@@ -1,0 +1,9 @@
+[package]
+name = "attic-gui"
+description = "Desktop GUI for Attic (framework not chosen yet)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+attic-core = { path = "../attic-core" }
