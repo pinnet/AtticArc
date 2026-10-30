@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 
-use attic_core::archive::{self, DeleteCheck, Progress, Settings};
-use attic_core::catalog::{self, ArchivedFolder, Catalog};
+use atticarc_core::archive::{self, DeleteCheck, Progress, Settings};
+use atticarc_core::catalog::{self, ArchivedFolder, Catalog};
 
 use crate::{human, theme};
 
@@ -421,7 +421,7 @@ impl Jobs {
         let mut keep = true;
         let mut check: Option<PathBuf> = None;
         let mut delete: Option<PathBuf> = None;
-        egui::Modal::new(egui::Id::unique("attic-dialog")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("atticarc-dialog")).show(ctx, |ui| {
             ui.set_max_width(480.0);
             match &dialog {
                 Dialog::ConfirmDelete(p) => {

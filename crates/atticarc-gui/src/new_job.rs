@@ -3,8 +3,8 @@
 
 use eframe::egui::{self, Color32, RichText};
 
-use attic_core::archive;
-use attic_core::settings::Threads;
+use atticarc_core::archive;
+use atticarc_core::settings::Threads;
 
 use crate::jobs::{Dialog, RowState};
 use crate::{App, Screen, caption, card, heading, human, pill, primary_button, theme};
@@ -52,7 +52,7 @@ impl App {
                 ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
                 if ui.button("Change source…").clicked()
                     && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
-                        self.source_dir = attic_core::settings::strip_verbatim(&p);
+                        self.source_dir = atticarc_core::settings::strip_verbatim(&p);
                         changed = true;
                     }
             });
@@ -75,7 +75,7 @@ impl App {
                 }
                 if ui.button("Change destination…").clicked()
                     && let Some(p) = rfd::FileDialog::new().set_directory(nearest_existing(&self.out_dir())).pick_folder() {
-                        self.out_dir_text = attic_core::settings::strip_verbatim(&p).display().to_string();
+                        self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
                         changed = true;
                     }
             });

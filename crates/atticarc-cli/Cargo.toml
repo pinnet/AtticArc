@@ -1,0 +1,13 @@
+[package]
+name = "atticarc-cli"
+description = "Command-line front end for AtticARC."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "atticarc-cli"
+path = "src/main.rs"
+
+[dependencies]
+atticarc-core = { path = "../atticarc-core" }

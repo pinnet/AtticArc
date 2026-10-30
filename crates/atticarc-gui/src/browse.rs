@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, RichText};
 
-use attic_core::catalog::{Catalog, FoundFile};
+use atticarc_core::catalog::{Catalog, FoundFile};
 
 use crate::{human, theme};
 

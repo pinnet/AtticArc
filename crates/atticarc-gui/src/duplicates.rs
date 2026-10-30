@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 
-use attic_core::catalog::{self, Catalog, DuplicateGroup};
+use atticarc_core::catalog::{self, Catalog, DuplicateGroup};
 
 use crate::{App, card, heading, human, theme};
 

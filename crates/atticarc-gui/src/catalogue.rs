@@ -7,8 +7,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText};
 
-use attic_core::archive;
-use attic_core::catalog::{self, ArchiveSummary, Catalog, FoundFile};
+use atticarc_core::archive;
+use atticarc_core::catalog::{self, ArchiveSummary, Catalog, FoundFile};
 
 use crate::browse::Browse;
 use crate::{App, card, human, primary_button, theme};

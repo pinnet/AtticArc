@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Attic ARC desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
+//! AtticARC desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
 //! sidebar with New job, Progress, Catalogue and Duplicates.
 //!
-//! The archive, verify and delete logic is foldarc's, now in attic-core.
+//! The archive, verify and delete logic is foldarc's, now in atticarc-core.
 
 mod browse;
 mod catalogue;
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 
-use attic_core::settings;
+use atticarc_core::settings;
 
 use jobs::Jobs;
 
@@ -26,13 +26,13 @@ fn main() -> eframe::Result {
     let source_dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Attic ARC")
+            .with_title("AtticARC")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Attic ARC",
+        "AtticARC",
         options,
         Box::new(move |cc| {
             let app = App::new(source_dir);
@@ -102,7 +102,7 @@ impl App {
         PathBuf::from(self.out_dir_text.trim())
     }
 
-    fn settings(&self) -> attic_core::archive::Settings {
+    fn settings(&self) -> atticarc_core::archive::Settings {
         let mut s = self.saved.settings_for(&self.source_dir);
         s.out_dir = self.out_dir();
         s
@@ -126,7 +126,7 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Attic ARC").size(18.0).strong().color(theme::sidebar_text()));
+        ui.label(RichText::new("AtticARC").size(18.0).strong().color(theme::sidebar_text()));
         ui.add_space(16.0);
         for s in Screen::ALL {
             let on = self.screen == s;

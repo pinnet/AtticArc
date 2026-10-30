@@ -122,7 +122,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("attic-test-{name}-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atticarc-test-{name}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn unreadable_root_is_reported_not_fatal() {
-        let r = scan(Path::new("/definitely/not/a/real/path/attic"));
+        let r = scan(Path::new("/definitely/not/a/real/path/atticarc"));
         assert!(r.files.is_empty());
         assert_eq!(r.errors.len(), 1);
     }

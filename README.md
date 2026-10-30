@@ -1,9 +1,9 @@
-# Attic ARC
+# AtticARC
 
 Archive, catalogue and de-duplicate large folder collections, to free up disk space without losing anything that matters.
 
 Private successor to `pinnet/compressed-subfolders-7z`, rewritten in Rust. The archive,
-catalogue and verified-delete engine comes from foldarc, which is now part of Attic ARC.
+catalogue and verified-delete engine comes from foldarc, which is now part of AtticARC.
 
 ## What it will do
 
@@ -37,7 +37,7 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 - [ ] Archive breakdown screen (pie / treemap of an archive's contents).
 - [ ] MD5 as an optional hash for compatibility with the older tool.
 - [ ] Skip locked files instead of failing the folder; free-space check before archiving.
-- [ ] Hash the size-collision candidates from `attic scan` before archiving.
+- [ ] Hash the size-collision candidates from `atticarc-cli scan` before archiving.
 - [ ] EXE version info in the catalogue.
 - [ ] Macrium Reflect image reader: mount `.mrimg` files read-only and catalogue their contents to prune the NAS image collection.
 
@@ -45,14 +45,14 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 
 | Crate | Purpose |
 |---|---|
-| `crates/attic-core` | `scan` (fast metadata scan), `archive` (compress, verify, check-then-delete), `catalog` (SQLite), `settings` |
-| `crates/attic-cli` | `attic` command-line tool |
-| `crates/attic-gui` | Desktop GUI (`attic-gui`) |
+| `crates/atticarc-core` | `scan` (fast metadata scan), `archive` (compress, verify, check-then-delete), `catalog` (SQLite), `settings` |
+| `crates/atticarc-cli` | `atticarc-cli` command-line tool |
+| `crates/atticarc-gui` | Desktop GUI (`atticarc`) |
 
 ## GUI
 
 ```
-cargo run --release -p attic-gui -- D:\Photos
+cargo run --release -p atticarc-gui -- D:\Photos
 ```
 
 Starts on the given source folder (or the last one used).
@@ -72,23 +72,28 @@ Starts on the given source folder (or the last one used).
 
 ## Output
 
-The destination folder (default: `Attic ARC archives\<name>` beside the source, so `D:\Photos` archives to
-`D:\Attic ARC archives\Photos`) holds:
+The destination folder (default: `AtticARC archives\<name>` beside the source, so `D:\Photos` archives to
+`D:\AtticARC archives\Photos`) holds:
 
 - `<folder>.7z`: standard 7z, opens in 7-Zip. With store mode on, already-compressed files (zip,
-  jpg, mp4, whl, safetensors and similar) go in uncompressed blocks.
-- `<folder>.7z.manifest.json`: every file's path, size, times, BLAKE3 and SHA-256.
-- `catalog.db`: SQLite with `archives`, `entries` (full-text index `entries_fts`) and `runs`.
+  jpg, mp4, whl, safetensors and similar) go in uncompressed blocks. Each archive also holds
+  `.atticarc/manifest.json` (hidden): every file's path, size, times, BLAKE3 and SHA-256, so the
+  record travels with the archive. It sits in a small block of its own, so reading it is quick.
+- `.atticarc\catalog.db` (hidden folder): SQLite with `archives`, `entries` (full-text index
+  `entries_fts`) and `runs`. It can be rebuilt from the archives' manifests (**Rebuild from archives**
+  in the Catalogue, or `atticarc-cli rebuild`). A `catalog.db` left loose by earlier versions is
+  moved in automatically, and `.7z.manifest.json` files they left beside archives are still read.
 
-Settings are kept in `%APPDATA%\attic\settings.json`; settings saved by foldarc are picked up on
-first run.
+Settings are kept in `%APPDATA%\atticarc\settings.json`; settings saved by earlier versions (`attic`,
+`foldarc`) are picked up on first run.
 
 ## Command line
 
 ```
-attic scan <folder> [--top N]                  Possible duplicates by size, without reading files
-attic archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
-attic search <words> [--out DIR]               Search the catalogue
+atticarc-cli scan <folder> [--top N]                  Possible duplicates by size, without reading files
+atticarc-cli archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
+atticarc-cli search <words> [--out DIR]               Search the catalogue
+atticarc-cli rebuild [--out DIR]                      Add archives missing from the catalogue
 ```
 
 ## Build

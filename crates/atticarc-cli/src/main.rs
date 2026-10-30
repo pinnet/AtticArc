@@ -2,23 +2,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use attic_core::archive::{self, Progress};
-use attic_core::catalog::Catalog;
-use attic_core::{scan, settings};
+use atticarc_core::archive::{self, Progress};
+use atticarc_core::catalog::Catalog;
+use atticarc_core::{scan, settings};
 
 const USAGE: &str = "\
-Attic ARC – archive, catalogue and de-duplicate folders
+AtticARC – archive, catalogue and de-duplicate folders
 
 Usage:
-  attic scan <folder> [--top N]   List files and show possible duplicates (by size).
+  atticarc-cli scan <folder> [--top N]   List files and show possible duplicates (by size).
                                   Reads no file contents, so it is fast.
-  attic archive <folder>...       Archive each folder to its own .7z and verify it,
+  atticarc-cli archive <folder>...       Archive each folder to its own .7z and verify it,
                                   using the settings saved by the GUI.
         [--out DIR] [--level 5|9]  Override the output folder or level.
-  attic search <words> [--out DIR] Search the catalogue in the output folder.
-  attic rebuild [--out DIR]       Add the archives in the output folder that the
+  atticarc-cli search <words> [--out DIR] Search the catalogue in the output folder.
+  atticarc-cli rebuild [--out DIR]       Add the archives in the output folder that the
                                   catalogue is missing, from their manifests.
-  attic help                      Show this message.
+  atticarc-cli help                      Show this message.
 
 Exit code 0 means every folder was archived and verified.";
 

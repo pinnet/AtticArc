@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/attic-core", "crates/attic-cli", "crates/attic-gui"]
+members = ["crates/atticarc-core", "crates/atticarc-cli", "crates/atticarc-gui"]
 
 [workspace.package]
 version = "0.1.0"

@@ -420,14 +420,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "attic-cli"
+name = "atticarc-cli"
 version = "0.1.0"
 dependencies = [
- "attic-core",
+ "atticarc-core",
 ]
 
 [[package]]
-name = "attic-core"
+name = "atticarc-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -443,11 +443,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "attic-gui"
+name = "atticarc-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "attic-core",
+ "atticarc-core",
  "eframe",
  "rfd",
 ]
