@@ -66,10 +66,12 @@ Starts on the given source folder (or the last one used).
 - **Catalogue**: search every file in every archive by name or folder, without unpacking; see its
   original path, hashes and how many copies exist, and extract a single file.
 - **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first.
+- **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output
 
-The destination folder (default: next to the source, `<name> archives`) holds:
+The destination folder (default: `Attic archives\<name>` beside the source, so `D:\Photos` archives to
+`D:\Attic archives\Photos`) holds:
 
 - `<folder>.7z`: standard 7z, opens in 7-Zip. With store mode on, already-compressed files (zip,
   jpg, mp4, whl, safetensors and similar) go in uncompressed blocks.

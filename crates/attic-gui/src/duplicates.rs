@@ -32,7 +32,7 @@ impl App {
             st.error = None;
             st.groups.clear();
             if out.join(CATALOG_FILE).is_file() {
-                match Catalog::open(&out).and_then(|c| c.duplicate_groups(MAX_GROUPS)) {
+                match Catalog::open_existing(&out).and_then(|c| c.duplicate_groups(MAX_GROUPS)) {
                     Ok(g) => st.groups = g,
                     Err(e) => st.error = Some(format!("{e:#}")),
                 }
@@ -44,7 +44,7 @@ impl App {
         ui.horizontal(|ui| {
             for (label, value) in [("Groups", st.groups.len().to_string()), ("Reclaimable", human(reclaimable))] {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(label).size(13.0).color(theme::MUTED));
+                    ui.label(RichText::new(label).size(13.0).color(theme::muted()));
                     ui.label(RichText::new(value).size(19.0).strong());
                 });
                 ui.add_space(24.0);
@@ -55,8 +55,8 @@ impl App {
         });
         ui.add_space(8.0);
         egui::Frame::NONE
-            .fill(theme::WARN_SOFT)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xF0, 0xD3, 0xA8)))
+            .fill(theme::warn_soft())
+            .stroke(egui::Stroke::new(1.0, theme::warn_border()))
             .corner_radius(egui::CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -66,12 +66,12 @@ impl App {
                         "This list is for review only: nothing is removed from here yet. Choosing which copy to keep \
                          and removing the others, with a log of every removal, comes next.",
                     )
-                    .color(egui::Color32::from_rgb(0x6B, 0x3A, 0x00)),
+                    .color(theme::warn()),
                 );
             });
         ui.add_space(10.0);
         if let Some(e) = &st.error {
-            ui.colored_label(theme::DANGER, e);
+            ui.colored_label(theme::danger(), e);
         }
         if st.groups.is_empty() {
             card(ui, |ui| {
@@ -88,7 +88,7 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let short = format!("{}…{}", &g.blake3[..6], &g.blake3[g.blake3.len() - 6..]);
                             ui.label(
-                                RichText::new(format!("{} · {} copies · {short}", human(g.size), g.copies.len())).color(theme::MUTED),
+                                RichText::new(format!("{} · {} copies · {short}", human(g.size), g.copies.len())).color(theme::muted()),
                             );
                         });
                     });

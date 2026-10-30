@@ -20,6 +20,8 @@ pub struct Saved {
     pub store_mode: bool,
     pub threads: Threads,
     pub protected: Vec<PathBuf>,
+    /// GUI colour scheme.
+    pub dark_mode: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -58,6 +60,7 @@ impl Default for Saved {
             store_mode: true,
             threads: Threads::All,
             protected: vec![r"C:\7ztest".into(), r"D:\7ztest".into(), r"W:\7ztest".into()],
+            dark_mode: false,
         }
     }
 }
@@ -100,14 +103,17 @@ pub fn store(s: &Saved) {
     }
 }
 
-/// Next to the source folder, never inside it: `D:\Photos` → `D:\Photos archives`.
+/// Beside the source folder, never inside it, in a shared `Attic archives`
+/// folder: `D:\Photos` → `D:\Attic archives\Photos`. Never inside the source,
+/// because the source may be protected or deleted later.
 pub fn default_out_dir(source: &Path) -> PathBuf {
-    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "attic".into());
-    match source.parent() {
-        Some(parent) => parent.join(format!("{name} archives")),
-        None => source.join("attic archives"),
+    match (source.parent(), source.file_name()) {
+        (Some(parent), Some(name)) => parent.join(OUT_DIR_NAME).join(name),
+        _ => source.join(OUT_DIR_NAME),
     }
 }
+
+const OUT_DIR_NAME: &str = "Attic archives";
 
 /// `\\?\C:\x` → `C:\x`, the form people expect to see.
 pub fn strip_verbatim(p: &Path) -> PathBuf {
@@ -133,6 +139,7 @@ mod tests {
     #[test]
     fn out_dir_sits_next_to_source() {
         let d = default_out_dir(Path::new("/data/Photos"));
-        assert_eq!(d, Path::new("/data/Photos archives"));
+        assert_eq!(d, Path::new("/data/Attic archives/Photos"));
+        assert_eq!(default_out_dir(Path::new("/")), Path::new("/Attic archives"));
     }
 }

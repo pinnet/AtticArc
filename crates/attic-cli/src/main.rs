@@ -209,7 +209,7 @@ fn run_search(words: &str, out: Option<PathBuf>) -> ExitCode {
         eprintln!("No output folder saved yet; pass --out <folder>.");
         return ExitCode::from(2);
     };
-    let found = Catalog::open(&out).and_then(|c| c.search(words, None, 200));
+    let found = Catalog::open_existing(&out).and_then(|c| c.search(words, None, 200));
     match found {
         Ok(found) => {
             for f in &found {

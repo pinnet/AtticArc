@@ -56,7 +56,7 @@ impl App {
             st.error = None;
             st.archives.clear();
             if out.join(CATALOG_FILE).is_file() {
-                match Catalog::open(&out).and_then(|c| c.archives()) {
+                match Catalog::open_existing(&out).and_then(|c| c.archives()) {
                     Ok(a) => st.archives = a,
                     Err(e) => st.error = Some(format!("{e:#}")),
                 }
@@ -65,7 +65,7 @@ impl App {
         let want = (st.query.trim().to_string(), st.archive_filter);
         if !want.0.is_empty() && st.searched.as_ref() != Some(&want) {
             st.selected = None;
-            st.results = Catalog::open(&out)
+            st.results = Catalog::open_existing(&out)
                 .and_then(|c| c.search(&want.0, want.1, MAX_RESULTS))
                 .unwrap_or_else(|e| {
                     st.error = Some(format!("{e:#}"));
@@ -77,7 +77,7 @@ impl App {
 
         heading(ui, "Catalogue", &format!("Every file in every archive in {}, searchable without unpacking.", out.display()));
         if let Some(e) = &st.error {
-            ui.colored_label(theme::DANGER, e);
+            ui.colored_label(theme::danger(), e);
         }
         if st.archives.is_empty() {
             card(ui, |ui| {
@@ -111,7 +111,7 @@ impl App {
         ui.columns(2, |c| {
             card(&mut c[0], |ui| {
                 let more = if st.results.len() == MAX_RESULTS { " (first 500, largest first)" } else { "" };
-                ui.label(RichText::new(format!("{} matches{more} · click a file for details", st.results.len())).color(theme::MUTED));
+                ui.label(RichText::new(format!("{} matches{more} · click a file for details", st.results.len())).color(theme::muted()));
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("results").auto_shrink([false, false]).max_height(ui.available_height()).show(ui, |ui| {
                     for (i, f) in st.results.iter().enumerate() {
@@ -145,7 +145,7 @@ fn archive_list(ui: &mut egui::Ui, st: &State) {
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("archives").num_columns(5).striped(true).spacing([18.0, 8.0]).show(ui, |ui| {
                 for h in ["Archive", "Files", "Original", "Archive size", "Archived"] {
-                    ui.label(RichText::new(h).color(theme::MUTED));
+                    ui.label(RichText::new(h).color(theme::muted()));
                 }
                 ui.end_row();
                 for a in &st.archives {
@@ -173,7 +173,7 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
     let original = PathBuf::from(&f.source_path).join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     egui::Grid::new("details").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
         let row = |ui: &mut egui::Ui, k: &str, v: String| {
-            ui.label(RichText::new(k).color(theme::MUTED));
+            ui.label(RichText::new(k).color(theme::muted()));
             ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
             ui.end_row();
         };
@@ -205,6 +205,6 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
         }
     });
     if let Some(n) = &st.note {
-        ui.label(RichText::new(n).color(theme::MUTED));
+        ui.label(RichText::new(n).color(theme::muted()));
     }
 }
