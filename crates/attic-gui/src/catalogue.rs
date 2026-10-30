@@ -26,6 +26,9 @@ pub struct State {
     error: Option<String>,
     note: Option<String>,
     extracting: Option<Receiver<Result<PathBuf, String>>>,
+    confirm_clear: bool,
+    /// Set after the catalogue was cleared, so the folder list reloads.
+    cleared: bool,
 }
 
 impl State {
@@ -42,6 +45,10 @@ impl State {
 impl App {
     pub fn catalogue(&mut self, ui: &mut egui::Ui) {
         let out = self.out_dir();
+        if std::mem::take(&mut self.catalogue.cleared) {
+            self.reload();
+        }
+        let busy = self.jobs.is_busy();
         let st = &mut self.catalogue;
         if let Some(rx) = &st.extracting
             && let Ok(res) = rx.try_recv() {
@@ -56,7 +63,7 @@ impl App {
             st.error = None;
             st.archives.clear();
             if out.join(CATALOG_FILE).is_file() {
-                match Catalog::open(&out).and_then(|c| c.archives()) {
+                match Catalog::open_existing(&out).and_then(|c| c.archives()) {
                     Ok(a) => st.archives = a,
                     Err(e) => st.error = Some(format!("{e:#}")),
                 }
@@ -65,7 +72,7 @@ impl App {
         let want = (st.query.trim().to_string(), st.archive_filter);
         if !want.0.is_empty() && st.searched.as_ref() != Some(&want) {
             st.selected = None;
-            st.results = Catalog::open(&out)
+            st.results = Catalog::open_existing(&out)
                 .and_then(|c| c.search(&want.0, want.1, MAX_RESULTS))
                 .unwrap_or_else(|e| {
                     st.error = Some(format!("{e:#}"));
@@ -77,11 +84,14 @@ impl App {
 
         heading(ui, "Catalogue", &format!("Every file in every archive in {}, searchable without unpacking.", out.display()));
         if let Some(e) = &st.error {
-            ui.colored_label(theme::DANGER, e);
+            ui.colored_label(theme::danger(), e);
         }
         if st.archives.is_empty() {
             card(ui, |ui| {
                 ui.label("No archives in this destination yet. Archive some folders from New job first.");
+                if let Some(n) = &st.note {
+                    ui.label(RichText::new(n).color(theme::muted()));
+                }
             });
             return;
         }
@@ -100,8 +110,17 @@ impl App {
                     ui.selectable_value(&mut st.archive_filter, Some(a.id), &a.name);
                 }
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clear = egui::Button::new(RichText::new("Clear the catalogue…").color(theme::danger()));
+                if ui.add_enabled(!busy, clear).on_hover_text("For development: forget every archive in this catalogue").clicked() {
+                    st.confirm_clear = true;
+                }
+            });
         });
         ui.add_space(8.0);
+        if st.confirm_clear {
+            confirm_clear(ui.ctx(), st, &out);
+        }
 
         if st.query.trim().is_empty() {
             archive_list(ui, st);
@@ -111,7 +130,7 @@ impl App {
         ui.columns(2, |c| {
             card(&mut c[0], |ui| {
                 let more = if st.results.len() == MAX_RESULTS { " (first 500, largest first)" } else { "" };
-                ui.label(RichText::new(format!("{} matches{more} · click a file for details", st.results.len())).color(theme::MUTED));
+                ui.label(RichText::new(format!("{} matches{more} · click a file for details", st.results.len())).color(theme::muted()));
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("results").auto_shrink([false, false]).max_height(ui.available_height()).show(ui, |ui| {
                     for (i, f) in st.results.iter().enumerate() {
@@ -138,6 +157,43 @@ impl App {
     }
 }
 
+fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
+    let mut close = false;
+    egui::Modal::new(egui::Id::unique("clear-catalogue")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.heading("Clear the catalogue?");
+        ui.label(format!(
+            "Forgets all {} archives recorded in {}. The .7z files and their manifests stay on disk; \
+             only the catalogue's records go, so their folders show as not archived again.",
+            st.archives.len(),
+            out.join(CATALOG_FILE).display()
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let clear = egui::Button::new(RichText::new("Clear the catalogue").color(egui::Color32::WHITE)).fill(theme::danger_fill());
+            if ui.add(clear).clicked() {
+                match Catalog::open_existing(out).and_then(|mut c| c.clear()) {
+                    Ok(n) => {
+                        st.note = Some(format!("Catalogue cleared: {n} archives forgotten."));
+                        st.cleared = true;
+                        st.invalidate();
+                        st.query.clear();
+                        st.results.clear();
+                    }
+                    Err(e) => st.error = Some(format!("Couldn't clear the catalogue: {e:#}")),
+                }
+                close = true;
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close {
+        st.confirm_clear = false;
+    }
+}
+
 fn archive_list(ui: &mut egui::Ui, st: &State) {
     card(ui, |ui| {
         ui.label(RichText::new(format!("{} archives", st.archives.len())).strong().size(16.0));
@@ -145,7 +201,7 @@ fn archive_list(ui: &mut egui::Ui, st: &State) {
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("archives").num_columns(5).striped(true).spacing([18.0, 8.0]).show(ui, |ui| {
                 for h in ["Archive", "Files", "Original", "Archive size", "Archived"] {
-                    ui.label(RichText::new(h).color(theme::MUTED));
+                    ui.label(RichText::new(h).color(theme::muted()));
                 }
                 ui.end_row();
                 for a in &st.archives {
@@ -173,7 +229,7 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
     let original = PathBuf::from(&f.source_path).join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     egui::Grid::new("details").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
         let row = |ui: &mut egui::Ui, k: &str, v: String| {
-            ui.label(RichText::new(k).color(theme::MUTED));
+            ui.label(RichText::new(k).color(theme::muted()));
             ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
             ui.end_row();
         };
@@ -205,6 +261,6 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
         }
     });
     if let Some(n) = &st.note {
-        ui.label(RichText::new(n).color(theme::MUTED));
+        ui.label(RichText::new(n).color(theme::muted()));
     }
 }

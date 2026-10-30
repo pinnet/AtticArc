@@ -1,9 +1,9 @@
-# Attic
+# Attic ARC
 
 Archive, catalogue and de-duplicate large folder collections, to free up disk space without losing anything that matters.
 
 Private successor to `pinnet/compressed-subfolders-7z`, rewritten in Rust. The archive,
-catalogue and verified-delete engine comes from foldarc, which is now part of Attic.
+catalogue and verified-delete engine comes from foldarc, which is now part of Attic ARC.
 
 ## What it will do
 
@@ -65,11 +65,14 @@ Starts on the given source folder (or the last one used).
   folder* or *Cancel now* (the partial archive is removed).
 - **Catalogue**: search every file in every archive by name or folder, without unpacking; see its
   original path, hashes and how many copies exist, and extract a single file.
+- **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
 - **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first.
+- **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output
 
-The destination folder (default: next to the source, `<name> archives`) holds:
+The destination folder (default: `Attic ARC archives\<name>` beside the source, so `D:\Photos` archives to
+`D:\Attic ARC archives\Photos`) holds:
 
 - `<folder>.7z`: standard 7z, opens in 7-Zip. With store mode on, already-compressed files (zip,
   jpg, mp4, whl, safetensors and similar) go in uncompressed blocks.

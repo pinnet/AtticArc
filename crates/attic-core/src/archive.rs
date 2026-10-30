@@ -299,8 +299,9 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         .with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
     let record = ArchiveRecord {
         name: name.clone(),
-        archive_path: final_path.to_string_lossy().into_owned(),
+        archive_path: crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned(),
         source_path: path_key(&source),
+        source_display: crate::settings::strip_verbatim(&source).to_string_lossy().into_owned(),
         created_utc: now_utc(),
         engine: settings.engine_label(),
         level: settings.level,
@@ -679,6 +680,48 @@ mod tests {
         let a = cat.archived_folder(src).unwrap().expect("archived");
         let e = cat.entries(a.archive_id).unwrap();
         (a, e)
+    }
+
+    #[test]
+    fn reading_a_missing_catalogue_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("not here");
+        assert!(Catalog::open_existing(&out).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn original_folder_keeps_its_spelling() {
+        let (_tmp, src, out) = run(true);
+        let cat = Catalog::open_existing(&out).unwrap();
+        let shown = PathBuf::from(&cat.archives().unwrap()[0].source_path);
+        assert_eq!(shown, crate::settings::strip_verbatim(&std::fs::canonicalize(&src).unwrap()));
+        assert!(shown.ends_with("My Folder"), "{}", shown.display());
+        let hit = &cat.search("notes", None, 5).unwrap()[0];
+        assert!(hit.source_path.ends_with("My Folder"), "{}", hit.source_path);
+    }
+
+    #[test]
+    fn clearing_the_catalogue_keeps_the_archives() {
+        let (_tmp, src, out) = run(true);
+        let (a, _) = recorded(&out, &src);
+        let mut cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.clear().unwrap(), 1);
+        assert!(cat.archives().unwrap().is_empty());
+        assert!(cat.search("notes", None, 5).unwrap().is_empty());
+        assert!(cat.archived_folder(&src).unwrap().is_none());
+        assert!(a.archive_path.is_file());
+        assert!(manifest_path(&a.archive_path).is_file());
+        // Archiving again works and is searchable.
+        archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
+        assert_eq!(Catalog::open_existing(&out).unwrap().search("notes", None, 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archive_path_is_stored_in_plain_form() {
+        let (_tmp, src, out) = run(true);
+        let (a, _) = recorded(&out, &src);
+        assert!(!a.archive_path.to_string_lossy().starts_with(r"\\?\"), "{}", a.archive_path.display());
     }
 
     #[test]

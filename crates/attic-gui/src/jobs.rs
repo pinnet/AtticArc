@@ -56,6 +56,8 @@ pub struct Batch {
     pub stop_after: Arc<AtomicBool>,
     pub current: Arc<Mutex<Option<PathBuf>>>,
     pub started: Instant,
+    /// When the batch finished, so its time and throughput stop counting.
+    pub ended: Option<Instant>,
     pub folders: Vec<(PathBuf, u64)>,
     pub finished: usize,
     pub finished_bytes: u64,
@@ -66,6 +68,11 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// Seconds the batch has run, or ran in total once it has ended.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.ended.unwrap_or_else(Instant::now).duration_since(self.started).as_secs_f64()
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.folders.iter().map(|f| f.1).sum()
     }
@@ -138,7 +145,7 @@ impl Jobs {
         self.load_error = None;
         let out_key = catalog::path_key(out_dir);
         let cat = if out_dir.join(catalog::CATALOG_FILE).is_file() {
-            Catalog::open(out_dir).map(Some).map_err(|e| format!("{e:#}"))
+            Catalog::open_existing(out_dir).map(Some).map_err(|e| format!("{e:#}"))
         } else {
             Ok(None)
         };
@@ -215,7 +222,7 @@ impl Jobs {
                     self.log(format!("{name}: compressing"));
                 }
                 Msg::Archived(p, res) => {
-                    let archived = Catalog::open(out_dir).ok().and_then(|c| c.archived_folder(&p).ok().flatten());
+                    let archived = Catalog::open_existing(out_dir).ok().and_then(|c| c.archived_folder(&p).ok().flatten());
                     let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     let line = match &res {
                         Ok(note) => format!("{name}.7z verified, {note}"),
@@ -245,6 +252,7 @@ impl Jobs {
                     }
                     if let Some(b) = &mut self.batch {
                         b.done = true;
+                        b.ended = Some(Instant::now());
                         let (v, f, n) = (b.verified, b.failed, b.folders.len());
                         self.log(format!("Finished: {v} verified, {f} failed, {} not started", n - v - f));
                     }
@@ -318,6 +326,7 @@ impl Jobs {
             stop_after: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
             started: Instant::now(),
+            ended: None,
             folders: todo.clone(),
             finished: 0,
             finished_bytes: 0,
@@ -371,7 +380,7 @@ impl Jobs {
         let settings = settings.clone();
         std::thread::spawn(move || {
             let res = (|| {
-                let cat = Catalog::open(&settings.out_dir)?;
+                let cat = Catalog::open_existing(&settings.out_dir)?;
                 let recorded = cat.entries(archived.archive_id)?;
                 archive::check_before_delete(&path, &archived.archive_path, &recorded, settings.threads, &progress)
             })()
@@ -395,7 +404,7 @@ impl Jobs {
         std::thread::spawn(move || {
             let started = catalog::now_utc();
             let res = archive::delete_folder(&path).map_err(|e| format!("{e:#}"));
-            if let Ok(cat) = Catalog::open(&out_dir) {
+            if let Ok(cat) = Catalog::open_existing(&out_dir) {
                 if res.is_ok() {
                     let _ = cat.mark_source_deleted(archived.archive_id, &catalog::now_utc());
                 }
@@ -457,7 +466,7 @@ impl Jobs {
                     ui.label(RichText::new("Deleting is permanent: the folder does not go to the Recycle Bin.").strong());
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let del = egui::Button::new(RichText::new("Delete the folder").color(Color32::WHITE)).fill(theme::DANGER);
+                        let del = egui::Button::new(RichText::new("Delete the folder").color(Color32::WHITE)).fill(theme::danger_fill());
                         if ui.add(del).clicked() {
                             delete = Some(p.clone());
                             keep = false;

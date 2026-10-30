@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -85,7 +85,12 @@ pub struct EntryRecord {
 pub struct ArchiveRecord {
     pub name: String,
     pub archive_path: String,
+    /// Lookup key for the source folder: canonical, and lower case on Windows.
     pub source_path: String,
+    /// The source folder as it is spelled on disk, for showing to people.
+    /// Missing in manifests written before it was added.
+    #[serde(default)]
+    pub source_display: String,
     pub created_utc: String,
     pub engine: String,
     pub level: u32,
@@ -110,12 +115,36 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Opens the catalogue in `dir`, creating the folder and the catalogue
+    /// if needed. Only archiving should do this; anything that only reads
+    /// uses [`Catalog::open_existing`], so it never writes into a folder.
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        Self::connect(&dir.join(CATALOG_FILE))
+    }
+
+    /// Opens the catalogue in `dir` only if it is already there.
+    pub fn open_existing(dir: &Path) -> Result<Self> {
         let path = dir.join(CATALOG_FILE);
-        let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+        if !path.is_file() {
+            bail!("there is no catalogue in {}", dir.display());
+        }
+        Self::connect(&path)
+    }
+
+    fn connect(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release: the source folder as spelled on disk.
+        let has_display: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('archives') WHERE name = 'source_display'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_display {
+            conn.execute_batch("ALTER TABLE archives ADD COLUMN source_display TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -124,8 +153,8 @@ impl Catalog {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO archives (name, archive_path, source_path, created_utc, engine, level, threads,
-                input_bytes, archive_bytes, file_count, dir_count, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'verified')",
+                input_bytes, archive_bytes, file_count, dir_count, status, source_display)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'verified', ?12)",
             params![
                 a.name,
                 a.archive_path,
@@ -137,7 +166,8 @@ impl Catalog {
                 a.input_bytes as i64,
                 a.archive_bytes as i64,
                 a.file_count as i64,
-                a.dir_count as i64
+                a.dir_count as i64,
+                a.source_display
             ],
         )?;
         let archive_id = tx.last_insert_rowid();
@@ -243,10 +273,24 @@ impl Catalog {
         Ok(())
     }
 
+    /// Forgets every archive, entry and run, leaving an empty catalogue.
+    /// The archives and manifests on disk are not touched. Returns how
+    /// many archives were forgotten.
+    pub fn clear(&mut self) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
+        tx.execute_batch(
+            "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM archives;",
+        )?;
+        tx.commit()?;
+        Ok(n as u64)
+    }
+
     /// Every verified archive, newest first.
     pub fn archives(&self) -> Result<Vec<ArchiveSummary>> {
         let mut q = self.conn.prepare(
-            "SELECT id, name, archive_path, source_path, created_utc, input_bytes, archive_bytes, file_count,
+            "SELECT id, name, archive_path, COALESCE(source_display, source_path), created_utc, input_bytes, archive_bytes, file_count,
                     source_deleted_utc
              FROM archives WHERE status = 'verified' ORDER BY id DESC",
         )?;
@@ -280,7 +324,7 @@ impl Catalog {
             return Ok(Vec::new());
         }
         let mut q = self.conn.prepare(
-            "SELECT e.id, a.id, a.name, a.source_path, e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256,
+            "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256,
                     (SELECT COUNT(*) FROM entries d WHERE d.blake3 = e.blake3 AND d.size = e.size)
              FROM entries_fts f
              JOIN entries e ON e.id = f.rowid
@@ -316,7 +360,7 @@ impl Catalog {
             }
         }
         let mut q = self.conn.prepare(
-            "SELECT e.id, a.id, a.name, a.source_path, e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256, 0
+            "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256, 0
              FROM entries e JOIN archives a ON a.id = e.archive_id
              WHERE e.blake3 = ?1 AND e.size = ?2 AND e.kind = 'file' AND a.status = 'verified'
              ORDER BY a.name, e.rel_path",

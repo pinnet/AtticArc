@@ -12,7 +12,7 @@ use crate::{App, Screen, card, duration, heading, human, theme};
 impl App {
     pub fn progress(&mut self, ui: &mut egui::Ui) {
         let Some(b) = &self.jobs.batch else {
-            heading(ui, "Progress", "Nothing has been archived since Attic started.");
+            heading(ui, "Progress", "Nothing has been archived since Attic ARC started.");
             if ui.button("Go to New job").clicked() {
                 self.screen = Screen::NewJob;
             }
@@ -21,7 +21,7 @@ impl App {
         let title = format!("Archiving {} → {}", self.source_dir.display(), self.out_dir().display());
         let fraction = b.fraction();
         let total = b.total_bytes();
-        let elapsed = b.started.elapsed().as_secs_f64().max(0.5);
+        let elapsed = b.elapsed_secs().max(0.5);
         let done_bytes = (fraction as f64 * total as f64) as u64;
         let stopping = b.stop_after.load(Ordering::Relaxed) && !b.done;
         let (done, verified, failed, n) = (b.done, b.verified, b.failed, b.folders.len());
@@ -34,11 +34,11 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if !done {
                         let b = self.jobs.batch.as_ref().unwrap();
-                        let cancel = egui::Button::new(RichText::new("Cancel now").color(theme::DANGER));
+                        let cancel = egui::Button::new(RichText::new("Cancel now").color(theme::danger()));
                         if ui.add(cancel).on_hover_text("Stops the current folder; its partial archive is removed").clicked() {
                             b.progress.cancel.store(true, Ordering::Relaxed);
                         }
-                        let stop = egui::Button::new(RichText::new("Stop after this folder").color(theme::WARN));
+                        let stop = egui::Button::new(RichText::new("Stop after this folder").color(theme::warn()));
                         if ui.add_enabled(!stopping, stop).clicked() {
                             b.stop_after.store(true, Ordering::Relaxed);
                         }
@@ -50,27 +50,28 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{:.0}%", fraction * 100.0)).size(38.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{} of {}", human(done_bytes), human(total))).color(theme::MUTED));
+                        ui.label(RichText::new(format!("{} of {}", human(done_bytes), human(total))).color(theme::muted()));
                     });
                 });
-                ui.add(egui::ProgressBar::new(fraction).desired_height(12.0).fill(theme::ACCENT));
+                ui.add(egui::ProgressBar::new(fraction).desired_height(12.0).fill(theme::accent()));
                 ui.add_space(6.0);
                 let rate = done_bytes as f64 / elapsed;
                 let eta = if done {
-                    if stopping || verified + failed < n { "Stopped".into() } else { "Done".into() }
+                    let word = if verified + failed < n { "Stopped" } else { "Done" };
+                    format!("{word} in {}", duration(elapsed))
                 } else if fraction > 0.01 {
                     duration(elapsed / fraction as f64 - elapsed)
                 } else {
                     "…".into()
                 };
                 ui.columns(4, |c| {
-                    stat(&mut c[0], "Throughput", &format!("{:.0} MB/s", rate / 1e6));
+                    stat(&mut c[0], if done { "Average throughput" } else { "Throughput" }, &format!("{:.0} MB/s", rate / 1e6));
                     stat(&mut c[1], if done { "Status" } else { "Time left" }, &eta);
                     stat(&mut c[2], "Folders", &format!("{} of {n}", verified + failed));
                     stat(&mut c[3], "Verified", &format!("{verified} · {failed} failed"));
                 });
                 if !done && !phase.is_empty() {
-                    ui.label(RichText::new(format!("Now: {phase}{}", if stopping { " · stopping after this folder" } else { "" })).color(theme::MUTED));
+                    ui.label(RichText::new(format!("Now: {phase}{}", if stopping { " · stopping after this folder" } else { "" })).color(theme::muted()));
                 }
             });
             ui.add_space(12.0);
@@ -88,9 +89,9 @@ impl App {
                             if r.state == RowState::Working {
                                 let b = self.jobs.batch.as_ref().unwrap();
                                 let text = format!("{} {:.0}%", b.progress.phase.lock().unwrap(), b.progress.fraction() * 100.0);
-                                crate::pill(ui, &text, egui::Color32::WHITE, theme::ACCENT);
+                                crate::pill(ui, &text, egui::Color32::WHITE, theme::accent());
                             } else if r.state == RowState::Idle {
-                                ui.label(RichText::new("Not started").color(theme::MUTED));
+                                ui.label(RichText::new("Not started").color(theme::muted()));
                             } else {
                                 state_label(ui, &r.state, true);
                             }
@@ -99,7 +100,7 @@ impl App {
                     });
                 });
                 egui::Frame::NONE
-                    .fill(theme::SIDEBAR)
+                    .fill(theme::sidebar())
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(16))
                     .show(&mut c[1], |ui| {
@@ -107,7 +108,7 @@ impl App {
                         ui.label(RichText::new("Log").strong().size(16.0).color(egui::Color32::WHITE));
                         egui::ScrollArea::vertical().max_height(360.0).stick_to_bottom(true).show(ui, |ui| {
                             for l in &self.jobs.log {
-                                ui.label(RichText::new(l).monospace().color(theme::SIDEBAR_TEXT));
+                                ui.label(RichText::new(l).monospace().color(theme::sidebar_text()));
                             }
                         });
                     });
@@ -117,6 +118,6 @@ impl App {
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(RichText::new(label).size(13.0).color(theme::MUTED));
+    ui.label(RichText::new(label).size(13.0).color(theme::muted()));
     ui.label(RichText::new(value).size(19.0).strong());
 }

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Attic desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
+//! Attic ARC desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
 //! sidebar with New job, Progress, Catalogue and Duplicates.
 //!
 //! The archive, verify and delete logic is foldarc's, now in attic-core.
@@ -10,6 +10,7 @@ mod duplicates;
 mod jobs;
 mod new_job;
 mod progress;
+mod theme;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,41 +21,22 @@ use attic_core::settings;
 
 use jobs::Jobs;
 
-/// Colours from the mockups.
-pub mod theme {
-    use eframe::egui::Color32;
-    pub const GROUND: Color32 = Color32::from_rgb(0xF3, 0xF3, 0xEF);
-    pub const SIDEBAR: Color32 = Color32::from_rgb(0x1C, 0x1E, 0x21);
-    pub const SIDEBAR_TEXT: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xE3);
-    pub const CARD: Color32 = Color32::WHITE;
-    pub const BORDER: Color32 = Color32::from_rgb(0xDA, 0xDA, 0xD3);
-    pub const INK: Color32 = Color32::from_rgb(0x1C, 0x1E, 0x21);
-    pub const MUTED: Color32 = Color32::from_rgb(0x5B, 0x5F, 0x66);
-    pub const ACCENT: Color32 = Color32::from_rgb(0x0B, 0x6B, 0x66);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0xE3, 0xF0, 0xEE);
-    pub const OK: Color32 = Color32::from_rgb(0x24, 0x5A, 0x24);
-    pub const OK_SOFT: Color32 = Color32::from_rgb(0xE3, 0xF0, 0xE3);
-    pub const WARN: Color32 = Color32::from_rgb(0x9A, 0x3B, 0x00);
-    pub const WARN_SOFT: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE5);
-    pub const DANGER: Color32 = Color32::from_rgb(0xB4, 0x32, 0x32);
-    pub const TRACK: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xE0);
-}
-
 fn main() -> eframe::Result {
     let source_dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Attic")
+            .with_title("Attic ARC")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Attic",
+        "Attic ARC",
         options,
         Box::new(move |cc| {
-            apply_theme(&cc.egui_ctx);
-            Ok(Box::new(App::new(source_dir)))
+            let app = App::new(source_dir);
+            theme::set_dark(&cc.egui_ctx, app.saved.dark_mode);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -143,19 +125,19 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Attic").size(18.0).strong().color(theme::SIDEBAR_TEXT));
+        ui.label(RichText::new("Attic ARC").size(18.0).strong().color(theme::sidebar_text()));
         ui.add_space(16.0);
         for s in Screen::ALL {
             let on = self.screen == s;
-            let mut text = RichText::new(s.label()).size(15.0).color(if on { Color32::WHITE } else { theme::SIDEBAR_TEXT });
+            let mut text = RichText::new(s.label()).size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() });
             if on {
                 text = text.strong();
             }
             if s == Screen::Progress && self.jobs.is_busy() {
-                text = RichText::new(format!("{}  ●", s.label())).size(15.0).color(if on { Color32::WHITE } else { theme::SIDEBAR_TEXT });
+                text = RichText::new(format!("{}  ●", s.label())).size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() });
             }
             let button = egui::Button::new(text)
-                .fill(if on { theme::ACCENT } else { Color32::TRANSPARENT })
+                .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
                 .stroke(Stroke::NONE)
                 .corner_radius(CornerRadius::same(6))
                 .min_size(egui::vec2(ui.available_width(), 40.0));
@@ -163,6 +145,20 @@ impl App {
                 self.screen = s;
             }
         }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let dark = self.saved.dark_mode;
+            let label = if dark { "Light mode" } else { "Dark mode" };
+            let button = egui::Button::new(RichText::new(label).size(15.0).color(theme::sidebar_text()))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
+                .corner_radius(CornerRadius::same(6))
+                .min_size(egui::vec2(ui.available_width(), 40.0));
+            if ui.add(button).on_hover_text("Switch between light and dark colours").clicked() {
+                self.saved.dark_mode = !dark;
+                theme::set_dark(ui.ctx(), !dark);
+                settings::store(&self.saved);
+            }
+        });
     }
 }
 
@@ -177,10 +173,10 @@ impl eframe::App for App {
         egui::Panel::left("nav")
             .resizable(false)
             .exact_size(200.0)
-            .frame(egui::Frame::NONE.fill(theme::SIDEBAR).inner_margin(Margin::symmetric(14, 18)))
+            .frame(egui::Frame::NONE.fill(theme::sidebar()).inner_margin(Margin::symmetric(14, 18)))
             .show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::no_frame()
-            .frame(egui::Frame::NONE.fill(theme::GROUND).inner_margin(Margin::symmetric(32, 26)))
+            .frame(egui::Frame::NONE.fill(theme::ground()).inner_margin(Margin::symmetric(32, 26)))
             .show(ui, |ui| match self.screen {
                 Screen::NewJob => self.new_job(ui),
                 Screen::Progress => self.progress(ui),
@@ -196,35 +192,13 @@ impl eframe::App for App {
     }
 }
 
-fn apply_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Light);
-    ctx.all_styles_mut(|style| {
-        let v = &mut style.visuals;
-        v.panel_fill = theme::GROUND;
-        v.window_fill = theme::CARD;
-        v.extreme_bg_color = Color32::WHITE;
-        v.faint_bg_color = Color32::from_rgb(0xF7, 0xF7, 0xF3);
-        v.hyperlink_color = theme::ACCENT;
-        v.selection.bg_fill = theme::ACCENT;
-        v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme::INK);
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme::BORDER);
-        v.widgets.inactive.corner_radius = CornerRadius::same(6);
-        v.widgets.hovered.corner_radius = CornerRadius::same(6);
-        v.widgets.active.corner_radius = CornerRadius::same(6);
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(14.0, 7.0);
-        style.spacing.interact_size.y = 30.0;
-    });
-}
-
 // Shared drawing helpers.
 
 /// A white card with the mockups' border and radius.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::NONE
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .fill(theme::card())
+        .stroke(Stroke::new(1.0, theme::border()))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(18))
         .show(ui, |ui| {
@@ -235,20 +209,20 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 pub fn heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).size(26.0).strong().color(theme::INK));
+    ui.label(RichText::new(title).size(26.0).strong().color(theme::ink()));
     if !subtitle.is_empty() {
-        ui.label(RichText::new(subtitle).color(theme::MUTED));
+        ui.label(RichText::new(subtitle).color(theme::muted()));
     }
     ui.add_space(10.0);
 }
 
 pub fn caption(text: &str) -> RichText {
-    RichText::new(text.to_uppercase()).size(12.0).strong().color(theme::MUTED)
+    RichText::new(text.to_uppercase()).size(12.0).strong().color(theme::muted())
 }
 
 pub fn primary_button(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE))
-        .fill(theme::ACCENT)
+        .fill(theme::accent())
         .min_size(egui::vec2(0.0, 40.0))
 }
 

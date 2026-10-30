@@ -36,7 +36,7 @@ impl App {
                         self.screen = Screen::Progress;
                     }
                     if busy {
-                        ui.label(RichText::new("A job is running; see Progress.").color(theme::MUTED));
+                        ui.label(RichText::new("A job is running; see Progress.").color(theme::muted()));
                     }
                 });
             });
@@ -48,8 +48,8 @@ impl App {
         ui.columns(2, |cols| {
             card(&mut cols[0], |ui| {
                 ui.label(caption("Source"));
-                ui.label(RichText::new(self.source_dir.display().to_string()).monospace().size(17.0).color(theme::INK));
-                ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::MUTED));
+                ui.label(RichText::new(self.source_dir.display().to_string()).monospace().size(17.0).color(theme::ink()));
+                ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
                 if ui.button("Change source…").clicked()
                     && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
                         self.source_dir = attic_core::settings::strip_verbatim(&p);
@@ -66,9 +66,15 @@ impl App {
                 if resp.lost_focus() {
                     changed = true;
                 }
-                ui.label(RichText::new("Archives, manifests and catalog.db are kept here.").color(theme::MUTED));
+                ui.label(RichText::new("Archives, manifests and catalog.db are kept here.").color(theme::muted()));
+                if archive::is_protected(&self.out_dir(), &self.settings()) {
+                    ui.label(
+                        RichText::new("This folder is protected, so archiving here will be refused. Choose another one.")
+                            .color(theme::danger()),
+                    );
+                }
                 if ui.button("Change destination…").clicked()
-                    && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
+                    && let Some(p) = rfd::FileDialog::new().set_directory(nearest_existing(&self.out_dir())).pick_folder() {
                         self.out_dir_text = attic_core::settings::strip_verbatim(&p).display().to_string();
                         changed = true;
                     }
@@ -107,12 +113,12 @@ impl App {
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("File hash").strong());
-                    ui.label(RichText::new("BLAKE3 + SHA-256, every file").color(theme::MUTED));
+                    ui.label(RichText::new("BLAKE3 + SHA-256, every file").color(theme::muted()));
                 });
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
                     ui.checkbox(&mut self.saved.store_mode, "Store already-compressed files (zip, jpg, mp4…) without recompressing");
-                    ui.label(RichText::new("Every archive is decoded and checked against its hashes after writing.").color(theme::MUTED));
+                    ui.label(RichText::new("Every archive is decoded and checked against its hashes after writing.").color(theme::muted()));
                 });
             });
             ui.add_space(4.0);
@@ -147,12 +153,12 @@ impl App {
                             human(bytes),
                             archived.len()
                         ))
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                 });
             });
             if let Some(e) = &self.jobs.load_error {
-                ui.colored_label(theme::DANGER, e);
+                ui.colored_label(theme::danger(), e);
             }
             ui.separator();
             if order.is_empty() && archived.is_empty() {
@@ -162,9 +168,9 @@ impl App {
             egui::Grid::new("folders").num_columns(4).striped(true).spacing([18.0, 8.0]).min_col_width(24.0).show(ui, |ui| {
                 if !order.is_empty() {
                     ui.label("");
-                    ui.label(RichText::new("Folder").color(theme::MUTED));
-                    ui.label(RichText::new("Size").color(theme::MUTED));
-                    ui.label(RichText::new("Status").color(theme::MUTED));
+                    ui.label(RichText::new("Folder").color(theme::muted()));
+                    ui.label(RichText::new("Size").color(theme::muted()));
+                    ui.label(RichText::new("Status").color(theme::muted()));
                     ui.end_row();
                 }
                 for i in order {
@@ -193,7 +199,7 @@ impl App {
                     let row = &self.jobs.rows[i];
                     let a = row.archived.as_ref().unwrap();
                     let locked = archive::is_protected(&row.path, &settings);
-                    let x = egui::Button::new(RichText::new("X").strong().color(theme::DANGER));
+                    let x = egui::Button::new(RichText::new("X").strong().color(theme::danger()));
                     let resp = ui.add_enabled(!busy && !locked, x);
                     let resp = if locked {
                         resp.on_disabled_hover_text("This folder is protected and can't be deleted here")
@@ -210,12 +216,18 @@ impl App {
                         RowState::Done(note) => format!("Archived now · {note}"),
                         _ => format!("Archived {when} · {} .7z", human(a.archive_bytes)),
                     };
-                    pill(ui, &text, theme::OK, theme::OK_SOFT);
+                    pill(ui, &text, theme::ok(), theme::ok_soft());
                     ui.end_row();
                 }
             });
         });
     }
+}
+
+/// `path`, or its closest parent that exists, so a folder picker can open
+/// there even when the destination hasn't been created yet.
+fn nearest_existing(path: &std::path::Path) -> std::path::PathBuf {
+    path.ancestors().find(|p| p.is_dir()).unwrap_or(path).to_path_buf()
 }
 
 /// A grid cell, greyed out when `dim`.
@@ -232,23 +244,23 @@ pub fn state_label(ui: &mut egui::Ui, s: &RowState, ticked: bool) {
     match s {
         RowState::Idle => {
             if ticked {
-                pill(ui, "Ready", theme::MUTED, Color32::from_rgb(0xEC, 0xEC, 0xE6));
+                pill(ui, "Ready", theme::muted(), theme::neutral_soft());
             } else {
-                ui.label(RichText::new("Skipped").color(theme::MUTED));
+                ui.label(RichText::new("Skipped").color(theme::muted()));
             }
         }
         RowState::Queued => {
-            pill(ui, "Queued", theme::MUTED, Color32::from_rgb(0xEC, 0xEC, 0xE6));
+            pill(ui, "Queued", theme::muted(), theme::neutral_soft());
         }
         RowState::Working => {
-            pill(ui, "Working…", Color32::WHITE, theme::ACCENT);
+            pill(ui, "Working…", Color32::WHITE, theme::accent());
         }
         RowState::Done(n) => {
-            pill(ui, &format!("Verified · {n}"), theme::OK, theme::OK_SOFT);
+            pill(ui, &format!("Verified · {n}"), theme::ok(), theme::ok_soft());
         }
         RowState::Failed(e) => {
             let first = e.lines().next().unwrap_or(e);
-            pill(ui, &format!("Failed: {first}"), theme::WARN, theme::WARN_SOFT).on_hover_text(e);
+            pill(ui, &format!("Failed: {first}"), theme::warn(), theme::warn_soft()).on_hover_text(e);
         }
     }
 }

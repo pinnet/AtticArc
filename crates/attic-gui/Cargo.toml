@@ -1,6 +1,6 @@
 [package]
 name = "attic-gui"
-description = "Desktop GUI for Attic (eframe/egui)."
+description = "Desktop GUI for Attic ARC (eframe/egui)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

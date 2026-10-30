@@ -7,7 +7,7 @@ use attic_core::catalog::Catalog;
 use attic_core::{scan, settings};
 
 const USAGE: &str = "\
-Attic – archive, catalogue and de-duplicate folders
+Attic ARC – archive, catalogue and de-duplicate folders
 
 Usage:
   attic scan <folder> [--top N]   List files and show possible duplicates (by size).
@@ -209,7 +209,7 @@ fn run_search(words: &str, out: Option<PathBuf>) -> ExitCode {
         eprintln!("No output folder saved yet; pass --out <folder>.");
         return ExitCode::from(2);
     };
-    let found = Catalog::open(&out).and_then(|c| c.search(words, None, 200));
+    let found = Catalog::open_existing(&out).and_then(|c| c.search(words, None, 200));
     match found {
         Ok(found) => {
             for f in &found {
