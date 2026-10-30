@@ -21,7 +21,7 @@ impl App {
         let title = format!("Archiving {} → {}", self.source_dir.display(), self.out_dir().display());
         let fraction = b.fraction();
         let total = b.total_bytes();
-        let elapsed = b.started.elapsed().as_secs_f64().max(0.5);
+        let elapsed = b.elapsed_secs().max(0.5);
         let done_bytes = (fraction as f64 * total as f64) as u64;
         let stopping = b.stop_after.load(Ordering::Relaxed) && !b.done;
         let (done, verified, failed, n) = (b.done, b.verified, b.failed, b.folders.len());
@@ -57,14 +57,15 @@ impl App {
                 ui.add_space(6.0);
                 let rate = done_bytes as f64 / elapsed;
                 let eta = if done {
-                    if stopping || verified + failed < n { "Stopped".into() } else { "Done".into() }
+                    let word = if verified + failed < n { "Stopped" } else { "Done" };
+                    format!("{word} in {}", duration(elapsed))
                 } else if fraction > 0.01 {
                     duration(elapsed / fraction as f64 - elapsed)
                 } else {
                     "…".into()
                 };
                 ui.columns(4, |c| {
-                    stat(&mut c[0], "Throughput", &format!("{:.0} MB/s", rate / 1e6));
+                    stat(&mut c[0], if done { "Average throughput" } else { "Throughput" }, &format!("{:.0} MB/s", rate / 1e6));
                     stat(&mut c[1], if done { "Status" } else { "Time left" }, &eta);
                     stat(&mut c[2], "Folders", &format!("{} of {n}", verified + failed));
                     stat(&mut c[3], "Verified", &format!("{verified} · {failed} failed"));

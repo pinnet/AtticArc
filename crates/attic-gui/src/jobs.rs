@@ -56,6 +56,8 @@ pub struct Batch {
     pub stop_after: Arc<AtomicBool>,
     pub current: Arc<Mutex<Option<PathBuf>>>,
     pub started: Instant,
+    /// When the batch finished, so its time and throughput stop counting.
+    pub ended: Option<Instant>,
     pub folders: Vec<(PathBuf, u64)>,
     pub finished: usize,
     pub finished_bytes: u64,
@@ -66,6 +68,11 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// Seconds the batch has run, or ran in total once it has ended.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.ended.unwrap_or_else(Instant::now).duration_since(self.started).as_secs_f64()
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.folders.iter().map(|f| f.1).sum()
     }
@@ -245,6 +252,7 @@ impl Jobs {
                     }
                     if let Some(b) = &mut self.batch {
                         b.done = true;
+                        b.ended = Some(Instant::now());
                         let (v, f, n) = (b.verified, b.failed, b.folders.len());
                         self.log(format!("Finished: {v} verified, {f} failed, {} not started", n - v - f));
                     }
@@ -318,6 +326,7 @@ impl Jobs {
             stop_after: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
             started: Instant::now(),
+            ended: None,
             folders: todo.clone(),
             finished: 0,
             finished_bytes: 0,
