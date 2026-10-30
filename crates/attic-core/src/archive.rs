@@ -695,7 +695,7 @@ mod tests {
         let (_tmp, src, out) = run(true);
         let cat = Catalog::open_existing(&out).unwrap();
         let shown = PathBuf::from(&cat.archives().unwrap()[0].source_path);
-        assert_eq!(shown, std::fs::canonicalize(&src).unwrap());
+        assert_eq!(shown, crate::settings::strip_verbatim(&std::fs::canonicalize(&src).unwrap()));
         assert!(shown.ends_with("My Folder"), "{}", shown.display());
         let hit = &cat.search("notes", None, 5).unwrap()[0];
         assert!(hit.source_path.ends_with("My Folder"), "{}", hit.source_path);
