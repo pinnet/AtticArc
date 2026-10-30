@@ -1,8 +1,10 @@
 //! SQLite catalog of archives and the files inside them.
 //!
-//! One `catalog.db` lives in the output folder next to the archives. An
-//! archive row is only written after the archive has been verified, in one
-//! transaction together with its entries.
+//! One `catalog.db` lives in a hidden `.atticarc` folder inside the output
+//! folder, so the output folder itself shows only the archives. An archive
+//! row is only written after the archive has been verified, in one
+//! transaction together with its entries. Every archive also carries its own
+//! manifest, so the catalogue can be rebuilt from the archives.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +13,58 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 pub const CATALOG_FILE: &str = "catalog.db";
+
+/// The hidden folder AtticARC keeps its own files in: inside the output
+/// folder for the catalogue, and inside each archive for its manifest.
+pub const DATA_DIR: &str = ".atticarc";
+
+/// Where the catalogue for the output folder `dir` lives.
+pub fn db_path(dir: &Path) -> PathBuf {
+    dir.join(DATA_DIR).join(CATALOG_FILE)
+}
+
+/// Whether `dir` has a catalogue, in its current or its old place.
+pub fn exists(dir: &Path) -> bool {
+    db_path(dir).is_file() || dir.join(CATALOG_FILE).is_file()
+}
+
+/// Creates `dir/.atticarc`, hidden on Windows (the dot hides it elsewhere).
+fn make_data_dir(dir: &Path) -> Result<()> {
+    let data = dir.join(DATA_DIR);
+    if data.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(&data)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    Ok(())
+}
+
+/// Moves a catalogue from where earlier versions kept it, loose in the
+/// output folder, into `.atticarc`.
+fn move_old_catalog(dir: &Path) -> Result<()> {
+    let old = dir.join(CATALOG_FILE);
+    if !old.is_file() || db_path(dir).is_file() {
+        return Ok(());
+    }
+    make_data_dir(dir)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", old.display()));
+        if from.is_file() {
+            let to = PathBuf::from(format!("{}{suffix}", db_path(dir).display()));
+            std::fs::rename(&from, &to).with_context(|| format!("move {} into {DATA_DIR}", from.display()))?;
+        }
+    }
+    Ok(())
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS archives (
@@ -120,16 +174,18 @@ impl Catalog {
     /// uses [`Catalog::open_existing`], so it never writes into a folder.
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        Self::connect(&dir.join(CATALOG_FILE))
+        move_old_catalog(dir)?;
+        make_data_dir(dir)?;
+        Self::connect(&db_path(dir))
     }
 
     /// Opens the catalogue in `dir` only if it is already there.
     pub fn open_existing(dir: &Path) -> Result<Self> {
-        let path = dir.join(CATALOG_FILE);
-        if !path.is_file() {
+        if !exists(dir) {
             bail!("there is no catalogue in {}", dir.display());
         }
-        Self::connect(&path)
+        move_old_catalog(dir)?;
+        Self::connect(&db_path(dir))
     }
 
     fn connect(path: &Path) -> Result<Self> {
@@ -226,6 +282,12 @@ impl Catalog {
             )
             .optional()?;
         Ok(found.filter(|f| f.archive_path.is_file()))
+    }
+
+    /// Whether an archive at `path` is already in the catalogue.
+    pub fn has_archive_path(&self, path: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM archives WHERE archive_path = ?1", params![path], |r| r.get(0))?;
+        Ok(n > 0)
     }
 
     pub fn entries(&self, archive_id: i64) -> Result<Vec<EntryRecord>> {

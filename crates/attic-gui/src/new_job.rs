@@ -66,7 +66,7 @@ impl App {
                 if resp.lost_focus() {
                     changed = true;
                 }
-                ui.label(RichText::new("Archives, manifests and catalog.db are kept here.").color(theme::muted()));
+                ui.label(RichText::new("Archives are kept here, with the catalogue in a hidden .atticarc folder.").color(theme::muted()));
                 if archive::is_protected(&self.out_dir(), &self.settings()) {
                     ui.label(
                         RichText::new("This folder is protected, so archiving here will be refused. Choose another one.")

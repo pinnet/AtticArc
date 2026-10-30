@@ -16,6 +16,8 @@ Usage:
                                   using the settings saved by the GUI.
         [--out DIR] [--level 5|9]  Override the output folder or level.
   attic search <words> [--out DIR] Search the catalogue in the output folder.
+  attic rebuild [--out DIR]       Add the archives in the output folder that the
+                                  catalogue is missing, from their manifests.
   attic help                      Show this message.
 
 Exit code 0 means every folder was archived and verified.";
@@ -41,6 +43,14 @@ fn main() -> ExitCode {
             Ok((words, out)) => run_search(&words, out),
             Err(msg) => {
                 eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("rebuild") => match args.get(1).map(String::as_str) {
+            None => run_rebuild(None),
+            Some("--out") if args.len() == 3 => run_rebuild(Some(PathBuf::from(&args[2]))),
+            _ => {
+                eprintln!("rebuild takes only --out <folder>\n\n{USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -201,6 +211,26 @@ fn parse_search(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
         return Err("search needs some words".into());
     }
     Ok((words.join(" "), out))
+}
+
+fn run_rebuild(out: Option<PathBuf>) -> ExitCode {
+    let Some(out) = out.or(settings::load().out_dir) else {
+        eprintln!("No output folder saved yet; pass --out <folder>.");
+        return ExitCode::from(2);
+    };
+    match archive::rebuild_catalog(&out) {
+        Ok(r) => {
+            println!("{} added, {} already in the catalogue", r.added, r.already_there);
+            for f in &r.failed {
+                println!("  not added: {f}");
+            }
+            if r.failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
+        }
+        Err(e) => {
+            eprintln!("Rebuild failed: {e:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run_search(words: &str, out: Option<PathBuf>) -> ExitCode {

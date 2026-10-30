@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 
-use attic_core::catalog::{CATALOG_FILE, Catalog, DuplicateGroup};
+use attic_core::catalog::{self, Catalog, DuplicateGroup};
 
 use crate::{App, card, heading, human, theme};
 
@@ -31,7 +31,7 @@ impl App {
             st.loaded = true;
             st.error = None;
             st.groups.clear();
-            if out.join(CATALOG_FILE).is_file() {
+            if catalog::exists(&out) {
                 match Catalog::open_existing(&out).and_then(|c| c.duplicate_groups(MAX_GROUPS)) {
                     Ok(g) => st.groups = g,
                     Err(e) => st.error = Some(format!("{e:#}")),

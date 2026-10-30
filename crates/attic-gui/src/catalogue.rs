@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 use eframe::egui::{self, RichText};
 
 use attic_core::archive;
-use attic_core::catalog::{ArchiveSummary, CATALOG_FILE, Catalog, FoundFile};
+use attic_core::catalog::{self, ArchiveSummary, Catalog, FoundFile};
 
 use crate::browse::Browse;
 use crate::{App, card, human, primary_button, theme};
@@ -28,6 +28,8 @@ pub struct State {
     error: Option<String>,
     note: Option<String>,
     extracting: Option<Receiver<Result<PathBuf, String>>>,
+    rebuilding: Option<Receiver<Result<archive::Rebuilt, String>>>,
+    rebuild_note: Option<String>,
     /// The archive open in the browser, which is the one picked in the
     /// archive filter while there is no search.
     browse: Option<Browse>,
@@ -44,7 +46,19 @@ impl State {
     }
 
     pub fn busy(&self) -> bool {
-        self.extracting.is_some()
+        self.extracting.is_some() || self.rebuilding.is_some()
+    }
+
+    /// Adds the archives in `out` that the catalogue is missing, from the
+    /// manifests inside them, in the background.
+    fn rebuild(&mut self, out: &std::path::Path) {
+        let (tx, rx) = channel();
+        let out = out.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(archive::rebuild_catalog(&out).map_err(|e| format!("{e:#}")));
+        });
+        self.rebuilding = Some(rx);
+        self.rebuild_note = Some("Reading the manifests inside the archives…".into());
     }
 }
 
@@ -64,11 +78,27 @@ impl App {
                 });
                 st.extracting = None;
             }
+        if let Some(rx) = &st.rebuilding
+            && let Ok(res) = rx.try_recv() {
+                st.rebuild_note = Some(match res {
+                    Ok(r) => {
+                        let mut n = format!("Rebuilt from the archives: {} added, {} already in the catalogue.", r.added, r.already_there);
+                        if !r.failed.is_empty() {
+                            n.push_str(&format!(" {} couldn't be read:\n{}", r.failed.len(), r.failed.join("\n")));
+                        }
+                        n
+                    }
+                    Err(e) => format!("Rebuild failed: {e}"),
+                });
+                st.rebuilding = None;
+                st.cleared = true;
+                st.invalidate();
+            }
         if !st.loaded {
             st.loaded = true;
             st.error = None;
             st.archives.clear();
-            if out.join(CATALOG_FILE).is_file() {
+            if catalog::exists(&out) {
                 match Catalog::open_existing(&out).and_then(|c| c.archives()) {
                     Ok(a) => st.archives = a,
                     Err(e) => st.error = Some(format!("{e:#}")),
@@ -102,8 +132,13 @@ impl App {
         }
         if st.archives.is_empty() {
             card(ui, |ui| {
-                ui.label("No archives in this destination yet. Archive some folders from New job first.");
-                if let Some(n) = &st.note {
+                ui.label("No archives in the catalogue. Archive some folders from New job, or if this folder already holds archives, rebuild the catalogue from them.");
+                ui.add_space(6.0);
+                let rebuild = egui::Button::new("Rebuild from archives");
+                if ui.add_enabled(!busy && st.rebuilding.is_none(), rebuild).clicked() {
+                    st.rebuild(&out);
+                }
+                for n in [&st.note, &st.rebuild_note].into_iter().flatten() {
                     ui.label(RichText::new(n).color(theme::muted()));
                 }
             });
@@ -129,8 +164,16 @@ impl App {
                 if ui.add_enabled(!busy, clear).on_hover_text("For development: forget every archive in this catalogue").clicked() {
                     st.confirm_clear = true;
                 }
+                let rebuild = egui::Button::new("Rebuild from archives");
+                let tip = "Add any archives in this folder that the catalogue is missing, from the manifests inside them";
+                if ui.add_enabled(!busy && st.rebuilding.is_none(), rebuild).on_hover_text(tip).clicked() {
+                    st.rebuild(&out);
+                }
             });
         });
+        if let Some(n) = &st.rebuild_note {
+            ui.label(RichText::new(n).color(theme::muted()));
+        }
         ui.add_space(8.0);
         if st.confirm_clear {
             confirm_clear(ui.ctx(), st, &out);
@@ -180,10 +223,11 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
         ui.set_max_width(460.0);
         ui.heading("Clear the catalogue?");
         ui.label(format!(
-            "Forgets all {} archives recorded in {}. The .7z files and their manifests stay on disk; \
-             only the catalogue's records go, so their folders show as not archived again.",
+            "Forgets all {} archives recorded in {}. The .7z files stay on disk with their manifests \
+             inside them, so Rebuild from archives can bring the records back. Until then their \
+             folders show as not archived.",
             st.archives.len(),
-            out.join(CATALOG_FILE).display()
+            catalog::db_path(out).display()
         ));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -192,6 +236,7 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
                 match Catalog::open_existing(out).and_then(|mut c| c.clear()) {
                     Ok(n) => {
                         st.note = Some(format!("Catalogue cleared: {n} archives forgotten."));
+                        st.rebuild_note = None;
                         st.cleared = true;
                         st.invalidate();
                         st.archive_filter = None;

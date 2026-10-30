@@ -144,7 +144,7 @@ impl Jobs {
         self.rows.clear();
         self.load_error = None;
         let out_key = catalog::path_key(out_dir);
-        let cat = if out_dir.join(catalog::CATALOG_FILE).is_file() {
+        let cat = if catalog::exists(out_dir) {
             Catalog::open_existing(out_dir).map(Some).map_err(|e| format!("{e:#}"))
         } else {
             Ok(None)

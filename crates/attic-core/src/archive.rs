@@ -23,7 +23,23 @@ use sevenz_turbo::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{ArchiveRecord, Catalog, EntryRecord, now_utc, path_key};
+use serde::{Deserialize, Serialize};
+
+use crate::catalog::{ArchiveRecord, Catalog, DATA_DIR, EntryRecord, now_utc, path_key};
+
+/// The manifest's path inside every archive: what the archive holds, with
+/// every file's hashes, so the record travels with the archive and the
+/// catalogue can be rebuilt from it.
+pub const MANIFEST_ENTRY: &str = ".atticarc/manifest.json";
+
+/// What an archive's manifest holds. Written inside the archive before it
+/// is finished, so `archive.archive_path` and `archive.archive_bytes` are
+/// empty there; [`read_manifest`] fills them in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Manifest {
+    pub archive: ArchiveRecord,
+    pub entries: Vec<EntryRecord>,
+}
 
 /// Files at least this big go in a block of their own; smaller files are
 /// packed into solid blocks that stay under it. Same as sevenz-turbo's
@@ -114,7 +130,14 @@ pub struct Scan {
 /// delete from.
 pub fn scan(root: &Path) -> Result<Scan> {
     let mut s = Scan::default();
-    for item in walkdir::WalkDir::new(root).follow_links(false).sort_by_file_name() {
+    // A top-level .atticarc is a manifest left by extracting an archive; the
+    // new archive gets its own instead.
+    let walk = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| !(e.depth() == 1 && e.file_name() == DATA_DIR));
+    for item in walk {
         let item = item.with_context(|| format!("can't read inside {}", root.display()))?;
         if item.depth() == 0 {
             continue;
@@ -275,9 +298,24 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     progress.set_phase("Scanning", 0);
     let scan = scan(&source)?;
 
+    let mut record = ArchiveRecord {
+        name: name.clone(),
+        archive_path: String::new(),
+        source_path: path_key(&source),
+        source_display: crate::settings::strip_verbatim(&source).to_string_lossy().into_owned(),
+        created_utc: now_utc(),
+        engine: settings.engine_label(),
+        level: settings.level,
+        threads: settings.threads,
+        input_bytes: scan.total_bytes,
+        archive_bytes: 0,
+        file_count: scan.files.len() as u64,
+        dir_count: scan.dirs.len() as u64,
+    };
+
     let result = (|| -> Result<(Vec<EntryRecord>, u64)> {
         progress.set_phase("Compressing", scan.total_bytes);
-        let entries = write_archive(&scan, &partial, settings, progress)?;
+        let entries = write_archive(&scan, &partial, settings, progress, &record)?;
         progress.set_phase("Verifying", scan.total_bytes);
         verify_archive(&partial, &entries, settings.threads, progress)?;
         let archive_bytes = std::fs::metadata(&partial)?.len();
@@ -297,22 +335,8 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
 
     std::fs::rename(&partial, &final_path)
         .with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
-    let record = ArchiveRecord {
-        name: name.clone(),
-        archive_path: crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned(),
-        source_path: path_key(&source),
-        source_display: crate::settings::strip_verbatim(&source).to_string_lossy().into_owned(),
-        created_utc: now_utc(),
-        engine: settings.engine_label(),
-        level: settings.level,
-        threads: settings.threads,
-        input_bytes: scan.total_bytes,
-        archive_bytes,
-        file_count: scan.files.len() as u64,
-        dir_count: scan.dirs.len() as u64,
-    };
-    let manifest = serde_json::json!({ "archive": &record, "entries": &entries });
-    std::fs::write(manifest_path(&final_path), serde_json::to_vec_pretty(&manifest)?)?;
+    record.archive_path = crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned();
+    record.archive_bytes = archive_bytes;
 
     let mut cat = Catalog::open(&out_dir)?;
     let archive_id = cat.insert_archive(&record, &entries)?;
@@ -325,8 +349,65 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links })
 }
 
-pub fn manifest_path(archive: &Path) -> PathBuf {
+/// Where earlier versions wrote an archive's manifest: a file beside it.
+fn old_manifest_path(archive: &Path) -> PathBuf {
     PathBuf::from(format!("{}.manifest.json", archive.display()))
+}
+
+/// Reads the manifest inside `archive`, or for archives made before
+/// manifests went inside, the `.manifest.json` file beside it. Only the
+/// manifest's own small block is decoded.
+pub fn read_manifest(archive: &Path) -> Result<Manifest> {
+    let mut reader = ArchiveReader::open(archive, Password::empty()).with_context(|| format!("can't open {}", archive.display()))?;
+    let bytes = match reader.read_file(MANIFEST_ENTRY) {
+        Ok(b) => b,
+        Err(_) => {
+            let old = old_manifest_path(archive);
+            std::fs::read(&old).map_err(|_| anyhow!("{} has no AtticARC manifest", archive.display()))?
+        }
+    };
+    let mut m: Manifest = serde_json::from_slice(&bytes).with_context(|| format!("the manifest in {} can't be read", archive.display()))?;
+    m.archive.archive_path = crate::settings::strip_verbatim(archive).to_string_lossy().into_owned();
+    m.archive.archive_bytes = std::fs::metadata(archive)?.len();
+    Ok(m)
+}
+
+/// What rebuilding a catalogue found.
+#[derive(Debug, Default)]
+pub struct Rebuilt {
+    pub added: u64,
+    pub already_there: u64,
+    /// Archives that couldn't be added, with the reason.
+    pub failed: Vec<String>,
+}
+
+/// Adds every .7z in `out_dir` that isn't in its catalogue yet, from the
+/// manifests the archives carry. Archives already catalogued are left alone.
+pub fn rebuild_catalog(out_dir: &Path) -> Result<Rebuilt> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(out_dir)
+        .with_context(|| format!("can't read {}", out_dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("7z")))
+        .collect();
+    found.sort();
+    let mut out = Rebuilt::default();
+    if found.is_empty() {
+        return Ok(out);
+    }
+    let mut cat = Catalog::open(out_dir)?;
+    for path in found {
+        let key = crate::settings::strip_verbatim(&path).to_string_lossy().into_owned();
+        if cat.has_archive_path(&key)? {
+            out.already_there += 1;
+            continue;
+        }
+        match read_manifest(&path).and_then(|m| cat.insert_archive(&m.archive, &m.entries)) {
+            Ok(_) => out.added += 1,
+            Err(e) => out.failed.push(format!("{}: {e:#}", path.file_name().unwrap_or_default().to_string_lossy())),
+        }
+    }
+    Ok(out)
 }
 
 fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
@@ -338,7 +419,16 @@ fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
     out_dir.join(format!("{name} ({stamp}).7z"))
 }
 
-fn write_archive(scan: &Scan, dest: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<Vec<EntryRecord>> {
+/// Writes the archive, with the manifest describing `record` and the files
+/// last in a small block of its own so it can be read without decoding the
+/// rest.
+fn write_archive(
+    scan: &Scan,
+    dest: &Path,
+    settings: &Settings,
+    progress: &Arc<Progress>,
+    record: &ArchiveRecord,
+) -> Result<Vec<EntryRecord>> {
     let hashes: Arc<Mutex<Vec<Option<FileHash>>>> = Arc::new(Mutex::new(vec![None; scan.files.len()]));
     let mut w = ArchiveWriter::create(dest).with_context(|| format!("can't create {}", dest.display()))?;
 
@@ -397,9 +487,32 @@ fn write_archive(scan: &Scan, dest: &Path, settings: &Settings, progress: &Arc<P
             w.push_archive_entries_send(entries, readers)?;
         }
     }
+    let records = file_records(scan, &hashes.lock().unwrap(), &is_store)?;
+    let manifest = serde_json::to_vec_pretty(&Manifest { archive: record.clone(), entries: records.clone() })?;
+    // Marked as a folder and hidden, so it stays out of the way when the
+    // archive is extracted on Windows too.
+    const HIDDEN: u32 = 0x2;
+    const DIRECTORY: u32 = 0x10;
+    let now = sevenz_turbo::NtTime::now();
+    let mut dir = ArchiveEntry::new_directory(DATA_DIR);
+    dir.has_windows_attributes = true;
+    dir.windows_attributes = DIRECTORY | HIDDEN;
+    dir.has_last_modified_date = true;
+    dir.last_modified_date = now;
+    w.push_archive_entry::<File>(dir, None)?;
+    let mut entry = ArchiveEntry::new_file(MANIFEST_ENTRY);
+    entry.size = manifest.len() as u64;
+    entry.has_last_modified_date = true;
+    entry.last_modified_date = now;
+    w.set_content_methods(vec![lzma2_config(5, 1)]);
+    w.push_archive_entry(entry, Some(io::Cursor::new(manifest)))?;
     w.finish().with_context(|| format!("can't finish {}", dest.display()))?;
+    Ok(records)
+}
 
-    let hashes = hashes.lock().unwrap();
+/// The catalogue records for everything in `scan`, once every file has
+/// been read and hashed.
+fn file_records(scan: &Scan, hashes: &[Option<FileHash>], is_store: &dyn Fn(&ScannedFile) -> bool) -> Result<Vec<EntryRecord>> {
     let mut records: Vec<EntryRecord> = scan
         .dirs
         .iter()
@@ -455,6 +568,15 @@ pub fn verify_archive(archive: &Path, expected: &[EntryRecord], threads: u32, pr
     reader
         .for_each_entries(|entry, data| {
             if entry.is_directory() {
+                return Ok(true);
+            }
+            if entry.name() == MANIFEST_ENTRY {
+                let mut bytes = Vec::new();
+                data.read_to_end(&mut bytes)?;
+                match serde_json::from_slice::<Manifest>(&bytes) {
+                    Ok(m) if m.entries.len() == expected.len() => {}
+                    _ => problems.push("the manifest in the archive doesn't match the record".into()),
+                }
                 return Ok(true);
             }
             let mut h = blake3::Hasher::new();
@@ -711,10 +833,53 @@ mod tests {
         assert!(cat.search("notes", None, 5).unwrap().is_empty());
         assert!(cat.archived_folder(&src).unwrap().is_none());
         assert!(a.archive_path.is_file());
-        assert!(manifest_path(&a.archive_path).is_file());
         // Archiving again works and is searchable.
         archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
         assert_eq!(Catalog::open_existing(&out).unwrap().search("notes", None, 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rebuilding_the_catalogue_from_the_archives() {
+        let (_tmp, src, out) = run(true);
+        let (a, before) = recorded(&out, &src);
+        Catalog::open_existing(&out).unwrap().clear().unwrap();
+        // Something that isn't an AtticARC archive is reported, not added.
+        std::fs::write(out.join("other.7z"), b"not an archive").unwrap();
+        let r = rebuild_catalog(&out).unwrap();
+        assert_eq!((r.added, r.already_there, r.failed.len()), (1, 0, 1), "{r:?}");
+        let (b, after) = recorded(&out, &src);
+        assert_eq!(after, before);
+        assert_eq!(b.archive_path, a.archive_path);
+        assert_eq!(b.archive_bytes, a.archive_bytes);
+        let r = rebuild_catalog(&out).unwrap();
+        assert_eq!((r.added, r.already_there), (0, 1));
+    }
+
+    #[test]
+    fn old_catalogue_moves_into_its_folder() {
+        let (_tmp, _src, out) = run(true);
+        let db = crate::catalog::db_path(&out);
+        std::fs::rename(&db, out.join("catalog.db")).unwrap();
+        std::fs::remove_dir_all(out.join(".atticarc")).unwrap();
+        assert!(crate::catalog::exists(&out));
+        assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
+        assert!(db.is_file());
+        assert!(!out.join("catalog.db").exists());
+    }
+
+    #[test]
+    fn extracted_manifest_is_not_archived_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        make_tree(&src);
+        std::fs::create_dir_all(src.join(".atticarc")).unwrap();
+        std::fs::write(src.join(".atticarc/manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(src.join("sub/.atticarc")).unwrap();
+        let s = scan(&src).unwrap();
+        assert!(!s.files.iter().any(|f| f.rel.starts_with(".atticarc")));
+        assert!(s.dirs.iter().any(|d| d.1 == "sub/.atticarc"), "only the top-level one is skipped");
+        let o = archive_folder(&src, &settings(&tmp.path().join("out"), true), &Arc::new(Progress::default())).unwrap();
+        assert_eq!(o.record.file_count, 5);
     }
 
     #[test]
@@ -730,7 +895,15 @@ mod tests {
             let (_tmp, src, out) = run(store);
             let (a, entries) = recorded(&out, &src);
             assert!(a.archive_path.ends_with("My Folder.7z"));
-            assert!(manifest_path(&a.archive_path).is_file());
+            // The manifest is inside the archive and only archives are left
+            // in the output folder.
+            let m = read_manifest(&a.archive_path).unwrap();
+            assert_eq!(m.entries, entries);
+            assert_eq!(m.archive.file_count, 5);
+            let mut names: Vec<_> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            assert_eq!(names, [".atticarc", "My Folder.7z"]);
+            assert!(crate::catalog::db_path(&out).is_file());
             assert!(!PathBuf::from(format!("{}.partial", a.archive_path.display())).exists());
             let zip = entries.iter().find(|e| e.rel_path == "sub/already.zip").unwrap();
             assert_eq!(zip.method, if store { "copy" } else { "lzma2" });
