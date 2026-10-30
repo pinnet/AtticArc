@@ -299,7 +299,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         .with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
     let record = ArchiveRecord {
         name: name.clone(),
-        archive_path: final_path.to_string_lossy().into_owned(),
+        archive_path: crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned(),
         source_path: path_key(&source),
         created_utc: now_utc(),
         engine: settings.engine_label(),
@@ -679,6 +679,13 @@ mod tests {
         let a = cat.archived_folder(src).unwrap().expect("archived");
         let e = cat.entries(a.archive_id).unwrap();
         (a, e)
+    }
+
+    #[test]
+    fn archive_path_is_stored_in_plain_form() {
+        let (_tmp, src, out) = run(true);
+        let (a, _) = recorded(&out, &src);
+        assert!(!a.archive_path.to_string_lossy().starts_with(r"\\?\"), "{}", a.archive_path.display());
     }
 
     #[test]
