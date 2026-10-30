@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{ArchiveRecord, Catalog, DATA_DIR, EntryRecord, now_utc, path_key};
+use crate::exclude::{Exclusions, Rule};
 
 /// The manifest's path inside every archive: what the archive holds, with
 /// every file's hashes, so the record travels with the archive and the
@@ -63,6 +64,8 @@ pub struct Settings {
     pub threads: u32,
     /// Folders the app never deletes from, whatever their state.
     pub protected: Vec<PathBuf>,
+    /// Files to leave out of archives.
+    pub exclusions: Vec<Rule>,
 }
 
 impl Settings {
@@ -123,12 +126,19 @@ pub struct Scan {
     pub total_bytes: u64,
     /// Links and junctions, which are not followed or archived.
     pub skipped_links: Vec<String>,
+    /// Files left out by the exclusions.
+    pub excluded: Vec<String>,
 }
 
 /// Walks `root` without following links or junctions. Any folder or file
 /// that can't be listed is an error: a partial archive would be unsafe to
 /// delete from.
 pub fn scan(root: &Path) -> Result<Scan> {
+    scan_excluding(root, &Exclusions::default())
+}
+
+/// [`scan`], leaving out the files `exclusions` match.
+pub fn scan_excluding(root: &Path, exclusions: &Exclusions) -> Result<Scan> {
     let mut s = Scan::default();
     // A top-level .atticarc is a manifest left by extracting an archive; the
     // new archive gets its own instead.
@@ -148,6 +158,8 @@ pub fn scan(root: &Path) -> Result<Scan> {
             s.skipped_links.push(rel);
         } else if ft.is_dir() {
             s.dirs.push((item.path().to_path_buf(), rel));
+        } else if ft.is_file() && exclusions.excludes(&rel) {
+            s.excluded.push(rel);
         } else if ft.is_file() {
             let meta = item.metadata().with_context(|| format!("can't read {}", item.path().display()))?;
             s.total_bytes += meta.len();
@@ -265,12 +277,14 @@ fn lzma2_config(level: u32, threads: u32) -> EncoderConfiguration {
 pub struct ArchiveOutcome {
     pub record: ArchiveRecord,
     pub skipped_links: Vec<String>,
+    pub excluded: Vec<String>,
 }
 
 /// Archives `source` into `settings.out_dir`, verifies the archive by
 /// decoding it, and only then records it in the catalog.
 pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<ArchiveOutcome> {
     let started = now_utc();
+    let exclusions = Exclusions::new(&settings.exclusions).context("an exclusion can't be used")?;
     let source = std::fs::canonicalize(source).with_context(|| format!("can't open {}", source.display()))?;
     // Check before creating the output folder, so a protected folder never
     // gains one, and again after, once the path can be fully resolved.
@@ -296,7 +310,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     let partial = PathBuf::from(format!("{}.partial", final_path.display()));
 
     progress.set_phase("Scanning", 0);
-    let scan = scan(&source)?;
+    let scan = scan_excluding(&source, &exclusions)?;
 
     let mut record = ArchiveRecord {
         name: name.clone(),
@@ -340,13 +354,16 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
 
     let mut cat = Catalog::open(&out_dir)?;
     let archive_id = cat.insert_archive(&record, &entries)?;
-    let detail = if scan.skipped_links.is_empty() {
-        String::new()
-    } else {
-        format!("links not followed: {}", scan.skipped_links.join(", "))
-    };
+    let mut detail = Vec::new();
+    if !scan.skipped_links.is_empty() {
+        detail.push(format!("links not followed: {}", scan.skipped_links.join(", ")));
+    }
+    if !scan.excluded.is_empty() {
+        detail.push(format!("excluded: {}", scan.excluded.join(", ")));
+    }
+    let detail = detail.join("; ");
     cat.log_run(Some(archive_id), "archive", &source, &started, "verified", &detail)?;
-    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links })
+    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded: scan.excluded })
 }
 
 /// Where earlier versions wrote an archive's manifest: a file beside it.
@@ -694,7 +711,7 @@ pub fn check_before_delete(
     let mut problems = Vec::new();
     for f in &now.files {
         match rec_files.get(f.rel.as_str()) {
-            None => problems.push(format!("{} is new since the folder was archived", f.rel)),
+            None => problems.push(format!("{} isn't in the archive: it is new, or an exclusion left it out", f.rel)),
             Some(r) if r.size != f.size => problems.push(format!("{} has changed size since it was archived", f.rel)),
             _ => {}
         }
@@ -766,7 +783,7 @@ mod tests {
     use std::io::Write;
 
     fn settings(out: &Path, store: bool) -> Settings {
-        Settings { out_dir: out.to_path_buf(), level: 5, store_mode: store, threads: 4, protected: vec![] }
+        Settings { out_dir: out.to_path_buf(), level: 5, store_mode: store, threads: 4, protected: vec![], exclusions: vec![] }
     }
 
     /// A tree with the awkward cases: Unicode names, an empty folder, an
@@ -872,6 +889,27 @@ mod tests {
     }
 
     #[test]
+    fn excluded_files_stay_out_and_block_deleting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        make_tree(&src);
+        std::fs::write(src.join("sub/Shortcut.LNK"), b"link").unwrap();
+        let mut s = settings(&out, true);
+        s.exclusions = vec![Rule { enabled: true, kind: crate::exclude::Kind::Wildcard, pattern: "*.lnk".into() }];
+        let o = archive_folder(&src, &s, &Arc::new(Progress::default())).unwrap();
+        assert_eq!(o.excluded, ["sub/Shortcut.LNK"]);
+        assert_eq!(o.record.file_count, 5);
+        let (a, entries) = recorded(&out, &src);
+        assert!(!entries.iter().any(|e| e.rel_path.ends_with(".LNK")));
+        let e = check_before_delete(&src, &a.archive_path, &entries, 2, &Arc::new(Progress::default())).err().unwrap();
+        assert!(format!("{e:#}").contains("sub/Shortcut.LNK isn't in the archive"), "{e:#}");
+        // A rule that doesn't compile stops the job before anything is written.
+        s.exclusions = vec![Rule { enabled: true, kind: crate::exclude::Kind::Regex, pattern: "*.lnk".into() }];
+        assert!(archive_folder(&src, &s, &Arc::new(Progress::default())).is_err());
+    }
+
+    #[test]
     fn extracted_manifest_is_not_archived_again() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
@@ -966,7 +1004,7 @@ mod tests {
         std::fs::write(src.join("sub/new.txt"), "new").unwrap();
         let p = Arc::new(Progress::default());
         let e = check_before_delete(&src, &a.archive_path, &entries, 4, &p).err().unwrap();
-        assert!(format!("{e:#}").contains("sub/new.txt is new"), "{e:#}");
+        assert!(format!("{e:#}").contains("sub/new.txt isn't in the archive: it is new"), "{e:#}");
     }
 
     #[test]

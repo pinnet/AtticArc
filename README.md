@@ -61,6 +61,11 @@ Starts on the given source folder (or the last one used).
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
   **X** that starts the check-then-delete flow.
+- **New job → Exclusions**: rules for files to leave out of archives, each ticked on or off. A
+  *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a folder,
+  `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is ignored.
+  An unticked `*.lnk` rule is there to start from. A folder that still holds an excluded file can't be
+  deleted, because its archive doesn't have that file.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and

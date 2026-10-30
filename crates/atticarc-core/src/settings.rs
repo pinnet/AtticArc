@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::archive::{self, Settings};
+use crate::exclude::{self, Rule};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -20,6 +21,8 @@ pub struct Saved {
     pub store_mode: bool,
     pub threads: Threads,
     pub protected: Vec<PathBuf>,
+    /// Files to leave out of archives.
+    pub exclusions: Vec<Rule>,
     /// GUI colour scheme.
     pub dark_mode: bool,
 }
@@ -60,6 +63,7 @@ impl Default for Saved {
             store_mode: true,
             threads: Threads::All,
             protected: vec![r"C:\7ztest".into(), r"D:\7ztest".into(), r"W:\7ztest".into()],
+            exclusions: exclude::default_rules(),
             dark_mode: false,
         }
     }
@@ -74,6 +78,7 @@ impl Saved {
             store_mode: self.store_mode,
             threads: self.threads.count(),
             protected: self.protected.clone(),
+            exclusions: self.exclusions.clone(),
         }
     }
 }

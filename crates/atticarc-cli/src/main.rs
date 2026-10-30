@@ -186,6 +186,9 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 if !o.skipped_links.is_empty() {
                     println!("  links not followed: {}", o.skipped_links.join(", "));
                 }
+                if !o.excluded.is_empty() {
+                    println!("  excluded: {}", o.excluded.join(", "));
+                }
             }
             Err(e) => {
                 failed += 1;

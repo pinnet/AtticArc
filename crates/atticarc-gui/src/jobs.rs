@@ -359,6 +359,9 @@ impl Jobs {
                         if !o.skipped_links.is_empty() {
                             note.push_str(&format!(", {} links skipped", o.skipped_links.len()));
                         }
+                        if !o.excluded.is_empty() {
+                            note.push_str(&format!(", {} files excluded", o.excluded.len()));
+                        }
                         note
                     })
                     .map_err(|e| format!("{e:#}"));
