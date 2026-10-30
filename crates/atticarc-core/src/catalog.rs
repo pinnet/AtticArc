@@ -130,6 +130,17 @@ CREATE TABLE IF NOT EXISTS runs (
     outcome         TEXT NOT NULL,
     detail          TEXT NOT NULL
 );
+
+-- Files the exclusions left out of an archive: set aside in a second
+-- archive (aside_archive is its file name) or discarded.
+CREATE TABLE IF NOT EXISTS excluded (
+    archive_id      INTEGER NOT NULL REFERENCES archives(id),
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    action          TEXT NOT NULL,
+    aside_archive   TEXT
+);
+CREATE INDEX IF NOT EXISTS excluded_archive ON excluded(archive_id);
 "#;
 
 /// One file or folder as recorded in the catalog and the manifest.
@@ -324,6 +335,83 @@ impl Catalog {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Records what the exclusions left out of an archive.
+    pub fn insert_excluded(&mut self, archive_id: i64, ex: &crate::archive::Excluded) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut q = tx.prepare(
+                "INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in &ex.set_aside {
+                q.execute(params![archive_id, e.rel_path, e.size as i64, "set_aside", ex.set_aside_archive])?;
+            }
+            for e in &ex.discarded {
+                q.execute(params![archive_id, e.rel_path, e.size as i64, "discard", Option::<String>::None])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every verified archive whose folder had files left out by the
+    /// exclusions, newest first.
+    pub fn excluded_folders(&self) -> Result<Vec<ExcludedFolder>> {
+        let mut q = self.conn.prepare(
+            "SELECT a.id, a.name, a.archive_path, COALESCE(a.source_display, a.source_path), a.created_utc,
+                    a.archive_bytes, a.source_deleted_utc
+             FROM archives a
+             WHERE a.status = 'verified' AND EXISTS (SELECT 1 FROM excluded x WHERE x.archive_id = a.id)
+             ORDER BY a.id DESC",
+        )?;
+        let mut out: Vec<ExcludedFolder> = q
+            .query_map([], |r| {
+                Ok(ExcludedFolder {
+                    archive: ArchivedFolder {
+                        archive_id: r.get(0)?,
+                        archive_path: PathBuf::from(r.get::<_, String>(2)?),
+                        created_utc: r.get(4)?,
+                        archive_bytes: r.get::<_, i64>(5)? as u64,
+                    },
+                    name: r.get(1)?,
+                    source: PathBuf::from(r.get::<_, String>(3)?),
+                    source_deleted_utc: r.get(6)?,
+                    aside_archive: None,
+                    set_aside: Vec::new(),
+                    discarded: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut files = self.conn.prepare(
+            "SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path",
+        )?;
+        for f in &mut out {
+            let rows = files.query_map(params![f.archive.archive_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+            })?;
+            for row in rows {
+                let (rel, size, action, aside) = row?;
+                if action == "discard" {
+                    f.discarded.push((rel, size));
+                } else {
+                    f.set_aside.push((rel, size));
+                    if f.aside_archive.is_none() {
+                        f.aside_archive = aside.map(|n| f.archive.archive_path.with_file_name(n));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The catalogue id of the archive at `path`, if it is catalogued.
+    pub fn archive_id_for(&self, path: &Path) -> Result<Option<i64>> {
+        let key = crate::settings::strip_verbatim(path).to_string_lossy().into_owned();
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM archives WHERE archive_path = ?1 ORDER BY id DESC LIMIT 1", params![key], |r| r.get(0))
+            .optional()?)
+    }
+
     pub fn mark_source_deleted(&self, archive_id: i64, when_utc: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1",
@@ -357,7 +445,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)
@@ -505,6 +593,23 @@ pub struct FoundFile {
     pub sha256: Option<String>,
     /// How many catalogued files share this file's size and hash, itself included.
     pub copies: u64,
+}
+
+/// A folder some of whose files the exclusions left out of its archive.
+#[derive(Clone, Debug)]
+pub struct ExcludedFolder {
+    /// The folder's main archive.
+    pub archive: ArchivedFolder,
+    pub name: String,
+    /// The folder that was archived, as spelled on disk.
+    pub source: PathBuf,
+    pub source_deleted_utc: Option<String>,
+    /// The second archive holding the set-aside files.
+    pub aside_archive: Option<PathBuf>,
+    /// (path inside the folder, size) of each set-aside file.
+    pub set_aside: Vec<(String, u64)>,
+    /// (path inside the folder, size) of each discarded file.
+    pub discarded: Vec<(String, u64)>,
 }
 
 /// What one archive holds, as recorded in the catalogue.

@@ -45,6 +45,13 @@ impl State {
         self.browse = None;
     }
 
+    /// Opens archive `id` in the browser, as if picked in the archive list.
+    pub fn show_archive(&mut self, id: i64) {
+        self.query.clear();
+        self.archive_filter = Some(id);
+        self.browse = None;
+    }
+
     pub fn busy(&self) -> bool {
         self.extracting.is_some() || self.rebuilding.is_some()
     }

@@ -61,11 +61,17 @@ Starts on the given source folder (or the last one used).
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
   **X** that starts the check-then-delete flow.
-- **New job → Exclusions**: rules for files to leave out of archives, each ticked on or off. A
-  *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a folder,
-  `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is ignored.
-  An unticked `*.lnk` rule is there to start from. A folder that still holds an excluded file can't be
-  deleted, because its archive doesn't have that file.
+- **New job → Exclusions**: rules for files to leave out of the main archive, each ticked on or off.
+  A *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a
+  folder, `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is
+  ignored. Each rule either **sets aside** its files, into a second verified archive
+  `<folder>.excluded.7z`, or **discards** them (junk such as shortcuts): they are archived nowhere,
+  but the manifest lists them with their hashes. If both kinds match, the file is set aside. An
+  unticked `*.lnk` discard rule is there to start from.
+- **Excluded**: every archived folder whose exclusions left files out, with what was set aside or
+  discarded, buttons to browse either archive, and **Delete the folder…**. Deleting checks every file
+  in the folder against the main archive, the set-aside archive or the discard list (same hash), and
+  the confirmation lists the discarded files that will be gone for good.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and

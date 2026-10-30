@@ -186,8 +186,14 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 if !o.skipped_links.is_empty() {
                     println!("  links not followed: {}", o.skipped_links.join(", "));
                 }
-                if !o.excluded.is_empty() {
-                    println!("  excluded: {}", o.excluded.join(", "));
+                let names = |v: &[atticarc_core::catalog::EntryRecord]| {
+                    v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ")
+                };
+                if let Some(a) = &o.excluded.set_aside_archive {
+                    println!("  set aside in {a}: {}", names(&o.excluded.set_aside));
+                }
+                if !o.excluded.discarded.is_empty() {
+                    println!("  discarded: {}", names(&o.excluded.discarded));
                 }
             }
             Err(e) => {

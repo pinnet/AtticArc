@@ -8,9 +8,12 @@
 //! one character. A regular expression matches anywhere in the path unless
 //! anchored with `^` or `$`.
 //!
-//! Excluded files are not in the archive, so a folder that still holds one
-//! can't be deleted: the check before deleting finds a file the archive
-//! doesn't have.
+//! Each rule also says what happens to the files it leaves out. *Set aside*
+//! files go into a second archive beside the main one,
+//! `<folder>.excluded.7z`, verified and catalogued like any other.
+//! *Discard* files (junk such as shortcuts) are archived nowhere; the main
+//! archive's manifest lists them with their hashes, and they are deleted
+//! with the folder. If both kinds of rule match a file, it is set aside.
 
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
@@ -21,6 +24,23 @@ pub enum Kind {
     #[default]
     Wildcard,
     Regex,
+}
+
+/// What happens to the files a rule leaves out.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Action {
+    #[default]
+    SetAside,
+    Discard,
+}
+
+impl Action {
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::SetAside => "Set aside",
+            Action::Discard => "Discard",
+        }
+    }
 }
 
 impl Kind {
@@ -38,11 +58,12 @@ pub struct Rule {
     pub enabled: bool,
     pub kind: Kind,
     pub pattern: String,
+    pub action: Action,
 }
 
 impl Default for Rule {
     fn default() -> Self {
-        Self { enabled: true, kind: Kind::Wildcard, pattern: String::new() }
+        Self { enabled: true, kind: Kind::Wildcard, pattern: String::new(), action: Action::SetAside }
     }
 }
 
@@ -63,7 +84,7 @@ impl Rule {
 /// The enabled rules, ready to match paths.
 #[derive(Clone, Debug, Default)]
 pub struct Exclusions {
-    rules: Vec<Regex>,
+    rules: Vec<(Regex, Action)>,
 }
 
 impl Exclusions {
@@ -73,14 +94,28 @@ impl Exclusions {
         let rules = rules
             .iter()
             .filter(|r| r.enabled && !r.pattern.trim().is_empty())
-            .map(Rule::compile)
+            .map(|r| Ok((r.compile()?, r.action)))
             .collect::<Result<_>>()?;
         Ok(Self { rules })
     }
 
-    /// Whether the file at `rel` (`/` separated, inside the folder) is left out.
+    /// Whether the file at `rel` (`/` separated, inside the folder) is left
+    /// out, and if so what happens to it.
+    pub fn action(&self, rel: &str) -> Option<Action> {
+        let mut found = None;
+        for (re, action) in &self.rules {
+            if re.is_match(rel) {
+                if *action == Action::SetAside {
+                    return Some(Action::SetAside);
+                }
+                found = Some(*action);
+            }
+        }
+        found
+    }
+
     pub fn excludes(&self, rel: &str) -> bool {
-        self.rules.iter().any(|r| r.is_match(rel))
+        self.action(rel).is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -88,9 +123,9 @@ impl Exclusions {
     }
 }
 
-/// The rule the New job page starts with: shortcuts, switched off.
+/// The rule the New job page starts with: discard shortcuts, switched off.
 pub fn default_rules() -> Vec<Rule> {
-    vec![Rule { enabled: false, kind: Kind::Wildcard, pattern: "*.lnk".into() }]
+    vec![Rule { enabled: false, kind: Kind::Wildcard, pattern: "*.lnk".into(), action: Action::Discard }]
 }
 
 fn wildcard_regex(pattern: &str) -> String {
@@ -117,7 +152,7 @@ mod tests {
     use super::*;
 
     fn ex(kind: Kind, pattern: &str) -> Exclusions {
-        Exclusions::new(&[Rule { enabled: true, kind, pattern: pattern.into() }]).unwrap()
+        Exclusions::new(&[Rule { enabled: true, kind, pattern: pattern.into(), action: Action::SetAside }]).unwrap()
     }
 
     #[test]
@@ -145,10 +180,19 @@ mod tests {
         let r = ex(Kind::Regex, r"\.(tmp|bak)$");
         assert!(r.excludes("x/file.TMP"));
         assert!(!r.excludes("x/file.tmpl"));
-        assert!(Exclusions::new(&[Rule { enabled: true, kind: Kind::Regex, pattern: "*.lnk".into() }]).is_err());
+        assert!(Exclusions::new(&[Rule { kind: Kind::Regex, pattern: "*.lnk".into(), ..Rule::default() }]).is_err());
         let off = Exclusions::new(&default_rules()).unwrap();
         assert!(off.is_empty() && !off.excludes("a.lnk"));
         let blank = Exclusions::new(&[Rule::default()]).unwrap();
         assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn set_aside_wins_over_discard() {
+        let rule = |pattern: &str, action| Rule { pattern: pattern.into(), action, ..Rule::default() };
+        let e = Exclusions::new(&[rule("*.lnk", Action::Discard), rule("keep/**", Action::SetAside)]).unwrap();
+        assert_eq!(e.action("a/x.lnk"), Some(Action::Discard));
+        assert_eq!(e.action("keep/x.lnk"), Some(Action::SetAside));
+        assert_eq!(e.action("keep.txt"), None);
     }
 }

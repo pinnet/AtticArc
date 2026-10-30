@@ -8,6 +8,7 @@
 mod browse;
 mod catalogue;
 mod duplicates;
+mod excluded;
 mod jobs;
 mod new_job;
 mod progress;
@@ -48,10 +49,11 @@ pub enum Screen {
     Progress,
     Catalogue,
     Duplicates,
+    Excluded,
 }
 
 impl Screen {
-    const ALL: [Screen; 4] = [Screen::NewJob, Screen::Progress, Screen::Catalogue, Screen::Duplicates];
+    const ALL: [Screen; 5] = [Screen::NewJob, Screen::Progress, Screen::Catalogue, Screen::Duplicates, Screen::Excluded];
 
     fn label(self) -> &'static str {
         match self {
@@ -59,6 +61,7 @@ impl Screen {
             Screen::Progress => "Progress",
             Screen::Catalogue => "Catalogue",
             Screen::Duplicates => "Duplicates",
+            Screen::Excluded => "Excluded",
         }
     }
 }
@@ -72,6 +75,7 @@ pub struct App {
     jobs: Jobs,
     catalogue: catalogue::State,
     duplicates: duplicates::State,
+    excluded: excluded::State,
 }
 
 impl App {
@@ -93,6 +97,7 @@ impl App {
             jobs: Jobs::new(),
             catalogue: catalogue::State::default(),
             duplicates: duplicates::State::default(),
+            excluded: excluded::State::default(),
         };
         app.reload();
         app
@@ -122,6 +127,7 @@ impl App {
         self.jobs.reload(&self.source_dir, &out);
         self.catalogue.invalidate();
         self.duplicates.invalidate();
+        self.excluded.invalidate();
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -167,9 +173,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let out = self.out_dir();
         let finished_batch = self.jobs.handle_messages(&out);
-        if finished_batch {
+        if finished_batch || std::mem::take(&mut self.jobs.deleted) {
             self.catalogue.invalidate();
             self.duplicates.invalidate();
+            self.excluded.invalidate();
         }
         egui::Panel::left("nav")
             .resizable(false)
@@ -183,6 +190,7 @@ impl eframe::App for App {
                 Screen::Progress => self.progress(ui),
                 Screen::Catalogue => self.catalogue(ui),
                 Screen::Duplicates => self.duplicates(ui),
+                Screen::Excluded => self.excluded(ui),
             });
         let ctx = ui.ctx().clone();
         let settings = self.settings();
