@@ -103,8 +103,8 @@ pub fn store(s: &Saved) {
     }
 }
 
-/// Beside the source folder, never inside it, in a shared `Attic archives`
-/// folder: `D:\Photos` → `D:\Attic archives\Photos`. Never inside the source,
+/// Beside the source folder, never inside it, in a shared `Attic ARC archives`
+/// folder: `D:\Photos` → `D:\Attic ARC archives\Photos`. Never inside the source,
 /// because the source may be protected or deleted later.
 pub fn default_out_dir(source: &Path) -> PathBuf {
     match (source.parent(), source.file_name()) {
@@ -113,7 +113,7 @@ pub fn default_out_dir(source: &Path) -> PathBuf {
     }
 }
 
-const OUT_DIR_NAME: &str = "Attic archives";
+const OUT_DIR_NAME: &str = "Attic ARC archives";
 
 /// `\\?\C:\x` → `C:\x`, the form people expect to see.
 pub fn strip_verbatim(p: &Path) -> PathBuf {
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn out_dir_sits_next_to_source() {
         let d = default_out_dir(Path::new("/data/Photos"));
-        assert_eq!(d, Path::new("/data/Attic archives/Photos"));
-        assert_eq!(default_out_dir(Path::new("/")), Path::new("/Attic archives"));
+        assert_eq!(d, Path::new("/data/Attic ARC archives/Photos"));
+        assert_eq!(default_out_dir(Path::new("/")), Path::new("/Attic ARC archives"));
     }
 }

@@ -12,7 +12,7 @@ use crate::{App, Screen, card, duration, heading, human, theme};
 impl App {
     pub fn progress(&mut self, ui: &mut egui::Ui) {
         let Some(b) = &self.jobs.batch else {
-            heading(ui, "Progress", "Nothing has been archived since Attic started.");
+            heading(ui, "Progress", "Nothing has been archived since Attic ARC started.");
             if ui.button("Go to New job").clicked() {
                 self.screen = Screen::NewJob;
             }

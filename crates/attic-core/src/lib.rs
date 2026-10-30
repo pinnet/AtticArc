@@ -1,4 +1,4 @@
-//! Attic core: everything the CLI and GUI share.
+//! Attic ARC core: everything the CLI and GUI share.
 //!
 //! The pipeline, in order:
 //! 1. [`scan`]: walk a source folder and record path, size and modified time (fast, no file reads).

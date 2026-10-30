@@ -7,7 +7,7 @@ use attic_core::catalog::Catalog;
 use attic_core::{scan, settings};
 
 const USAGE: &str = "\
-Attic – archive, catalogue and de-duplicate folders
+Attic ARC – archive, catalogue and de-duplicate folders
 
 Usage:
   attic scan <folder> [--top N]   List files and show possible duplicates (by size).
