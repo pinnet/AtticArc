@@ -234,37 +234,83 @@ fn load_browse(st: &mut State, out: &std::path::Path) {
 }
 
 /// The page title in the heading style, followed while browsing by the
-/// archive and each folder down to the open one. Every part but the last
-/// can be clicked to go back up to it.
+/// archive and each folder down to the open one, highlighted in the accent
+/// colour. Every part but the last can be clicked to go back up to it. The
+/// text shrinks to stay on one line; if even the smallest size is too wide,
+/// folders in the middle fold into "…" first.
 fn title(ui: &mut egui::Ui, st: &mut State) {
+    const FULL: f32 = 26.0;
+    const SMALLEST: f32 = 15.0;
+    const GAP: f32 = 10.0;
     let browsing = st.query.trim().is_empty() && st.browse.is_some();
-    let mut parts = vec![("Catalogue".to_string(), None)];
+    // (text, where clicking goes, highlighted): None goes to all archives.
+    let mut parts: Vec<(String, Option<Option<String>>, bool)> = vec![("Catalogue".into(), Some(None), false)];
+    let mut full_path = String::new();
     if browsing && let Some(b) = &st.browse {
         if let Some(a) = st.archives.iter().find(|a| a.id == b.archive_id) {
-            parts.push((format!("{}.7z", a.name), Some(String::new())));
+            full_path = format!("{}.7z", a.name);
+            parts.push((full_path.clone(), Some(Some(String::new())), true));
         }
-        parts.extend(b.crumbs().into_iter().map(|(name, path)| (name, Some(path))));
+        for (name, path) in b.crumbs() {
+            full_path = format!("{full_path} › {name}");
+            parts.push((name, Some(Some(path)), true));
+        }
     }
-    let last = parts.len() - 1;
+    if let Some(last) = parts.last_mut() {
+        last.1 = None;
+    }
+
+    let avail = ui.available_width();
+    let width_at = |parts: &[(String, Option<Option<String>>, bool)], size: f32| -> f32 {
+        let font = egui::FontId::proportional(size);
+        let text: f32 = ui.fonts_mut(|f| {
+            parts.iter().map(|p| f.layout_no_wrap(p.0.clone(), font.clone(), theme::ink()).size().x).sum::<f32>()
+                + f.layout_no_wrap("›".into(), font.clone(), theme::ink()).size().x * (parts.len() - 1) as f32
+        });
+        text + GAP * (2 * parts.len() - 2) as f32
+    };
+    // Fold middle folders into "…" until the path fits at the smallest
+    // size, then make it as large as fits.
+    let mut folded = false;
+    while width_at(&parts, SMALLEST) > avail && parts.len() > 3 {
+        let at = if folded { 3 } else { 2 };
+        if parts.len() <= at + 1 {
+            break;
+        }
+        parts.remove(at);
+        if !folded {
+            parts.insert(2, ("…".into(), None, true));
+            folded = true;
+        }
+    }
+    let size = (FULL * avail / width_at(&parts, FULL)).clamp(SMALLEST, FULL);
+
     let mut go: Option<Option<String>> = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        for (i, (name, path)) in parts.into_iter().enumerate() {
+    let resp = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        for (i, (name, target, highlight)) in parts.into_iter().enumerate() {
             if i > 0 {
-                ui.label(RichText::new("›").size(26.0).color(theme::muted()));
+                ui.label(RichText::new("›").size(size).color(theme::muted()));
             }
-            let text = RichText::new(name).size(26.0).strong().color(theme::ink());
-            if i == last {
-                ui.label(text);
-            } else {
-                let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
-                let tip = if path.is_none() { "Show all archives" } else { "Go back to this folder" };
-                if resp.on_hover_text(tip).clicked() {
-                    go = Some(path);
+            let color = if highlight { theme::accent_text() } else { theme::ink() };
+            let text = RichText::new(name).size(size).strong().color(color);
+            match target {
+                None => {
+                    ui.add(egui::Label::new(text).extend());
+                }
+                Some(t) => {
+                    let tip = if t.is_none() { "Show all archives" } else { "Go back to this folder" };
+                    let r = ui.add(egui::Label::new(text).extend().sense(egui::Sense::click()));
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                        go = Some(t);
+                    }
                 }
             }
         }
     });
+    if folded {
+        resp.response.on_hover_text(full_path);
+    }
     match go {
         Some(None) => st.archive_filter = None,
         Some(Some(p)) => {
