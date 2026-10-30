@@ -362,8 +362,12 @@ pub fn read_manifest(archive: &Path) -> Result<Manifest> {
     let bytes = match reader.read_file(MANIFEST_ENTRY) {
         Ok(b) => b,
         Err(_) => {
-            let old = old_manifest_path(archive);
-            std::fs::read(&old).map_err(|_| anyhow!("{} has no AtticARC manifest", archive.display()))?
+            // Beside the archive, or moved into the .atticarc folder with the catalogue.
+            let beside = old_manifest_path(archive);
+            let moved = archive.parent().zip(beside.file_name()).map(|(d, n)| d.join(DATA_DIR).join(n));
+            std::fs::read(&beside)
+                .or_else(|e| moved.map_or(Err(e), std::fs::read))
+                .map_err(|_| anyhow!("{} has no AtticARC manifest", archive.display()))?
         }
     };
     let mut m: Manifest = serde_json::from_slice(&bytes).with_context(|| format!("the manifest in {} can't be read", archive.display()))?;

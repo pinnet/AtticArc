@@ -28,25 +28,38 @@ pub fn exists(dir: &Path) -> bool {
     db_path(dir).is_file() || dir.join(CATALOG_FILE).is_file()
 }
 
-/// Creates `dir/.atticarc`, hidden on Windows (the dot hides it elsewhere).
+/// Creates `dir/.atticarc` if needed and makes sure it is hidden on Windows
+/// (the dot hides it elsewhere).
 fn make_data_dir(dir: &Path) -> Result<()> {
     let data = dir.join(DATA_DIR);
-    if data.is_dir() {
-        return Ok(());
+    if !data.is_dir() {
+        std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
     }
-    std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("attrib")
-            .arg("+h")
-            .arg(&data)
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
+    hide(&data);
     Ok(())
 }
+
+/// Sets the Hidden attribute on Windows if it isn't set. Best effort: a
+/// folder that stays visible does no harm.
+#[cfg(windows)]
+fn hide(path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::process::CommandExt;
+    const HIDDEN: u32 = 0x2;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & HIDDEN != 0) {
+        return;
+    }
+    // attrib doesn't understand \\?\ paths.
+    let _ = std::process::Command::new("attrib")
+        .arg("+h")
+        .arg(crate::settings::strip_verbatim(path))
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+#[cfg(not(windows))]
+fn hide(_path: &Path) {}
 
 /// Moves a catalogue from where earlier versions kept it, loose in the
 /// output folder, into `.atticarc`.
@@ -185,6 +198,7 @@ impl Catalog {
             bail!("there is no catalogue in {}", dir.display());
         }
         move_old_catalog(dir)?;
+        hide(&dir.join(DATA_DIR));
         Self::connect(&db_path(dir))
     }
 
