@@ -195,7 +195,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
-        if self.jobs.needs_repaint() || self.catalogue.busy() {
+        if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }

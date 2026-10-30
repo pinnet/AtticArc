@@ -72,6 +72,12 @@ Starts on the given source folder (or the last one used).
   discarded, buttons to browse either archive, and **Delete the folder…**. Deleting checks every file
   in the folder against the main archive, the set-aside archive or the discard list (same hash), and
   the confirmation lists the discarded files that will be gone for good.
+  Tick files under *Files left out* and **Put them back in the archive**: the main archive is unpacked
+  into a work folder in `.atticarc`, written again with those files (set-aside ones from the set-aside
+  archive, discarded ones from the folder while it still has them), verified, and only then swapped in,
+  so it needs free space for the unpacked archive. **Put ticked back, discard the rest…** also moves
+  the remaining set-aside files to the discard list and deletes the set-aside archive, so you can keep
+  what you want and throw the rest away with the folder.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and

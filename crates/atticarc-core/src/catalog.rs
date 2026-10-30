@@ -252,38 +252,41 @@ impl Catalog {
             ],
         )?;
         let archive_id = tx.last_insert_rowid();
-        {
-            let mut ins = tx.prepare(
-                "INSERT INTO entries (archive_id, rel_path, name, ext, kind, size, modified_utc,
-                    created_utc, blake3, sha256, method)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
-            for e in entries {
-                let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
-                let ext = if e.is_dir {
-                    String::new()
-                } else {
-                    name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
-                };
-                ins.execute(params![
-                    archive_id,
-                    e.rel_path,
-                    name,
-                    ext,
-                    if e.is_dir { "dir" } else { "file" },
-                    e.size as i64,
-                    e.modified_utc,
-                    e.created_utc,
-                    e.blake3,
-                    e.sha256,
-                    e.method
-                ])?;
-                fts.execute(params![tx.last_insert_rowid(), name, e.rel_path])?;
-            }
-        }
+        insert_entries(&tx, archive_id, entries)?;
         tx.commit()?;
         Ok(archive_id)
+    }
+
+    /// Replaces what is recorded for archive `id` after it was rewritten:
+    /// its sizes and counts, its entries and what was left out of it.
+    pub fn replace_contents(
+        &mut self,
+        id: i64,
+        a: &ArchiveRecord,
+        entries: &[EntryRecord],
+        ex: &crate::archive::Excluded,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE archives SET input_bytes = ?2, archive_bytes = ?3, file_count = ?4, dir_count = ?5 WHERE id = ?1",
+            params![id, a.input_bytes as i64, a.archive_bytes as i64, a.file_count as i64, a.dir_count as i64],
+        )?;
+        delete_entries(&tx, id)?;
+        insert_entries(&tx, id, entries)?;
+        tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.commit()?;
+        self.insert_excluded(id, ex)
+    }
+
+    /// Forgets archive `id` entirely, for an archive file that was removed.
+    pub fn remove_archive(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        delete_entries(&tx, id)?;
+        tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.execute("UPDATE runs SET archive_id = NULL WHERE archive_id = ?1", params![id])?;
+        tx.execute("DELETE FROM archives WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The newest verified archive of `source`, if its source folder has not
@@ -593,6 +596,49 @@ pub struct FoundFile {
     pub sha256: Option<String>,
     /// How many catalogued files share this file's size and hash, itself included.
     pub copies: u64,
+}
+
+fn insert_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64, entries: &[EntryRecord]) -> Result<()> {
+    let mut ins = tx.prepare(
+        "INSERT INTO entries (archive_id, rel_path, name, ext, kind, size, modified_utc,
+            created_utc, blake3, sha256, method)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
+    for e in entries {
+        let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
+        let ext = if e.is_dir {
+            String::new()
+        } else {
+            name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
+        };
+        ins.execute(params![
+            archive_id,
+            e.rel_path,
+            name,
+            ext,
+            if e.is_dir { "dir" } else { "file" },
+            e.size as i64,
+            e.modified_utc,
+            e.created_utc,
+            e.blake3,
+            e.sha256,
+            e.method
+        ])?;
+        fts.execute(params![tx.last_insert_rowid(), name, e.rel_path])?;
+    }
+    Ok(())
+}
+
+/// Removes an archive's entries and their search index rows.
+fn delete_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO entries_fts (entries_fts, rowid, name, rel_path)
+         SELECT 'delete', id, name, rel_path FROM entries WHERE archive_id = ?1",
+        params![archive_id],
+    )?;
+    tx.execute("DELETE FROM entries WHERE archive_id = ?1", params![archive_id])?;
+    Ok(())
 }
 
 /// A folder some of whose files the exclusions left out of its archive.

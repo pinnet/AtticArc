@@ -794,6 +794,268 @@ pub fn extract_file(archive: &Path, rel_path: &str, dest_dir: &Path, threads: u3
     Ok(dest)
 }
 
+/// What putting excluded files back into an archive did.
+#[derive(Debug, Default)]
+pub struct Restored {
+    pub put_back: usize,
+    /// Set-aside files moved to the discarded list.
+    pub discarded: usize,
+    /// Whether the set-aside archive was emptied and removed.
+    pub aside_removed: bool,
+}
+
+/// Puts files the exclusions left out of `archive` back into it. Set-aside
+/// files come from the set-aside archive; discarded ones from the source
+/// folder, which must still hold them with their recorded hash. With
+/// `discard_rest`, the set-aside files not kept move to the discarded list
+/// and the set-aside archive goes.
+///
+/// The archive is unpacked into a work folder in the catalogue's folder and
+/// written again, then verified, and only then swapped in, so this needs
+/// free space for the unpacked archive and its new copy.
+pub fn restore_excluded(
+    archive: &Path,
+    keep: &[String],
+    discard_rest: bool,
+    settings: &Settings,
+    progress: &Arc<Progress>,
+) -> Result<Restored> {
+    let m = read_manifest(archive)?;
+    let ex = &m.excluded;
+    let find = |list: &[EntryRecord], rel: &str| list.iter().any(|e| e.rel_path == rel);
+    for rel in keep {
+        if !find(&ex.set_aside, rel) && !find(&ex.discarded, rel) {
+            bail!("{rel} isn't one of the files left out of {}", archive.display());
+        }
+    }
+    let out_dir = archive.parent().ok_or_else(|| anyhow!("{} has no folder", archive.display()))?;
+    let aside_path = ex.set_aside_archive.as_ref().map(|n| archive.with_file_name(n));
+    let source = PathBuf::from(if m.archive.source_display.is_empty() { &m.archive.source_path } else { &m.archive.source_display });
+    let work = out_dir.join(DATA_DIR).join(format!("work-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let main_dir = work.join("main");
+    let aside_dir = work.join("aside");
+
+    let result = (|| -> Result<_> {
+        progress.set_phase("Unpacking the archive", m.archive.input_bytes);
+        extract_all(archive, &main_dir, settings.threads, progress)?;
+        // Only needed when a set-aside file is kept; otherwise the set-aside
+        // archive stays as it is or goes whole.
+        let takes_aside = keep.iter().any(|r| find(&ex.set_aside, r));
+        if let Some(p) = aside_path.as_ref().filter(|_| takes_aside) {
+            progress.set_phase("Unpacking the set-aside files", ex.set_aside.iter().map(|e| e.size).sum());
+            extract_all(p, &aside_dir, settings.threads, progress)?;
+        }
+        for rel in keep {
+            let to = main_dir.join(rel);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Some(rec) = ex.set_aside.iter().find(|e| &e.rel_path == rel) {
+                std::fs::rename(aside_dir.join(rel), &to).with_context(|| format!("{rel} isn't in the set-aside archive"))?;
+                check_hash(&to, rec)?;
+            } else {
+                let rec = ex.discarded.iter().find(|e| &e.rel_path == rel).unwrap();
+                let from = source.join(rel);
+                if !from.is_file() {
+                    bail!("{rel} was discarded and the folder no longer has it, so it can't be put back");
+                }
+                std::fs::copy(&from, &to).with_context(|| format!("can't copy {}", from.display()))?;
+                check_hash(&to, rec).with_context(|| format!("{rel} has changed since it was archived"))?;
+                set_times(&to, std::fs::metadata(&from)?.modified().ok(), std::fs::metadata(&from)?.created().ok(), false);
+            }
+        }
+
+        // What is left out now.
+        let mut left = Excluded {
+            set_aside_archive: ex.set_aside_archive.clone(),
+            set_aside: ex.set_aside.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
+            discarded: ex.discarded.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
+        };
+        let mut moved = 0;
+        if discard_rest {
+            moved = left.set_aside.len();
+            for mut e in std::mem::take(&mut left.set_aside) {
+                e.method = "discard".into();
+                left.discarded.push(e);
+            }
+            left.discarded.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        }
+        if left.set_aside.is_empty() {
+            left.set_aside_archive = None;
+        }
+
+        // The set-aside archive again, without the files taken from it.
+        let mut new_aside = None;
+        if let Some(p) = &aside_path
+            && !left.set_aside.is_empty()
+            && left.set_aside.len() != ex.set_aside.len()
+        {
+            let am = read_manifest(p)?;
+            // Files only, like the set-aside archive first written.
+            let s = Scan { dirs: Vec::new(), ..scan(&aside_dir)? };
+            let mut rec = am.archive.clone();
+            (rec.archive_path, rec.archive_bytes) = (String::new(), 0);
+            (rec.input_bytes, rec.file_count, rec.dir_count) = (s.total_bytes, s.files.len() as u64, s.dirs.len() as u64);
+            let partial = PathBuf::from(format!("{}.partial", p.display()));
+            progress.set_phase("Compressing the set-aside files", s.total_bytes);
+            let entries = write_archive(&s, &partial, settings, progress, &rec, &Excluded::default())?;
+            progress.set_phase("Verifying the set-aside files", s.total_bytes);
+            verify_archive(&partial, &entries, settings.threads, progress)?;
+            left.set_aside = entries.clone();
+            new_aside = Some((partial, rec, entries));
+        }
+
+        let s = scan(&main_dir)?;
+        let mut rec = m.archive.clone();
+        (rec.archive_path, rec.archive_bytes) = (String::new(), 0);
+        (rec.input_bytes, rec.file_count, rec.dir_count) = (s.total_bytes, s.files.len() as u64, s.dirs.len() as u64);
+        let partial = PathBuf::from(format!("{}.partial", archive.display()));
+        progress.set_phase("Compressing", s.total_bytes);
+        let entries = write_archive(&s, &partial, settings, progress, &rec, &left)?;
+        progress.set_phase("Verifying", s.total_bytes);
+        verify_archive(&partial, &entries, settings.threads, progress)?;
+        Ok((partial, rec, entries, left, new_aside, moved))
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    let (partial, mut rec, entries, left, new_aside, moved) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(format!("{}.partial", archive.display()));
+            if let Some(p) = &aside_path {
+                let _ = std::fs::remove_file(format!("{}.partial", p.display()));
+            }
+            return Err(e);
+        }
+    };
+
+    // Everything is verified: swap the new archives in and update the catalogue.
+    let mut cat = Catalog::open(out_dir)?;
+    let main_id = cat.archive_id_for(archive)?;
+    let aside_id = match &aside_path {
+        Some(p) => cat.archive_id_for(p)?,
+        None => None,
+    };
+    if let Some((aside_partial, mut aside_rec, aside_entries)) = new_aside {
+        let p = aside_path.as_ref().unwrap();
+        std::fs::rename(&aside_partial, p).with_context(|| format!("can't replace {}", p.display()))?;
+        aside_rec.archive_bytes = std::fs::metadata(p)?.len();
+        if let Some(id) = aside_id {
+            cat.replace_contents(id, &aside_rec, &aside_entries, &Excluded::default())?;
+        }
+    }
+    std::fs::rename(&partial, archive).with_context(|| format!("can't replace {}", archive.display()))?;
+    rec.archive_bytes = std::fs::metadata(archive)?.len();
+    if let Some(id) = main_id {
+        cat.replace_contents(id, &rec, &entries, &left)?;
+    }
+    let mut aside_removed = false;
+    if let Some(p) = aside_path.as_ref().filter(|_| left.set_aside_archive.is_none()) {
+        std::fs::remove_file(p).with_context(|| format!("can't remove {}", p.display()))?;
+        if let Some(id) = aside_id {
+            cat.remove_archive(id)?;
+        }
+        aside_removed = true;
+    }
+    if let Some(id) = main_id {
+        let detail = format!("put back: {}", keep.join(", "));
+        cat.log_run(Some(id), "restore", &source, &now_utc(), "verified", &detail)?;
+    }
+    Ok(Restored { put_back: keep.len(), discarded: moved, aside_removed })
+}
+
+/// Unpacks every file and folder in `archive` into `dest` except the
+/// manifest, keeping their times.
+fn extract_all(archive: &Path, dest: &Path, threads: u32, progress: &Arc<Progress>) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let mut reader = ArchiveReader::open(archive, Password::empty())
+        .with_context(|| format!("can't open {}", archive.display()))?
+        .with_threads(threads.max(1));
+    let time = |has: bool, t: sevenz_turbo::NtTime| has.then(|| SystemTime::from(t));
+    let mut dirs = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    reader
+        .for_each_entries(|entry, data| {
+            let name = entry.name();
+            if name == MANIFEST_ENTRY || name == DATA_DIR {
+                return Ok(true);
+            }
+            if name.split(['/', '\\']).any(|p| p.is_empty() || p == "." || p == "..") || name.contains(':') {
+                return Err(io::Error::other(format!("{name} has a path that can't be unpacked safely")).into());
+            }
+            let to = dest.join(name);
+            let times = (time(entry.has_last_modified_date, entry.last_modified_date), time(entry.has_creation_date, entry.creation_date));
+            if entry.is_directory() {
+                std::fs::create_dir_all(&to)?;
+                dirs.push((to, times));
+                return Ok(true);
+            }
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = File::create(&to)?;
+            loop {
+                progress.check_cancel()?;
+                let k = data.read(&mut buf)?;
+                if k == 0 {
+                    break;
+                }
+                io::Write::write_all(&mut out, &buf[..k])?;
+                progress.done.fetch_add(k as u64, Ordering::Relaxed);
+            }
+            drop(out);
+            set_times(&to, times.0, times.1, false);
+            Ok(true)
+        })
+        .map_err(|e| {
+            if progress.cancel.load(Ordering::Relaxed) { anyhow!("cancelled") } else { anyhow!("can't unpack {}: {e}", archive.display()) }
+        })?;
+    // Folders last, deepest first, since writing into one changes its time.
+    for (dir, (modified, created)) in dirs.iter().rev() {
+        set_times(dir, *modified, *created, true);
+    }
+    Ok(())
+}
+
+/// Sets a file's or folder's times where the system allows; best effort.
+fn set_times(path: &Path, modified: Option<SystemTime>, created: Option<SystemTime>, is_dir: bool) {
+    let mut times = std::fs::FileTimes::new();
+    if let Some(m) = modified {
+        times = times.set_modified(m);
+    }
+    #[cfg(windows)]
+    if let Some(c) = created {
+        use std::os::windows::fs::FileTimesExt;
+        times = times.set_created(c);
+    }
+    #[cfg(not(windows))]
+    let _ = created;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true);
+    #[cfg(windows)]
+    if is_dir {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        open.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    #[cfg(not(windows))]
+    if is_dir {
+        open.write(false).read(true);
+    }
+    if let Ok(f) = open.open(path) {
+        let _ = f.set_times(times);
+    }
+}
+
+fn check_hash(path: &Path, rec: &EntryRecord) -> Result<()> {
+    let mut h = blake3::Hasher::new();
+    let mut f = File::open(path)?;
+    io::copy(&mut f, &mut h)?;
+    if rec.blake3.as_deref() != Some(h.finalize().to_hex().as_str()) {
+        bail!("{} doesn't match its recorded hash", rec.rel_path);
+    }
+    Ok(())
+}
+
 /// What the check before a delete found.
 pub struct DeleteCheck {
     pub files_checked: u64,
@@ -1089,6 +1351,70 @@ mod tests {
         // A rule that doesn't compile stops the job before anything is written.
         s.exclusions = vec![Rule { kind: Kind::Regex, pattern: "*.lnk".into(), ..Rule::default() }];
         assert!(archive_folder(&src, &s, &Arc::new(Progress::default())).is_err());
+    }
+
+    #[test]
+    fn excluded_files_go_back_into_the_archive() {
+        use crate::exclude::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        make_tree(&src);
+        std::fs::write(src.join("sub/Shortcut.LNK"), b"link").unwrap();
+        std::fs::write(src.join("sub/deeper/keep.tmp"), b"keep me").unwrap();
+        let mut s = settings(&out, true);
+        let rule = |pattern: &str, action| Rule { pattern: pattern.into(), action, ..Rule::default() };
+        s.exclusions = vec![rule("*.lnk", Action::Discard), rule("*.dat", Action::SetAside), rule("*.tmp", Action::SetAside)];
+        archive_folder(&src, &s, &Arc::new(Progress::default())).unwrap();
+        let main = out.join("src.7z");
+        let aside = out.join("src.excluded.7z");
+        let p = Arc::new(Progress::default());
+
+        // Not a file that was left out.
+        assert!(restore_excluded(&main, &["notes.txt".into()], false, &s, &p).is_err());
+
+        // One set-aside file and the discarded one go back; the other stays aside.
+        let keep = vec!["sub/deeper/keep.tmp".to_string(), "sub/Shortcut.LNK".to_string()];
+        let r = restore_excluded(&main, &keep, false, &s, &p).unwrap();
+        assert_eq!((r.put_back, r.discarded, r.aside_removed), (2, 0, false));
+        let m = read_manifest(&main).unwrap();
+        assert!(m.entries.iter().any(|e| e.rel_path == "sub/deeper/keep.tmp"));
+        assert!(m.entries.iter().any(|e| e.rel_path == "sub/Shortcut.LNK"));
+        assert!(m.entries.iter().any(|e| e.rel_path == "empty folder" && e.is_dir));
+        assert_eq!(m.archive.file_count, 6);
+        assert!(m.excluded.discarded.is_empty());
+        assert_eq!(m.excluded.set_aside.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["sub/random.dat"]);
+        let am = read_manifest(&aside).unwrap();
+        assert_eq!(am.entries.iter().filter(|e| !e.is_dir).count(), 1);
+        let orig = std::fs::metadata(src.join("notes.txt")).unwrap().modified().unwrap();
+        assert_eq!(m.entries.iter().find(|e| e.rel_path == "notes.txt").unwrap().modified_utc, utc(Some(orig)));
+
+        // The catalogue follows, and the folder still checks out for deleting.
+        let (a, entries) = recorded(&out, &src);
+        assert_eq!(entries.iter().filter(|e| !e.is_dir).count(), 6);
+        let folders = Catalog::open_existing(&out).unwrap().excluded_folders().unwrap();
+        assert_eq!((folders[0].set_aside.len(), folders[0].discarded.len()), (1, 0));
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+
+        // Discarding the rest removes the set-aside archive.
+        let r = restore_excluded(&main, &[], true, &s, &p).unwrap();
+        assert_eq!((r.put_back, r.discarded, r.aside_removed), (0, 1, true));
+        assert!(!aside.exists());
+        let m = read_manifest(&main).unwrap();
+        assert_eq!(m.excluded.discarded.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(), ["discard"]);
+        assert!(m.excluded.set_aside_archive.is_none());
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.archives().unwrap().len(), 1);
+        let (a, entries) = recorded(&out, &src);
+        let c = check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+        assert_eq!(c.discarded.len(), 1);
+        assert!(std::fs::read_dir(out.join(DATA_DIR)).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("work-")));
+
+        // A discarded file can't come back once the folder no longer has it.
+        std::fs::remove_file(src.join("sub/random.dat")).unwrap();
+        let e = restore_excluded(&main, &["sub/random.dat".into()], false, &s, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("no longer has it"), "{e:#}");
+        assert!(read_manifest(&main).is_ok());
     }
 
     #[test]
