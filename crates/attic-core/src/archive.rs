@@ -249,9 +249,16 @@ pub struct ArchiveOutcome {
 pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<ArchiveOutcome> {
     let started = now_utc();
     let source = std::fs::canonicalize(source).with_context(|| format!("can't open {}", source.display()))?;
+    // Check before creating the output folder, so a protected folder never
+    // gains one, and again after, once the path can be fully resolved.
+    let refuse = || anyhow!("the output folder {} is a protected folder; choose another one", settings.out_dir.display());
+    let wanted = std::path::absolute(&settings.out_dir).unwrap_or_else(|_| settings.out_dir.clone());
+    if is_protected(&wanted, settings) {
+        return Err(refuse());
+    }
     std::fs::create_dir_all(&settings.out_dir)?;
     if is_protected(&settings.out_dir, settings) {
-        bail!("the output folder {} is a protected folder; choose another one", settings.out_dir.display());
+        return Err(refuse());
     }
     let out_dir = std::fs::canonicalize(&settings.out_dir)?;
     if out_dir.starts_with(&source) {
@@ -797,6 +804,20 @@ mod tests {
         assert!(is_protected(&tmp.path().join("keep"), &s));
         assert!(is_protected(&tmp.path().join("keep/inner"), &s));
         assert!(!is_protected(&tmp.path().join("keeper"), &s));
+    }
+
+    #[test]
+    fn output_inside_protected_folder_is_refused_before_it_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        make_tree(&src);
+        let keep = tmp.path().join("keep");
+        std::fs::create_dir_all(&keep).unwrap();
+        let mut s = settings(&keep.join("out"), true);
+        s.protected = vec![keep.clone()];
+        let e = archive_folder(&src, &s, &Arc::new(Progress::default())).err().unwrap();
+        assert!(format!("{e:#}").contains("protected"), "{e:#}");
+        assert!(!keep.join("out").exists());
     }
 
     #[test]
