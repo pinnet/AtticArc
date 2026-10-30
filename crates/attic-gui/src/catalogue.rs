@@ -11,7 +11,7 @@ use attic_core::archive;
 use attic_core::catalog::{ArchiveSummary, CATALOG_FILE, Catalog, FoundFile};
 
 use crate::browse::Browse;
-use crate::{App, card, heading, human, primary_button, theme};
+use crate::{App, card, human, primary_button, theme};
 
 const MAX_RESULTS: usize = 500;
 
@@ -88,11 +88,15 @@ impl App {
             st.searched = Some(want);
         }
 
-        heading(
-            ui,
-            "Catalogue",
-            &format!("Every file in every archive in {}, to browse or search without unpacking.", out.display()),
+        if st.query.trim().is_empty() {
+            load_browse(st, &out);
+        }
+        title(ui, st);
+        ui.label(
+            RichText::new(format!("Every file in every archive in {}, to browse or search without unpacking.", out.display()))
+                .color(theme::muted()),
         );
+        ui.add_space(10.0);
         if let Some(e) = &st.error {
             ui.colored_label(theme::danger(), e);
         }
@@ -134,7 +138,7 @@ impl App {
 
         if st.query.trim().is_empty() {
             match st.archive_filter {
-                Some(id) => browse_view(ui, st, &out, id),
+                Some(id) => browse_view(ui, st, id),
                 None => archive_list(ui, st),
             }
             return;
@@ -208,31 +212,76 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
     }
 }
 
-fn browse_view(ui: &mut egui::Ui, st: &mut State, out: &std::path::Path, id: i64) {
+/// Opens the archive picked in the archive list in the browser, if it isn't
+/// open already.
+fn load_browse(st: &mut State, out: &std::path::Path) {
+    let Some(id) = st.archive_filter else { return };
+    if st.browse.as_ref().map(|b| b.archive_id) == Some(id) {
+        return;
+    }
+    st.browse = None;
+    let Some(name) = st.archives.iter().find(|a| a.id == id).map(|a| a.name.clone()) else {
+        st.archive_filter = None;
+        return;
+    };
+    match Catalog::open_existing(out).and_then(|c| Browse::load(&c, id)) {
+        Ok(b) => st.browse = Some(b),
+        Err(e) => {
+            st.error = Some(format!("Couldn't open {name}: {e:#}"));
+            st.archive_filter = None;
+        }
+    }
+}
+
+/// The page title in the heading style, followed while browsing by the
+/// archive and each folder down to the open one. Every part but the last
+/// can be clicked to go back up to it.
+fn title(ui: &mut egui::Ui, st: &mut State) {
+    let browsing = st.query.trim().is_empty() && st.browse.is_some();
+    let mut parts = vec![("Catalogue".to_string(), None)];
+    if browsing && let Some(b) = &st.browse {
+        if let Some(a) = st.archives.iter().find(|a| a.id == b.archive_id) {
+            parts.push((format!("{}.7z", a.name), Some(String::new())));
+        }
+        parts.extend(b.crumbs().into_iter().map(|(name, path)| (name, Some(path))));
+    }
+    let last = parts.len() - 1;
+    let mut go: Option<Option<String>> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        for (i, (name, path)) in parts.into_iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("›").size(26.0).color(theme::muted()));
+            }
+            let text = RichText::new(name).size(26.0).strong().color(theme::ink());
+            if i == last {
+                ui.label(text);
+            } else {
+                let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let tip = if path.is_none() { "Show all archives" } else { "Go back to this folder" };
+                if resp.on_hover_text(tip).clicked() {
+                    go = Some(path);
+                }
+            }
+        }
+    });
+    match go {
+        Some(None) => st.archive_filter = None,
+        Some(Some(p)) => {
+            if let Some(b) = &mut st.browse {
+                b.open(p);
+            }
+        }
+        None => {}
+    }
+}
+
+fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64) {
     let Some(a) = st.archives.iter().find(|a| a.id == id).cloned() else {
         st.archive_filter = None;
         return;
     };
-    if st.browse.as_ref().map(|b| b.archive_id) != Some(id) {
-        st.browse = None;
-        match Catalog::open_existing(out).and_then(|c| Browse::load(&c, id)) {
-            Ok(b) => st.browse = Some(b),
-            Err(e) => {
-                st.error = Some(format!("Couldn't open {}: {e:#}", a.name));
-                st.archive_filter = None;
-                return;
-            }
-        }
-    }
     let Some(mut b) = st.browse.take() else { return };
-    ui.horizontal(|ui| {
-        if ui.button("← All archives").clicked() {
-            st.archive_filter = None;
-        }
-        ui.add_space(8.0);
-        b.path_bar(ui, &a.name);
-    });
-    ui.add_space(6.0);
     let w = ui.available_width();
     let h = ui.available_height();
     let gap = ui.spacing().item_spacing.x;

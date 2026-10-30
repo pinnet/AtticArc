@@ -74,7 +74,7 @@ impl Browse {
         self.selected.and_then(|i| self.files.get(i))
     }
 
-    fn open(&mut self, dir: String) {
+    pub fn open(&mut self, dir: String) {
         self.dir = dir;
         self.selected = None;
         self.relist();
@@ -118,32 +118,16 @@ impl Browse {
         self.listing = dirs;
     }
 
-    /// The path bar: the archive, then each folder down to the open one.
-    pub fn path_bar(&mut self, ui: &mut egui::Ui, archive_name: &str) {
-        let mut go = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.add_enabled(!self.dir.is_empty(), egui::Button::new("⬆ Up")).on_hover_text("Open the parent folder").clicked() {
-                go = Some(parent(&self.dir).to_string());
-            }
-            ui.add_space(6.0);
-            if ui.link(RichText::new(format!("{archive_name}.7z")).monospace().strong()).clicked() {
-                go = Some(String::new());
-            }
-            let mut at = 0;
-            for seg in self.dir.split('/').filter(|s| !s.is_empty()) {
-                ui.label(RichText::new("›").color(theme::muted()));
-                at += seg.len();
-                let path = self.dir[..at].to_string();
-                at += 1;
-                if ui.link(RichText::new(seg).monospace()).clicked() {
-                    go = Some(path);
-                }
-            }
-        });
-        if let Some(d) = go {
-            self.open(d);
+    /// Each folder from the top level down to the open one, as (name, path).
+    pub fn crumbs(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for seg in self.dir.split('/').filter(|s| !s.is_empty()) {
+            at += seg.len();
+            out.push((seg.to_string(), self.dir[..at].to_string()));
+            at += 1;
         }
+        out
     }
 
     /// The open folder's contents as a table. Clicking a folder opens it,
@@ -151,14 +135,24 @@ impl Browse {
     pub fn table(&mut self, ui: &mut egui::Ui) {
         let (size, count) = self.folders.get(&self.dir).copied().unwrap_or_default();
         let subfolders = self.listing.iter().filter(|i| matches!(i, Item::Folder(_))).count();
-        ui.label(
+        let mut up = false;
+        ui.horizontal(|ui| {
+            up = ui
+                .add_enabled(!self.dir.is_empty(), egui::Button::new("⬆ Up"))
+                .on_hover_text("Open the parent folder")
+                .clicked();
+            ui.label(
             RichText::new(format!(
                 "{subfolders} folders · {} files here · {} in all, {count} files",
                 self.listing.len() - subfolders,
                 human(size)
             ))
             .color(theme::muted()),
-        );
+            );
+        });
+        if up {
+            self.open(parent(&self.dir).to_string());
+        }
         ui.separator();
 
         let widths = |ui: &egui::Ui| {
