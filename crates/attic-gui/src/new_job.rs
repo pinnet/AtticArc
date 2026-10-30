@@ -74,7 +74,7 @@ impl App {
                     );
                 }
                 if ui.button("Change destination…").clicked()
-                    && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
+                    && let Some(p) = rfd::FileDialog::new().set_directory(nearest_existing(&self.out_dir())).pick_folder() {
                         self.out_dir_text = attic_core::settings::strip_verbatim(&p).display().to_string();
                         changed = true;
                     }
@@ -222,6 +222,12 @@ impl App {
             });
         });
     }
+}
+
+/// `path`, or its closest parent that exists, so a folder picker can open
+/// there even when the destination hasn't been created yet.
+fn nearest_existing(path: &std::path::Path) -> std::path::PathBuf {
+    path.ancestors().find(|p| p.is_dir()).unwrap_or(path).to_path_buf()
 }
 
 /// A grid cell, greyed out when `dim`.
