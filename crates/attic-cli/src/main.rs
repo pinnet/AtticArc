@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use attic_core::scan;
+use attic_core::archive::{self, Progress};
+use attic_core::catalog::Catalog;
+use attic_core::{scan, settings};
 
 const USAGE: &str = "\
 Attic – archive, catalogue and de-duplicate folders
@@ -9,13 +12,33 @@ Attic – archive, catalogue and de-duplicate folders
 Usage:
   attic scan <folder> [--top N]   List files and show possible duplicates (by size).
                                   Reads no file contents, so it is fast.
-  attic help                      Show this message.";
+  attic archive <folder>...       Archive each folder to its own .7z and verify it,
+                                  using the settings saved by the GUI.
+        [--out DIR] [--level 5|9]  Override the output folder or level.
+  attic search <words> [--out DIR] Search the catalogue in the output folder.
+  attic help                      Show this message.
+
+Exit code 0 means every folder was archived and verified.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("scan") => match parse_scan(&args[1..]) {
             Ok((folder, top)) => run_scan(folder, top),
+            Err(msg) => {
+                eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("archive") => match parse_archive(&args[1..]) {
+            Ok(a) => run_archive(a),
+            Err(msg) => {
+                eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("search") => match parse_search(&args[1..]) {
+            Ok((words, out)) => run_search(&words, out),
             Err(msg) => {
                 eprintln!("{msg}\n\n{USAGE}");
                 ExitCode::from(2)
@@ -87,6 +110,119 @@ fn run_scan(folder: PathBuf, top: usize) -> ExitCode {
         eprintln!("warning: {}: {}", e.path.display(), e.error);
     }
     ExitCode::SUCCESS
+}
+
+struct ArchiveArgs {
+    folders: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    level: Option<u32>,
+}
+
+fn parse_archive(args: &[String]) -> Result<ArchiveArgs, String> {
+    let mut a = ArchiveArgs { folders: Vec::new(), out: None, level: None };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--out" => a.out = Some(PathBuf::from(it.next().ok_or("--out needs a folder")?)),
+            "--level" => {
+                let n = it.next().ok_or("--level needs 5 or 9")?;
+                match n.as_str() {
+                    "5" => a.level = Some(5),
+                    "9" => a.level = Some(9),
+                    _ => return Err(format!("level must be 5 or 9, not '{n}'")),
+                }
+            }
+            f => {
+                let p = PathBuf::from(f);
+                if !p.is_dir() {
+                    return Err(format!("'{f}' is not a folder"));
+                }
+                a.folders.push(p);
+            }
+        }
+    }
+    if a.folders.is_empty() {
+        return Err("archive needs at least one folder".into());
+    }
+    Ok(a)
+}
+
+fn run_archive(a: ArchiveArgs) -> ExitCode {
+    let saved = settings::load();
+    let mut failed = 0;
+    for folder in &a.folders {
+        let source_dir = std::fs::canonicalize(folder)
+            .ok()
+            .and_then(|p| p.parent().map(settings::strip_verbatim))
+            .unwrap_or_default();
+        let mut s = saved.settings_for(&source_dir);
+        if let Some(out) = &a.out {
+            s.out_dir = out.clone();
+        }
+        if let Some(level) = a.level {
+            s.level = level;
+        }
+        println!("Archiving {} to {} ({}, {} threads)", folder.display(), s.out_dir.display(), s.engine_label(), s.threads);
+        let started = std::time::Instant::now();
+        match archive::archive_folder(folder, &s, &Arc::new(Progress::default())) {
+            Ok(o) => {
+                println!(
+                    "  verified: {} files, {} → {} in {:.1?}",
+                    o.record.file_count,
+                    human(o.record.input_bytes),
+                    human(o.record.archive_bytes),
+                    started.elapsed()
+                );
+                if !o.skipped_links.is_empty() {
+                    println!("  links not followed: {}", o.skipped_links.join(", "));
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  failed: {e:#}");
+            }
+        }
+    }
+    if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) }
+}
+
+fn parse_search(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
+    let mut words = Vec::new();
+    let mut out = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--out" {
+            out = Some(PathBuf::from(it.next().ok_or("--out needs a folder")?));
+        } else {
+            words.push(a.as_str());
+        }
+    }
+    if words.is_empty() {
+        return Err("search needs some words".into());
+    }
+    Ok((words.join(" "), out))
+}
+
+fn run_search(words: &str, out: Option<PathBuf>) -> ExitCode {
+    let saved = settings::load();
+    let Some(out) = out.or(saved.out_dir) else {
+        eprintln!("No output folder saved yet; pass --out <folder>.");
+        return ExitCode::from(2);
+    };
+    let found = Catalog::open(&out).and_then(|c| c.search(words, None, 200));
+    match found {
+        Ok(found) => {
+            for f in &found {
+                println!("{:>10}  {} › {}", human(f.size), f.archive_name, f.rel_path);
+            }
+            println!("{} matches", found.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn human(bytes: u64) -> String {

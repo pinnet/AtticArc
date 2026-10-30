@@ -10,3 +10,7 @@ publish = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Compression and hashing are unbearably slow unoptimised, even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3

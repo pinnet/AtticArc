@@ -1,9 +1,15 @@
 [package]
 name = "attic-gui"
-description = "Desktop GUI for Attic (framework not chosen yet)."
+description = "Desktop GUI for Attic (eframe/egui)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "attic-gui"
+path = "src/main.rs"
+
 [dependencies]
 attic-core = { path = "../attic-core" }
+eframe = "0.37.0"
+rfd = "0.17.2"
