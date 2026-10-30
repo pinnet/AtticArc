@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 attic-core = { path = "../attic-core" }
+anyhow = "1.0.104"
 eframe = "0.37.0"
 rfd = "0.17.2"

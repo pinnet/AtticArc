@@ -5,6 +5,7 @@
 //!
 //! The archive, verify and delete logic is foldarc's, now in attic-core.
 
+mod browse;
 mod catalogue;
 mod duplicates;
 mod jobs;

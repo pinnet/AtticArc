@@ -1,5 +1,6 @@
-//! Catalogue: search every file in every archive without unpacking, see its
-//! details and extract it. Mockup: Catalogue.dc.html.
+//! Catalogue: browse each archive's folders, or search every file in every
+//! archive, without unpacking; see a file's details and extract it. Mockup:
+//! Catalogue.dc.html.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -9,6 +10,7 @@ use eframe::egui::{self, RichText};
 use attic_core::archive;
 use attic_core::catalog::{ArchiveSummary, CATALOG_FILE, Catalog, FoundFile};
 
+use crate::browse::Browse;
 use crate::{App, card, heading, human, primary_button, theme};
 
 const MAX_RESULTS: usize = 500;
@@ -26,6 +28,9 @@ pub struct State {
     error: Option<String>,
     note: Option<String>,
     extracting: Option<Receiver<Result<PathBuf, String>>>,
+    /// The archive open in the browser, which is the one picked in the
+    /// archive filter while there is no search.
+    browse: Option<Browse>,
     confirm_clear: bool,
     /// Set after the catalogue was cleared, so the folder list reloads.
     cleared: bool,
@@ -35,6 +40,7 @@ impl State {
     pub fn invalidate(&mut self) {
         self.loaded = false;
         self.searched = None;
+        self.browse = None;
     }
 
     pub fn busy(&self) -> bool {
@@ -82,7 +88,11 @@ impl App {
             st.searched = Some(want);
         }
 
-        heading(ui, "Catalogue", &format!("Every file in every archive in {}, searchable without unpacking.", out.display()));
+        heading(
+            ui,
+            "Catalogue",
+            &format!("Every file in every archive in {}, to browse or search without unpacking.", out.display()),
+        );
         if let Some(e) = &st.error {
             ui.colored_label(theme::danger(), e);
         }
@@ -123,7 +133,10 @@ impl App {
         }
 
         if st.query.trim().is_empty() {
-            archive_list(ui, st);
+            match st.archive_filter {
+                Some(id) => browse_view(ui, st, &out, id),
+                None => archive_list(ui, st),
+            }
             return;
         }
 
@@ -177,6 +190,7 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
                         st.note = Some(format!("Catalogue cleared: {n} archives forgotten."));
                         st.cleared = true;
                         st.invalidate();
+                        st.archive_filter = None;
                         st.query.clear();
                         st.results.clear();
                     }
@@ -194,9 +208,74 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
     }
 }
 
-fn archive_list(ui: &mut egui::Ui, st: &State) {
+fn browse_view(ui: &mut egui::Ui, st: &mut State, out: &std::path::Path, id: i64) {
+    let Some(a) = st.archives.iter().find(|a| a.id == id).cloned() else {
+        st.archive_filter = None;
+        return;
+    };
+    if st.browse.as_ref().map(|b| b.archive_id) != Some(id) {
+        st.browse = None;
+        match Catalog::open_existing(out).and_then(|c| Browse::load(&c, id)) {
+            Ok(b) => st.browse = Some(b),
+            Err(e) => {
+                st.error = Some(format!("Couldn't open {}: {e:#}", a.name));
+                st.archive_filter = None;
+                return;
+            }
+        }
+    }
+    let Some(mut b) = st.browse.take() else { return };
+    ui.horizontal(|ui| {
+        if ui.button("← All archives").clicked() {
+            st.archive_filter = None;
+        }
+        ui.add_space(8.0);
+        b.path_bar(ui, &a.name);
+    });
+    ui.add_space(6.0);
+    let w = ui.available_width();
+    let h = ui.available_height();
+    let gap = ui.spacing().item_spacing.x;
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(egui::vec2(w * 0.66 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| card(ui, |ui| b.table(ui)));
+        ui.allocate_ui_with_layout(egui::vec2(w * 0.34, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+            card(ui, |ui| match b.selected_file().cloned() {
+                Some(f) => details(ui, st, &f),
+                None => archive_info(ui, &a),
+            })
+        });
+    });
+    st.browse = Some(b);
+}
+
+fn archive_info(ui: &mut egui::Ui, a: &ArchiveSummary) {
+    ui.label(RichText::new(format!("{}.7z", a.name)).monospace().strong().size(16.0));
+    ui.add_space(4.0);
+    egui::Grid::new("archive-info").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+            ui.label(RichText::new(k).color(theme::muted()));
+            ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
+            ui.end_row();
+        };
+        row(ui, "Archive file", a.archive_path.clone());
+        row(ui, "Original folder", a.source_path.clone());
+        row(ui, "Files", a.file_count.to_string());
+        row(ui, "Original size", human(a.input_bytes));
+        let pct = if a.input_bytes > 0 { a.archive_bytes as f64 * 100.0 / a.input_bytes as f64 } else { 100.0 };
+        row(ui, "Archive size", format!("{} ({pct:.0}% of original)", human(a.archive_bytes)));
+        row(ui, "Archived", a.created_utc.replace('T', " ").replace('Z', " UTC"));
+        if let Some(d) = &a.source_deleted_utc {
+            row(ui, "Original deleted", d.replace('T', " ").replace('Z', " UTC"));
+        }
+    });
+    ui.add_space(8.0);
+    ui.label(RichText::new("Click a folder to open it, or a file to see its details and extract it.").color(theme::muted()));
+}
+
+fn archive_list(ui: &mut egui::Ui, st: &mut State) {
     card(ui, |ui| {
         ui.label(RichText::new(format!("{} archives", st.archives.len())).strong().size(16.0));
+        ui.label(RichText::new("Click an archive to look inside it.").color(theme::muted()));
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("archives").num_columns(5).striped(true).spacing([18.0, 8.0]).show(ui, |ui| {
@@ -205,7 +284,9 @@ fn archive_list(ui: &mut egui::Ui, st: &State) {
                 }
                 ui.end_row();
                 for a in &st.archives {
-                    ui.label(RichText::new(&a.name).monospace()).on_hover_text(&a.archive_path);
+                    if ui.link(RichText::new(&a.name).monospace()).on_hover_text(&a.archive_path).clicked() {
+                        st.archive_filter = Some(a.id);
+                    }
                     ui.label(a.file_count.to_string());
                     ui.label(human(a.input_bytes));
                     ui.label(human(a.archive_bytes));

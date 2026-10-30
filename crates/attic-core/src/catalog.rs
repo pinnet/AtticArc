@@ -338,6 +338,32 @@ impl Catalog {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Every file and folder recorded for one archive, for browsing it
+    /// without unpacking. Files carry their copy counts like [`Catalog::search`].
+    pub fn contents(&self, archive_id: i64) -> Result<ArchiveContents> {
+        let mut q = self.conn.prepare(
+            "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256,
+                    COALESCE(c.n, 1), e.kind
+             FROM entries e JOIN archives a ON a.id = e.archive_id
+             LEFT JOIN (SELECT blake3, size, COUNT(*) AS n FROM entries
+                        WHERE kind = 'file' AND blake3 IS NOT NULL GROUP BY blake3, size) c
+                    ON c.blake3 = e.blake3 AND c.size = e.size
+             WHERE e.archive_id = ?1
+             ORDER BY e.rel_path",
+        )?;
+        let mut out = ArchiveContents::default();
+        let rows = q.query_map(params![archive_id], |r| Ok((found_file(r)?, r.get::<_, String>(10)?)))?;
+        for row in rows {
+            let (f, kind) = row?;
+            if kind == "dir" {
+                out.folders.push(f.rel_path);
+            } else {
+                out.files.push(f);
+            }
+        }
+        Ok(out)
+    }
+
     /// Groups of files with the same size and BLAKE3 hash across all
     /// archives, the most space-wasting groups first.
     pub fn duplicate_groups(&self, limit: usize) -> Result<Vec<DuplicateGroup>> {
@@ -403,6 +429,14 @@ pub struct FoundFile {
     pub sha256: Option<String>,
     /// How many catalogued files share this file's size and hash, itself included.
     pub copies: u64,
+}
+
+/// What one archive holds, as recorded in the catalogue.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveContents {
+    pub files: Vec<FoundFile>,
+    /// Folder paths inside the archive, `/` separated.
+    pub folders: Vec<String>,
 }
 
 /// Catalogued files that share one size and BLAKE3 hash.

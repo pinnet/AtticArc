@@ -829,6 +829,10 @@ mod tests {
         assert_eq!(groups[0].reclaimable(), std::fs::metadata(src.join("notes.txt")).unwrap().len());
 
         let a = cat.archived_folder(&src).unwrap().unwrap();
+        let c = cat.contents(a.archive_id).unwrap();
+        assert!(c.folders.iter().any(|d| d == "sub/deeper"), "{:?}", c.folders);
+        assert!(c.files.iter().any(|f| f.rel_path == "sub/random.dat" && f.copies == 1));
+        assert!(c.files.iter().any(|f| f.rel_path == "notes.txt" && f.copies == 2));
         let dest = out.join("restored");
         std::fs::create_dir_all(&dest).unwrap();
         let p = extract_file(&a.archive_path, "sub/random.dat", &dest, 2).unwrap();

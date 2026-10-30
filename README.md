@@ -63,8 +63,9 @@ Starts on the given source folder (or the last one used).
   **X** that starts the check-then-delete flow.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
-- **Catalogue**: search every file in every archive by name or folder, without unpacking; see its
-  original path, hashes and how many copies exist, and extract a single file.
+- **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
+  date, sortable), or search every file in every archive by name or folder, all without unpacking.
+  Select a file to see its original path, hashes and how many copies exist, and extract it.
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
 - **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first.
 - **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
