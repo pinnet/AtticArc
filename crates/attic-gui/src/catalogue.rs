@@ -26,6 +26,9 @@ pub struct State {
     error: Option<String>,
     note: Option<String>,
     extracting: Option<Receiver<Result<PathBuf, String>>>,
+    confirm_clear: bool,
+    /// Set after the catalogue was cleared, so the folder list reloads.
+    cleared: bool,
 }
 
 impl State {
@@ -42,6 +45,10 @@ impl State {
 impl App {
     pub fn catalogue(&mut self, ui: &mut egui::Ui) {
         let out = self.out_dir();
+        if std::mem::take(&mut self.catalogue.cleared) {
+            self.reload();
+        }
+        let busy = self.jobs.is_busy();
         let st = &mut self.catalogue;
         if let Some(rx) = &st.extracting
             && let Ok(res) = rx.try_recv() {
@@ -82,6 +89,9 @@ impl App {
         if st.archives.is_empty() {
             card(ui, |ui| {
                 ui.label("No archives in this destination yet. Archive some folders from New job first.");
+                if let Some(n) = &st.note {
+                    ui.label(RichText::new(n).color(theme::muted()));
+                }
             });
             return;
         }
@@ -100,8 +110,17 @@ impl App {
                     ui.selectable_value(&mut st.archive_filter, Some(a.id), &a.name);
                 }
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clear = egui::Button::new(RichText::new("Clear the catalogue…").color(theme::danger()));
+                if ui.add_enabled(!busy, clear).on_hover_text("For development: forget every archive in this catalogue").clicked() {
+                    st.confirm_clear = true;
+                }
+            });
         });
         ui.add_space(8.0);
+        if st.confirm_clear {
+            confirm_clear(ui.ctx(), st, &out);
+        }
 
         if st.query.trim().is_empty() {
             archive_list(ui, st);
@@ -135,6 +154,43 @@ impl App {
                 Some(f) => details(ui, st, &f),
             });
         });
+    }
+}
+
+fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
+    let mut close = false;
+    egui::Modal::new(egui::Id::unique("clear-catalogue")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.heading("Clear the catalogue?");
+        ui.label(format!(
+            "Forgets all {} archives recorded in {}. The .7z files and their manifests stay on disk; \
+             only the catalogue's records go, so their folders show as not archived again.",
+            st.archives.len(),
+            out.join(CATALOG_FILE).display()
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let clear = egui::Button::new(RichText::new("Clear the catalogue").color(egui::Color32::WHITE)).fill(theme::danger_fill());
+            if ui.add(clear).clicked() {
+                match Catalog::open_existing(out).and_then(|mut c| c.clear()) {
+                    Ok(n) => {
+                        st.note = Some(format!("Catalogue cleared: {n} archives forgotten."));
+                        st.cleared = true;
+                        st.invalidate();
+                        st.query.clear();
+                        st.results.clear();
+                    }
+                    Err(e) => st.error = Some(format!("Couldn't clear the catalogue: {e:#}")),
+                }
+                close = true;
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close {
+        st.confirm_clear = false;
     }
 }
 

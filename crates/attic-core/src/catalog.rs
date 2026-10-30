@@ -273,6 +273,20 @@ impl Catalog {
         Ok(())
     }
 
+    /// Forgets every archive, entry and run, leaving an empty catalogue.
+    /// The archives and manifests on disk are not touched. Returns how
+    /// many archives were forgotten.
+    pub fn clear(&mut self) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
+        tx.execute_batch(
+            "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM archives;",
+        )?;
+        tx.commit()?;
+        Ok(n as u64)
+    }
+
     /// Every verified archive, newest first.
     pub fn archives(&self) -> Result<Vec<ArchiveSummary>> {
         let mut q = self.conn.prepare(

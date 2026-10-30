@@ -702,6 +702,22 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_catalogue_keeps_the_archives() {
+        let (_tmp, src, out) = run(true);
+        let (a, _) = recorded(&out, &src);
+        let mut cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.clear().unwrap(), 1);
+        assert!(cat.archives().unwrap().is_empty());
+        assert!(cat.search("notes", None, 5).unwrap().is_empty());
+        assert!(cat.archived_folder(&src).unwrap().is_none());
+        assert!(a.archive_path.is_file());
+        assert!(manifest_path(&a.archive_path).is_file());
+        // Archiving again works and is searchable.
+        archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
+        assert_eq!(Catalog::open_existing(&out).unwrap().search("notes", None, 5).unwrap().len(), 1);
+    }
+
+    #[test]
     fn archive_path_is_stored_in_plain_form() {
         let (_tmp, src, out) = run(true);
         let (a, _) = recorded(&out, &src);
