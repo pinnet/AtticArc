@@ -191,7 +191,7 @@ fn soak(a: &SoakArgs) -> Result<bool> {
 
     let source = match &a.source {
         Some(s) => {
-            let s = std::fs::canonicalize(s)?;
+            let s = settings::strip_verbatim(&std::fs::canonicalize(s)?);
             if work.starts_with(&s) {
                 bail!("the work folder is inside {}; choose one elsewhere", s.display());
             }
@@ -399,7 +399,7 @@ fn clock(d: Duration) -> String {
 /// soak's own leftovers.
 fn prepare_work(work: &Path, protected: &[PathBuf]) -> Result<PathBuf> {
     std::fs::create_dir_all(work).with_context(|| format!("can't create {}", work.display()))?;
-    let work = std::fs::canonicalize(work)?;
+    let work = settings::strip_verbatim(&std::fs::canonicalize(work)?);
     let key = atticarc_core::catalog::path_key(&work);
     for p in protected {
         let pk = atticarc_core::catalog::path_key(p);
