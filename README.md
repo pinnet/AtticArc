@@ -33,7 +33,7 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 
 ## Open items
 
-- [ ] Duplicates: choose the copy to keep and remove the rest, logging each removal (the screen lists groups, read-only).
+- [x] Duplicates: choose the copy to keep and remove the rest, logging each removal.
 - [ ] Archive breakdown screen (pie / treemap of an archive's contents).
 - [ ] MD5 as an optional hash for compatibility with the older tool.
 - [ ] Skip locked files instead of failing the folder; free-space check before archiving.
@@ -84,7 +84,13 @@ Starts on the given source folder (or the last one used).
   date, sortable), or search every file in every archive by name or folder, all without unpacking.
   Select a file to see its original path, hashes and how many copies exist, and extract it.
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
-- **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first.
+- **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first,
+  in a split pane: the duplicated files on the left, the copies of the one picked on the right. Tick
+  **Delete** on the copies to remove (or **Keep only this** on the one to keep); ticks stay while you
+  move between files, so one **Delete N copies…** removes them all together. One copy of every file
+  always stays. Each archive losing a copy is unpacked into a work folder, written again without it,
+  verified and swapped in; its manifest lists the removed copies as duplicates, so its folder still
+  passes the check before a delete, and every removal is logged.
 - **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output

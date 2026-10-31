@@ -54,6 +54,10 @@ pub struct Excluded {
     pub set_aside: Vec<EntryRecord>,
     /// Files archived nowhere, deleted with the folder.
     pub discarded: Vec<EntryRecord>,
+    /// Files removed from this archive because another archive holds an
+    /// identical copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicates: Vec<EntryRecord>,
 }
 
 /// Files at least this big go in a block of their own; smaller files are
@@ -820,7 +824,69 @@ pub fn restore_excluded(
     settings: &Settings,
     progress: &Arc<Progress>,
 ) -> Result<Restored> {
+    rewrite(archive, keep, discard_rest, &[], settings, progress)
+}
+
+/// What removing duplicates did.
+#[derive(Debug, Default)]
+pub struct RemovedDuplicates {
+    pub files: usize,
+    pub bytes: u64,
+    pub archives: usize,
+}
+
+/// Removes the catalogued files `entry_ids` from their archives, as long as
+/// every one has an identical copy (same size and hash) that stays in
+/// another archive or another place in the same one. Each archive is
+/// rewritten without them, verified and swapped in, and its manifest lists
+/// them as duplicates, so its folder still passes the check before a delete.
+pub fn remove_duplicates(out_dir: &Path, entry_ids: &[i64], settings: &Settings, progress: &Arc<Progress>) -> Result<RemovedDuplicates> {
+    let cat = Catalog::open_existing(out_dir)?;
+    let mut by_archive: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut out = RemovedDuplicates::default();
+    for id in entry_ids {
+        let f = cat.entry_location(*id)?.ok_or_else(|| anyhow!("a file picked is no longer in the catalogue; refresh and try again"))?;
+        let hash = f.blake3.as_deref().ok_or_else(|| anyhow!("{} has no recorded hash", f.rel_path))?;
+        let kept = cat
+            .copies_of(hash, f.size)?
+            .into_iter()
+            .any(|(other, path)| !entry_ids.contains(&other) && path.is_file());
+        if !kept {
+            bail!("{} would have no copy left in any archive; untick one of its copies", f.rel_path);
+        }
+        out.files += 1;
+        out.bytes += f.size;
+        by_archive.entry(f.archive_path).or_default().push(f.rel_path);
+    }
+    drop(cat);
+    for (archive, rels) in &by_archive {
+        rewrite(archive, &[], false, rels, settings, progress)
+            .with_context(|| format!("{} was left as it was", archive.file_name().unwrap_or_default().to_string_lossy()))?;
+        out.archives += 1;
+    }
+    Ok(out)
+}
+
+/// Rewrites `archive`: puts back the left-out files `keep`, optionally
+/// discards the rest of the set-aside files, and removes `remove` as
+/// duplicates.
+fn rewrite(
+    archive: &Path,
+    keep: &[String],
+    discard_rest: bool,
+    remove: &[String],
+    settings: &Settings,
+    progress: &Arc<Progress>,
+) -> Result<Restored> {
     let m = read_manifest(archive)?;
+    if !remove.is_empty() && m.archive.source_path.ends_with("|excluded") {
+        bail!("{} holds set-aside files; manage those on the Excluded page", archive.display());
+    }
+    for rel in remove {
+        if !m.entries.iter().any(|e| !e.is_dir && &e.rel_path == rel) {
+            bail!("{rel} isn't in {}", archive.display());
+        }
+    }
     let ex = &m.excluded;
     let find = |list: &[EntryRecord], rel: &str| list.iter().any(|e| e.rel_path == rel);
     for rel in keep {
@@ -864,12 +930,21 @@ pub fn restore_excluded(
                 set_times(&to, std::fs::metadata(&from)?.modified().ok(), std::fs::metadata(&from)?.created().ok(), false);
             }
         }
+        let mut duplicates = ex.duplicates.clone();
+        for rel in remove {
+            std::fs::remove_file(main_dir.join(rel)).with_context(|| format!("can't remove {rel} from the work folder"))?;
+            let mut e = m.entries.iter().find(|e| &e.rel_path == rel).unwrap().clone();
+            e.method = "duplicate".into();
+            duplicates.push(e);
+        }
+        duplicates.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
         // What is left out now.
         let mut left = Excluded {
             set_aside_archive: ex.set_aside_archive.clone(),
             set_aside: ex.set_aside.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
             discarded: ex.discarded.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
+            duplicates,
         };
         let mut moved = 0;
         if discard_rest {
@@ -957,8 +1032,12 @@ pub fn restore_excluded(
         aside_removed = true;
     }
     if let Some(id) = main_id {
-        let detail = format!("put back: {}", keep.join(", "));
-        cat.log_run(Some(id), "restore", &source, &now_utc(), "verified", &detail)?;
+        let (what, detail) = if remove.is_empty() {
+            ("restore", format!("put back: {}", keep.join(", ")))
+        } else {
+            ("dedupe", format!("removed as duplicates: {}", remove.join(", ")))
+        };
+        cat.log_run(Some(id), what, &source, &now_utc(), "verified", &detail)?;
     }
     Ok(Restored { put_back: keep.len(), discarded: moved, aside_removed })
 }
@@ -1103,6 +1182,7 @@ pub fn check_before_delete(
         .iter()
         .chain(&excluded.set_aside)
         .chain(&excluded.discarded)
+        .chain(&excluded.duplicates)
         .filter(|e| !e.is_dir)
         .map(|e| (e.rel_path.as_str(), e))
         .collect();
@@ -1415,6 +1495,47 @@ mod tests {
         let e = restore_excluded(&main, &["sub/random.dat".into()], false, &s, &p).err().unwrap();
         assert!(format!("{e:#}").contains("no longer has it"), "{e:#}");
         assert!(read_manifest(&main).is_ok());
+    }
+
+    #[test]
+    fn duplicates_are_removed_but_never_the_last_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let s = settings(&out, true);
+        let p = Arc::new(Progress::default());
+        for name in ["one", "two"] {
+            let src = tmp.path().join(name);
+            std::fs::create_dir_all(src.join("pics")).unwrap();
+            std::fs::write(src.join("pics/same.jpg"), b"identical bytes").unwrap();
+            std::fs::write(src.join(format!("{name}.txt")), name).unwrap();
+            archive_folder(&src, &s, &p).unwrap();
+        }
+        let cat = Catalog::open_existing(&out).unwrap();
+        let groups = cat.duplicate_groups(10).unwrap();
+        assert_eq!(groups.len(), 1);
+        let ids: Vec<i64> = groups[0].copies.iter().map(|c| c.entry_id).collect();
+        drop(cat);
+
+        // Both copies can't go.
+        let e = remove_duplicates(&out, &ids, &s, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("no copy left"), "{e:#}");
+
+        // The copy in "two" goes; "one" keeps its own.
+        let two = groups[0].copies.iter().find(|c| c.archive_name == "two").unwrap().entry_id;
+        let r = remove_duplicates(&out, &[two], &s, &p).unwrap();
+        assert_eq!((r.files, r.archives, r.bytes), (1, 1, 15));
+        let m = read_manifest(&out.join("two.7z")).unwrap();
+        assert!(!m.entries.iter().any(|e| e.rel_path == "pics/same.jpg"));
+        assert_eq!(m.excluded.duplicates.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(), ["duplicate"]);
+        assert!(read_manifest(&out.join("one.7z")).unwrap().entries.iter().any(|e| e.rel_path == "pics/same.jpg"));
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert!(cat.duplicate_groups(10).unwrap().is_empty());
+        assert!(cat.excluded_folders().unwrap().is_empty());
+
+        // The folder still on disk passes the check before a delete.
+        let src = tmp.path().join("two");
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
     }
 
     #[test]

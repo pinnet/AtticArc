@@ -406,6 +406,38 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Where catalogued file `entry_id` is: its archive and path inside it.
+    pub fn entry_location(&self, entry_id: i64) -> Result<Option<EntryLocation>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT a.archive_path, e.rel_path, e.blake3, e.size
+                 FROM entries e JOIN archives a ON a.id = e.archive_id
+                 WHERE e.id = ?1 AND e.kind = 'file'",
+                params![entry_id],
+                |r| {
+                    Ok(EntryLocation {
+                        archive_path: PathBuf::from(r.get::<_, String>(0)?),
+                        rel_path: r.get(1)?,
+                        blake3: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every catalogued copy of a file in a verified archive, as entry id
+    /// and archive path.
+    pub fn copies_of(&self, blake3: &str, size: u64) -> Result<Vec<(i64, PathBuf)>> {
+        let mut q = self.conn.prepare(
+            "SELECT e.id, a.archive_path FROM entries e JOIN archives a ON a.id = e.archive_id
+             WHERE e.blake3 = ?1 AND e.size = ?2 AND e.kind = 'file' AND a.status = 'verified'",
+        )?;
+        let rows = q.query_map(params![blake3, size as i64], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// The catalogue id of the archive at `path`, if it is catalogued.
     pub fn archive_id_for(&self, path: &Path) -> Result<Option<i64>> {
         let key = crate::settings::strip_verbatim(path).to_string_lossy().into_owned();
@@ -639,6 +671,15 @@ fn delete_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64) -> Result<()>
     )?;
     tx.execute("DELETE FROM entries WHERE archive_id = ?1", params![archive_id])?;
     Ok(())
+}
+
+/// Where a catalogued file is.
+#[derive(Clone, Debug)]
+pub struct EntryLocation {
+    pub archive_path: PathBuf,
+    pub rel_path: String,
+    pub blake3: Option<String>,
+    pub size: u64,
 }
 
 /// A folder some of whose files the exclusions left out of its archive.
