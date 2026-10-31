@@ -60,9 +60,6 @@ pub fn warn() -> Color32 {
 pub fn warn_soft() -> Color32 {
     pick(0xFFF4E5, 0x3A2A15)
 }
-pub fn warn_border() -> Color32 {
-    pick(0xF0D3A8, 0x6B4A20)
-}
 /// Danger as text (the X, Cancel now).
 pub fn danger() -> Color32 {
     pick(0xB43232, 0xF08A8A)

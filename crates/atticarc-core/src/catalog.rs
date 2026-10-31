@@ -1,8 +1,10 @@
 //! SQLite catalog of archives and the files inside them.
 //!
-//! One `catalog.db` lives in the output folder next to the archives. An
-//! archive row is only written after the archive has been verified, in one
-//! transaction together with its entries.
+//! One `catalog.db` lives in a hidden `.atticarc` folder inside the output
+//! folder, so the output folder itself shows only the archives. An archive
+//! row is only written after the archive has been verified, in one
+//! transaction together with its entries. Every archive also carries its own
+//! manifest, so the catalogue can be rebuilt from the archives.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +13,71 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 pub const CATALOG_FILE: &str = "catalog.db";
+
+/// The hidden folder AtticARC keeps its own files in: inside the output
+/// folder for the catalogue, and inside each archive for its manifest.
+pub const DATA_DIR: &str = ".atticarc";
+
+/// Where the catalogue for the output folder `dir` lives.
+pub fn db_path(dir: &Path) -> PathBuf {
+    dir.join(DATA_DIR).join(CATALOG_FILE)
+}
+
+/// Whether `dir` has a catalogue, in its current or its old place.
+pub fn exists(dir: &Path) -> bool {
+    db_path(dir).is_file() || dir.join(CATALOG_FILE).is_file()
+}
+
+/// Creates `dir/.atticarc` if needed and makes sure it is hidden on Windows
+/// (the dot hides it elsewhere).
+fn make_data_dir(dir: &Path) -> Result<()> {
+    let data = dir.join(DATA_DIR);
+    if !data.is_dir() {
+        std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
+    }
+    hide(&data);
+    Ok(())
+}
+
+/// Sets the Hidden attribute on Windows if it isn't set. Best effort: a
+/// folder that stays visible does no harm.
+#[cfg(windows)]
+fn hide(path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::process::CommandExt;
+    const HIDDEN: u32 = 0x2;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & HIDDEN != 0) {
+        return;
+    }
+    // attrib doesn't understand \\?\ paths.
+    let _ = std::process::Command::new("attrib")
+        .arg("+h")
+        .arg(crate::settings::strip_verbatim(path))
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+#[cfg(not(windows))]
+fn hide(_path: &Path) {}
+
+/// Moves a catalogue from where earlier versions kept it, loose in the
+/// output folder, into `.atticarc`.
+fn move_old_catalog(dir: &Path) -> Result<()> {
+    let old = dir.join(CATALOG_FILE);
+    if !old.is_file() || db_path(dir).is_file() {
+        return Ok(());
+    }
+    make_data_dir(dir)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", old.display()));
+        if from.is_file() {
+            let to = PathBuf::from(format!("{}{suffix}", db_path(dir).display()));
+            std::fs::rename(&from, &to).with_context(|| format!("move {} into {DATA_DIR}", from.display()))?;
+        }
+    }
+    Ok(())
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS archives (
@@ -63,6 +130,17 @@ CREATE TABLE IF NOT EXISTS runs (
     outcome         TEXT NOT NULL,
     detail          TEXT NOT NULL
 );
+
+-- Files the exclusions left out of an archive: set aside in a second
+-- archive (aside_archive is its file name) or discarded.
+CREATE TABLE IF NOT EXISTS excluded (
+    archive_id      INTEGER NOT NULL REFERENCES archives(id),
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    action          TEXT NOT NULL,
+    aside_archive   TEXT
+);
+CREATE INDEX IF NOT EXISTS excluded_archive ON excluded(archive_id);
 "#;
 
 /// One file or folder as recorded in the catalog and the manifest.
@@ -120,16 +198,19 @@ impl Catalog {
     /// uses [`Catalog::open_existing`], so it never writes into a folder.
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        Self::connect(&dir.join(CATALOG_FILE))
+        move_old_catalog(dir)?;
+        make_data_dir(dir)?;
+        Self::connect(&db_path(dir))
     }
 
     /// Opens the catalogue in `dir` only if it is already there.
     pub fn open_existing(dir: &Path) -> Result<Self> {
-        let path = dir.join(CATALOG_FILE);
-        if !path.is_file() {
+        if !exists(dir) {
             bail!("there is no catalogue in {}", dir.display());
         }
-        Self::connect(&path)
+        move_old_catalog(dir)?;
+        hide(&dir.join(DATA_DIR));
+        Self::connect(&db_path(dir))
     }
 
     fn connect(path: &Path) -> Result<Self> {
@@ -171,38 +252,41 @@ impl Catalog {
             ],
         )?;
         let archive_id = tx.last_insert_rowid();
-        {
-            let mut ins = tx.prepare(
-                "INSERT INTO entries (archive_id, rel_path, name, ext, kind, size, modified_utc,
-                    created_utc, blake3, sha256, method)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
-            for e in entries {
-                let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
-                let ext = if e.is_dir {
-                    String::new()
-                } else {
-                    name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
-                };
-                ins.execute(params![
-                    archive_id,
-                    e.rel_path,
-                    name,
-                    ext,
-                    if e.is_dir { "dir" } else { "file" },
-                    e.size as i64,
-                    e.modified_utc,
-                    e.created_utc,
-                    e.blake3,
-                    e.sha256,
-                    e.method
-                ])?;
-                fts.execute(params![tx.last_insert_rowid(), name, e.rel_path])?;
-            }
-        }
+        insert_entries(&tx, archive_id, entries)?;
         tx.commit()?;
         Ok(archive_id)
+    }
+
+    /// Replaces what is recorded for archive `id` after it was rewritten:
+    /// its sizes and counts, its entries and what was left out of it.
+    pub fn replace_contents(
+        &mut self,
+        id: i64,
+        a: &ArchiveRecord,
+        entries: &[EntryRecord],
+        ex: &crate::archive::Excluded,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE archives SET input_bytes = ?2, archive_bytes = ?3, file_count = ?4, dir_count = ?5 WHERE id = ?1",
+            params![id, a.input_bytes as i64, a.archive_bytes as i64, a.file_count as i64, a.dir_count as i64],
+        )?;
+        delete_entries(&tx, id)?;
+        insert_entries(&tx, id, entries)?;
+        tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.commit()?;
+        self.insert_excluded(id, ex)
+    }
+
+    /// Forgets archive `id` entirely, for an archive file that was removed.
+    pub fn remove_archive(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        delete_entries(&tx, id)?;
+        tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.execute("UPDATE runs SET archive_id = NULL WHERE archive_id = ?1", params![id])?;
+        tx.execute("DELETE FROM archives WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The newest verified archive of `source`, if its source folder has not
@@ -228,6 +312,12 @@ impl Catalog {
         Ok(found.filter(|f| f.archive_path.is_file()))
     }
 
+    /// Whether an archive at `path` is already in the catalogue.
+    pub fn has_archive_path(&self, path: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM archives WHERE archive_path = ?1", params![path], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     pub fn entries(&self, archive_id: i64) -> Result<Vec<EntryRecord>> {
         let mut q = self.conn.prepare(
             "SELECT rel_path, kind, size, modified_utc, created_utc, blake3, sha256, method
@@ -246,6 +336,115 @@ impl Catalog {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Records what the exclusions left out of an archive.
+    pub fn insert_excluded(&mut self, archive_id: i64, ex: &crate::archive::Excluded) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut q = tx.prepare(
+                "INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in &ex.set_aside {
+                q.execute(params![archive_id, e.rel_path, e.size as i64, "set_aside", ex.set_aside_archive])?;
+            }
+            for e in &ex.discarded {
+                q.execute(params![archive_id, e.rel_path, e.size as i64, "discard", Option::<String>::None])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every verified archive whose folder had files left out by the
+    /// exclusions, newest first.
+    pub fn excluded_folders(&self) -> Result<Vec<ExcludedFolder>> {
+        let mut q = self.conn.prepare(
+            "SELECT a.id, a.name, a.archive_path, COALESCE(a.source_display, a.source_path), a.created_utc,
+                    a.archive_bytes, a.source_deleted_utc
+             FROM archives a
+             WHERE a.status = 'verified' AND EXISTS (SELECT 1 FROM excluded x WHERE x.archive_id = a.id)
+             ORDER BY a.id DESC",
+        )?;
+        let mut out: Vec<ExcludedFolder> = q
+            .query_map([], |r| {
+                Ok(ExcludedFolder {
+                    archive: ArchivedFolder {
+                        archive_id: r.get(0)?,
+                        archive_path: PathBuf::from(r.get::<_, String>(2)?),
+                        created_utc: r.get(4)?,
+                        archive_bytes: r.get::<_, i64>(5)? as u64,
+                    },
+                    name: r.get(1)?,
+                    source: PathBuf::from(r.get::<_, String>(3)?),
+                    source_deleted_utc: r.get(6)?,
+                    aside_archive: None,
+                    set_aside: Vec::new(),
+                    discarded: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut files = self.conn.prepare(
+            "SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path",
+        )?;
+        for f in &mut out {
+            let rows = files.query_map(params![f.archive.archive_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+            })?;
+            for row in rows {
+                let (rel, size, action, aside) = row?;
+                if action == "discard" {
+                    f.discarded.push((rel, size));
+                } else {
+                    f.set_aside.push((rel, size));
+                    if f.aside_archive.is_none() {
+                        f.aside_archive = aside.map(|n| f.archive.archive_path.with_file_name(n));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Where catalogued file `entry_id` is: its archive and path inside it.
+    pub fn entry_location(&self, entry_id: i64) -> Result<Option<EntryLocation>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT a.archive_path, e.rel_path, e.blake3, e.size
+                 FROM entries e JOIN archives a ON a.id = e.archive_id
+                 WHERE e.id = ?1 AND e.kind = 'file'",
+                params![entry_id],
+                |r| {
+                    Ok(EntryLocation {
+                        archive_path: PathBuf::from(r.get::<_, String>(0)?),
+                        rel_path: r.get(1)?,
+                        blake3: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every catalogued copy of a file in a verified archive, as entry id
+    /// and archive path.
+    pub fn copies_of(&self, blake3: &str, size: u64) -> Result<Vec<(i64, PathBuf)>> {
+        let mut q = self.conn.prepare(
+            "SELECT e.id, a.archive_path FROM entries e JOIN archives a ON a.id = e.archive_id
+             WHERE e.blake3 = ?1 AND e.size = ?2 AND e.kind = 'file' AND a.status = 'verified'",
+        )?;
+        let rows = q.query_map(params![blake3, size as i64], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The catalogue id of the archive at `path`, if it is catalogued.
+    pub fn archive_id_for(&self, path: &Path) -> Result<Option<i64>> {
+        let key = crate::settings::strip_verbatim(path).to_string_lossy().into_owned();
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM archives WHERE archive_path = ?1 ORDER BY id DESC LIMIT 1", params![key], |r| r.get(0))
+            .optional()?)
     }
 
     pub fn mark_source_deleted(&self, archive_id: i64, when_utc: &str) -> Result<()> {
@@ -281,7 +480,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)
@@ -336,6 +535,32 @@ impl Catalog {
         )?;
         let rows = q.query_map(params![words.join(" "), archive_id, limit as i64], found_file)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every file and folder recorded for one archive, for browsing it
+    /// without unpacking. Files carry their copy counts like [`Catalog::search`].
+    pub fn contents(&self, archive_id: i64) -> Result<ArchiveContents> {
+        let mut q = self.conn.prepare(
+            "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256,
+                    COALESCE(c.n, 1), e.kind
+             FROM entries e JOIN archives a ON a.id = e.archive_id
+             LEFT JOIN (SELECT blake3, size, COUNT(*) AS n FROM entries
+                        WHERE kind = 'file' AND blake3 IS NOT NULL GROUP BY blake3, size) c
+                    ON c.blake3 = e.blake3 AND c.size = e.size
+             WHERE e.archive_id = ?1
+             ORDER BY e.rel_path",
+        )?;
+        let mut out = ArchiveContents::default();
+        let rows = q.query_map(params![archive_id], |r| Ok((found_file(r)?, r.get::<_, String>(10)?)))?;
+        for row in rows {
+            let (f, kind) = row?;
+            if kind == "dir" {
+                out.folders.push(f.rel_path);
+            } else {
+                out.files.push(f);
+            }
+        }
+        Ok(out)
     }
 
     /// Groups of files with the same size and BLAKE3 hash across all
@@ -403,6 +628,83 @@ pub struct FoundFile {
     pub sha256: Option<String>,
     /// How many catalogued files share this file's size and hash, itself included.
     pub copies: u64,
+}
+
+fn insert_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64, entries: &[EntryRecord]) -> Result<()> {
+    let mut ins = tx.prepare(
+        "INSERT INTO entries (archive_id, rel_path, name, ext, kind, size, modified_utc,
+            created_utc, blake3, sha256, method)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
+    for e in entries {
+        let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
+        let ext = if e.is_dir {
+            String::new()
+        } else {
+            name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
+        };
+        ins.execute(params![
+            archive_id,
+            e.rel_path,
+            name,
+            ext,
+            if e.is_dir { "dir" } else { "file" },
+            e.size as i64,
+            e.modified_utc,
+            e.created_utc,
+            e.blake3,
+            e.sha256,
+            e.method
+        ])?;
+        fts.execute(params![tx.last_insert_rowid(), name, e.rel_path])?;
+    }
+    Ok(())
+}
+
+/// Removes an archive's entries and their search index rows.
+fn delete_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO entries_fts (entries_fts, rowid, name, rel_path)
+         SELECT 'delete', id, name, rel_path FROM entries WHERE archive_id = ?1",
+        params![archive_id],
+    )?;
+    tx.execute("DELETE FROM entries WHERE archive_id = ?1", params![archive_id])?;
+    Ok(())
+}
+
+/// Where a catalogued file is.
+#[derive(Clone, Debug)]
+pub struct EntryLocation {
+    pub archive_path: PathBuf,
+    pub rel_path: String,
+    pub blake3: Option<String>,
+    pub size: u64,
+}
+
+/// A folder some of whose files the exclusions left out of its archive.
+#[derive(Clone, Debug)]
+pub struct ExcludedFolder {
+    /// The folder's main archive.
+    pub archive: ArchivedFolder,
+    pub name: String,
+    /// The folder that was archived, as spelled on disk.
+    pub source: PathBuf,
+    pub source_deleted_utc: Option<String>,
+    /// The second archive holding the set-aside files.
+    pub aside_archive: Option<PathBuf>,
+    /// (path inside the folder, size) of each set-aside file.
+    pub set_aside: Vec<(String, u64)>,
+    /// (path inside the folder, size) of each discarded file.
+    pub discarded: Vec<(String, u64)>,
+}
+
+/// What one archive holds, as recorded in the catalogue.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveContents {
+    pub files: Vec<FoundFile>,
+    /// Folder paths inside the archive, `/` separated.
+    pub folders: Vec<String>,
 }
 
 /// Catalogued files that share one size and BLAKE3 hash.

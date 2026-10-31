@@ -1,6 +1,6 @@
-//! Settings kept between runs, shared by the GUI and `attic archive`.
+//! Settings kept between runs, shared by the GUI and `atticarc-cli archive`.
 //!
-//! Stored in `%APPDATA%\attic\settings.json`. On first run, settings saved
+//! Stored in `%APPDATA%\atticarc\settings.json`. On first run, settings saved
 //! by foldarc (`%APPDATA%\foldarc\settings.json`) are picked up, so the
 //! output folder and protected folders carry over.
 
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::archive::{self, Settings};
+use crate::exclude::{self, Rule};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -20,6 +21,8 @@ pub struct Saved {
     pub store_mode: bool,
     pub threads: Threads,
     pub protected: Vec<PathBuf>,
+    /// Files to leave out of archives.
+    pub exclusions: Vec<Rule>,
     /// GUI colour scheme.
     pub dark_mode: bool,
 }
@@ -60,6 +63,7 @@ impl Default for Saved {
             store_mode: true,
             threads: Threads::All,
             protected: vec![r"C:\7ztest".into(), r"D:\7ztest".into(), r"W:\7ztest".into()],
+            exclusions: exclude::default_rules(),
             dark_mode: false,
         }
     }
@@ -74,6 +78,7 @@ impl Saved {
             store_mode: self.store_mode,
             threads: self.threads.count(),
             protected: self.protected.clone(),
+            exclusions: self.exclusions.clone(),
         }
     }
 }
@@ -83,12 +88,14 @@ fn config_dir() -> PathBuf {
 }
 
 pub fn settings_file() -> PathBuf {
-    config_dir().join("attic").join("settings.json")
+    config_dir().join("atticarc").join("settings.json")
 }
 
 pub fn load() -> Saved {
     let read = |p: PathBuf| std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Saved>(&b).ok());
+    // Earlier versions saved under "attic", and before that "foldarc".
     read(settings_file())
+        .or_else(|| read(config_dir().join("attic").join("settings.json")))
         .or_else(|| read(config_dir().join("foldarc").join("settings.json")))
         .unwrap_or_default()
 }
@@ -103,8 +110,8 @@ pub fn store(s: &Saved) {
     }
 }
 
-/// Beside the source folder, never inside it, in a shared `Attic ARC archives`
-/// folder: `D:\Photos` → `D:\Attic ARC archives\Photos`. Never inside the source,
+/// Beside the source folder, never inside it, in a shared `AtticARC archives`
+/// folder: `D:\Photos` → `D:\AtticARC archives\Photos`. Never inside the source,
 /// because the source may be protected or deleted later.
 pub fn default_out_dir(source: &Path) -> PathBuf {
     match (source.parent(), source.file_name()) {
@@ -113,7 +120,7 @@ pub fn default_out_dir(source: &Path) -> PathBuf {
     }
 }
 
-const OUT_DIR_NAME: &str = "Attic ARC archives";
+const OUT_DIR_NAME: &str = "AtticARC archives";
 
 /// `\\?\C:\x` → `C:\x`, the form people expect to see.
 pub fn strip_verbatim(p: &Path) -> PathBuf {
@@ -139,7 +146,7 @@ mod tests {
     #[test]
     fn out_dir_sits_next_to_source() {
         let d = default_out_dir(Path::new("/data/Photos"));
-        assert_eq!(d, Path::new("/data/Attic ARC archives/Photos"));
-        assert_eq!(default_out_dir(Path::new("/")), Path::new("/Attic ARC archives"));
+        assert_eq!(d, Path::new("/data/AtticARC archives/Photos"));
+        assert_eq!(default_out_dir(Path::new("/")), Path::new("/AtticARC archives"));
     }
 }

@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 
-use attic_core::archive::{self, DeleteCheck, Progress, Settings};
-use attic_core::catalog::{self, ArchivedFolder, Catalog};
+use atticarc_core::archive::{self, DeleteCheck, Progress, Settings};
+use atticarc_core::catalog::{self, ArchivedFolder, Catalog};
 
 use crate::{human, theme};
 
@@ -113,6 +113,11 @@ pub struct Jobs {
     pub log: Vec<String>,
     pub dialog: Option<Dialog>,
     pub load_error: Option<String>,
+    /// Folders outside the source folder list that a delete was asked for,
+    /// from the Excluded page.
+    targets: Vec<(PathBuf, ArchivedFolder)>,
+    /// Set when a folder was deleted, so other pages can refresh.
+    pub deleted: bool,
     task: Option<Task>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -121,7 +126,34 @@ pub struct Jobs {
 impl Jobs {
     pub fn new() -> Self {
         let (tx, rx) = channel();
-        Self { rows: Vec::new(), batch: None, log: Vec::new(), dialog: None, load_error: None, task: None, tx, rx }
+        Self {
+            rows: Vec::new(),
+            batch: None,
+            log: Vec::new(),
+            dialog: None,
+            load_error: None,
+            targets: Vec::new(),
+            deleted: false,
+            task: None,
+            tx,
+            rx,
+        }
+    }
+
+    /// Starts the check-then-delete flow for a folder archived as `archived`,
+    /// whether or not it is in the current source folder.
+    pub fn ask_delete(&mut self, path: PathBuf, archived: ArchivedFolder) {
+        self.targets.retain(|t| t.0 != path);
+        self.targets.push((path.clone(), archived));
+        self.dialog = Some(Dialog::ConfirmDelete(path));
+    }
+
+    fn archived_for(&self, path: &Path) -> Option<ArchivedFolder> {
+        self.rows
+            .iter()
+            .find(|r| r.path == path)
+            .and_then(|r| r.archived.clone())
+            .or_else(|| self.targets.iter().find(|t| t.0 == path).map(|t| t.1.clone()))
     }
 
     pub fn is_busy(&self) -> bool {
@@ -144,7 +176,7 @@ impl Jobs {
         self.rows.clear();
         self.load_error = None;
         let out_key = catalog::path_key(out_dir);
-        let cat = if out_dir.join(catalog::CATALOG_FILE).is_file() {
+        let cat = if catalog::exists(out_dir) {
             Catalog::open_existing(out_dir).map(Some).map_err(|e| format!("{e:#}"))
         } else {
             Ok(None)
@@ -270,6 +302,8 @@ impl Jobs {
                     match res {
                         Ok(()) => {
                             self.rows.retain(|r| r.path != p);
+                            self.targets.retain(|t| t.0 != p);
+                            self.deleted = true;
                             self.log(format!("{} deleted after a full check", p.display()));
                             self.dialog = Some(Dialog::Message(
                                 "Deleted".into(),
@@ -359,6 +393,12 @@ impl Jobs {
                         if !o.skipped_links.is_empty() {
                             note.push_str(&format!(", {} links skipped", o.skipped_links.len()));
                         }
+                        if !o.excluded.set_aside.is_empty() {
+                            note.push_str(&format!(", {} set aside", o.excluded.set_aside.len()));
+                        }
+                        if !o.excluded.discarded.is_empty() {
+                            note.push_str(&format!(", {} discarded", o.excluded.discarded.len()));
+                        }
                         note
                     })
                     .map_err(|e| format!("{e:#}"));
@@ -370,7 +410,7 @@ impl Jobs {
     }
 
     fn start_check(&mut self, path: PathBuf, settings: &Settings) {
-        let Some(archived) = self.rows.iter().find(|r| r.path == path).and_then(|r| r.archived.clone()) else {
+        let Some(archived) = self.archived_for(&path) else {
             return;
         };
         let progress = Arc::new(Progress::default());
@@ -390,7 +430,7 @@ impl Jobs {
     }
 
     fn start_delete(&mut self, path: PathBuf, settings: &Settings) {
-        let Some(archived) = self.rows.iter().find(|r| r.path == path).and_then(|r| r.archived.clone()) else {
+        let Some(archived) = self.archived_for(&path) else {
             return;
         };
         // Protected folders never reach here (their X is disabled), but check again.
@@ -421,7 +461,7 @@ impl Jobs {
         let mut keep = true;
         let mut check: Option<PathBuf> = None;
         let mut delete: Option<PathBuf> = None;
-        egui::Modal::new(egui::Id::unique("attic-dialog")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("atticarc-dialog")).show(ctx, |ui| {
             ui.set_max_width(480.0);
             match &dialog {
                 Dialog::ConfirmDelete(p) => {
@@ -462,6 +502,28 @@ impl Jobs {
                         human(c.bytes_checked),
                         p.display()
                     ));
+                    if let Some(a) = &c.set_aside_archive {
+                        ui.add_space(6.0);
+                        let name = a.file_name().unwrap_or_default().to_string_lossy();
+                        ui.label(format!("Files the exclusions set aside are safe in {name}, which was checked too."));
+                    }
+                    if !c.discarded.is_empty() {
+                        ui.add_space(6.0);
+                        let bytes: u64 = c.discarded.iter().map(|e| e.size).sum();
+                        ui.label(
+                            RichText::new(format!(
+                                "{} discarded files ({}) are in no archive and will be gone for good:",
+                                c.discarded.len(),
+                                human(bytes)
+                            ))
+                            .color(theme::warn()),
+                        );
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            for e in &c.discarded {
+                                ui.label(RichText::new(format!("{}  ({})", e.rel_path, human(e.size))).monospace().size(12.0));
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
                     ui.label(RichText::new("Deleting is permanent: the folder does not go to the Recycle Bin.").strong());
                     ui.add_space(8.0);

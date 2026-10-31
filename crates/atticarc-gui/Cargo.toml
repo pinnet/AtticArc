@@ -1,0 +1,17 @@
+[package]
+name = "atticarc-gui"
+description = "Desktop GUI for AtticARC (eframe/egui)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "atticarc"
+path = "src/main.rs"
+
+[dependencies]
+atticarc-core = { path = "../atticarc-core" }
+anyhow = "1.0.104"
+mimalloc = "0.1.52"
+eframe = "0.37.0"
+rfd = "0.17.2"

@@ -1,6 +1,6 @@
 [package]
-name = "attic-core"
-description = "Scanning, hashing, archiving and catalogue logic shared by the Attic ARC CLI and GUI."
+name = "atticarc-core"
+description = "Scanning, hashing, archiving and catalogue logic shared by the AtticARC CLI and GUI."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -9,6 +9,7 @@ publish.workspace = true
 anyhow = "1.0.104"
 blake3 = "1.8.7"
 chrono = "0.4.45"
+regex = "1"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

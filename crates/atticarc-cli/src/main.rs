@@ -1,22 +1,41 @@
+mod mem;
+mod soak;
+
+/// mimalloc hands freed memory back to the system, so memory stays flat
+/// over hours of archiving; the system allocator kept growing in the soak
+/// test as many threads freed and reused large buffers.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use attic_core::archive::{self, Progress};
-use attic_core::catalog::Catalog;
-use attic_core::{scan, settings};
+use atticarc_core::archive::{self, Progress};
+use atticarc_core::catalog::Catalog;
+use atticarc_core::{scan, settings};
 
 const USAGE: &str = "\
-Attic ARC – archive, catalogue and de-duplicate folders
+AtticARC – archive, catalogue and de-duplicate folders
 
 Usage:
-  attic scan <folder> [--top N]   List files and show possible duplicates (by size).
+  atticarc-cli scan <folder> [--top N]   List files and show possible duplicates (by size).
                                   Reads no file contents, so it is fast.
-  attic archive <folder>...       Archive each folder to its own .7z and verify it,
+  atticarc-cli archive <folder>...       Archive each folder to its own .7z and verify it,
                                   using the settings saved by the GUI.
         [--out DIR] [--level 5|9]  Override the output folder or level.
-  attic search <words> [--out DIR] Search the catalogue in the output folder.
-  attic help                      Show this message.
+  atticarc-cli search <words> [--out DIR] Search the catalogue in the output folder.
+  atticarc-cli rebuild [--out DIR]       Add the archives in the output folder that the
+                                  catalogue is missing, from their manifests.
+  atticarc-cli soak --work DIR           Robustness test: archive, check, put back, de-duplicate
+        [--hours H | --minutes M]  and rebuild in a loop (default 60 minutes), logging
+        [--rounds N] [--gb G]      memory, handles and threads to a CSV in DIR. Uses G GB
+        [--source FOLDER]          of generated files (default 1), or archives FOLDER
+        [--every S]                (only read) each round. DIR must be empty or a soak's.
+                                  Fails if a round fails or memory keeps climbing.
+  atticarc-cli watch [atticarc|PID]      Log the window's memory, handles and threads every
+        [--every S] [--csv FILE]   S seconds (default 10) until it exits.
+  atticarc-cli help                      Show this message.
 
 Exit code 0 means every folder was archived and verified.";
 
@@ -44,6 +63,22 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("rebuild") => match args.get(1).map(String::as_str) {
+            None => run_rebuild(None),
+            Some("--out") if args.len() == 3 => run_rebuild(Some(PathBuf::from(&args[2]))),
+            _ => {
+                eprintln!("rebuild takes only --out <folder>\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("soak") => match soak::parse_soak(&args[1..]) {
+            Ok(a) => soak::run_soak(a),
+            Err(msg) => {
+                eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("watch") => soak::run_watch(&args[1..]),
         Some("help" | "-h" | "--help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -176,6 +211,15 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 if !o.skipped_links.is_empty() {
                     println!("  links not followed: {}", o.skipped_links.join(", "));
                 }
+                let names = |v: &[atticarc_core::catalog::EntryRecord]| {
+                    v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ")
+                };
+                if let Some(a) = &o.excluded.set_aside_archive {
+                    println!("  set aside in {a}: {}", names(&o.excluded.set_aside));
+                }
+                if !o.excluded.discarded.is_empty() {
+                    println!("  discarded: {}", names(&o.excluded.discarded));
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -201,6 +245,26 @@ fn parse_search(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
         return Err("search needs some words".into());
     }
     Ok((words.join(" "), out))
+}
+
+fn run_rebuild(out: Option<PathBuf>) -> ExitCode {
+    let Some(out) = out.or(settings::load().out_dir) else {
+        eprintln!("No output folder saved yet; pass --out <folder>.");
+        return ExitCode::from(2);
+    };
+    match archive::rebuild_catalog(&out) {
+        Ok(r) => {
+            println!("{} added, {} already in the catalogue", r.added, r.already_there);
+            for f in &r.failed {
+                println!("  not added: {f}");
+            }
+            if r.failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
+        }
+        Err(e) => {
+            eprintln!("Rebuild failed: {e:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run_search(words: &str, out: Option<PathBuf>) -> ExitCode {

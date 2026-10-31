@@ -1,9 +1,9 @@
-# Attic ARC
+# AtticARC
 
 Archive, catalogue and de-duplicate large folder collections, to free up disk space without losing anything that matters.
 
 Private successor to `pinnet/compressed-subfolders-7z`, rewritten in Rust. The archive,
-catalogue and verified-delete engine comes from foldarc, which is now part of Attic ARC.
+catalogue and verified-delete engine comes from foldarc, which is now part of AtticARC.
 
 ## What it will do
 
@@ -33,11 +33,11 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 
 ## Open items
 
-- [ ] Duplicates: choose the copy to keep and remove the rest, logging each removal (the screen lists groups, read-only).
+- [x] Duplicates: choose the copy to keep and remove the rest, logging each removal.
 - [ ] Archive breakdown screen (pie / treemap of an archive's contents).
 - [ ] MD5 as an optional hash for compatibility with the older tool.
 - [ ] Skip locked files instead of failing the folder; free-space check before archiving.
-- [ ] Hash the size-collision candidates from `attic scan` before archiving.
+- [ ] Hash the size-collision candidates from `atticarc-cli scan` before archiving.
 - [ ] EXE version info in the catalogue.
 - [ ] Macrium Reflect image reader: mount `.mrimg` files read-only and catalogue their contents to prune the NAS image collection.
 
@@ -45,14 +45,14 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 
 | Crate | Purpose |
 |---|---|
-| `crates/attic-core` | `scan` (fast metadata scan), `archive` (compress, verify, check-then-delete), `catalog` (SQLite), `settings` |
-| `crates/attic-cli` | `attic` command-line tool |
-| `crates/attic-gui` | Desktop GUI (`attic-gui`) |
+| `crates/atticarc-core` | `scan` (fast metadata scan), `archive` (compress, verify, check-then-delete), `catalog` (SQLite), `settings` |
+| `crates/atticarc-cli` | `atticarc-cli` command-line tool |
+| `crates/atticarc-gui` | Desktop GUI (`atticarc`) |
 
 ## GUI
 
 ```
-cargo run --release -p attic-gui -- D:\Photos
+cargo run --release -p atticarc-gui -- D:\Photos
 ```
 
 Starts on the given source folder (or the last one used).
@@ -61,34 +61,86 @@ Starts on the given source folder (or the last one used).
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
   **X** that starts the check-then-delete flow.
+- **New job → Exclusions**: rules for files to leave out of the main archive, each ticked on or off.
+  A *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a
+  folder, `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is
+  ignored. Each rule either **sets aside** its files, into a second verified archive
+  `<folder>.excluded.7z`, or **discards** them (junk such as shortcuts): they are archived nowhere,
+  but the manifest lists them with their hashes. If both kinds match, the file is set aside. An
+  unticked `*.lnk` discard rule is there to start from.
+- **Excluded**: every archived folder whose exclusions left files out, with what was set aside or
+  discarded, buttons to browse either archive, and **Delete the folder…**. Deleting checks every file
+  in the folder against the main archive, the set-aside archive or the discard list (same hash), and
+  the confirmation lists the discarded files that will be gone for good.
+  Tick files under *Files left out* and **Put them back in the archive**: the main archive is unpacked
+  into a work folder in `.atticarc`, written again with those files (set-aside ones from the set-aside
+  archive, discarded ones from the folder while it still has them), verified, and only then swapped in,
+  so it needs free space for the unpacked archive. **Put ticked back, discard the rest…** also moves
+  the remaining set-aside files to the discard list and deletes the set-aside archive, so you can keep
+  what you want and throw the rest away with the folder.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
-- **Catalogue**: search every file in every archive by name or folder, without unpacking; see its
-  original path, hashes and how many copies exist, and extract a single file.
+- **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
+  date, sortable), or search every file in every archive by name or folder, all without unpacking.
+  Select a file to see its original path, hashes and how many copies exist, and extract it.
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
-- **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first.
+- **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first,
+  one file at a time. The right pane shows the copy that is kept; the left pane shows the other copies,
+  one line each with a **Delete** tick box (**→** makes that copy the kept one; sizes and hashes are
+  behind the ⓘ). **◀ Previous** and
+  **Next ▶** (or the arrow keys) move between files; **Delete the others, next** (D) and **Keep all,
+  next** (K) decide a file and move on. Ticks stay, so one **Delete N copies…** removes them all
+  together, and the copy on the right is never deleted. Each archive losing a copy is unpacked into a
+  work folder, written again without it, verified and swapped in; its manifest lists the removed copies
+  as duplicates, so its folder still passes the check before a delete, and every removal is logged.
 - **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output
 
-The destination folder (default: `Attic ARC archives\<name>` beside the source, so `D:\Photos` archives to
-`D:\Attic ARC archives\Photos`) holds:
+The destination folder (default: `AtticARC archives\<name>` beside the source, so `D:\Photos` archives to
+`D:\AtticARC archives\Photos`) holds:
 
 - `<folder>.7z`: standard 7z, opens in 7-Zip. With store mode on, already-compressed files (zip,
-  jpg, mp4, whl, safetensors and similar) go in uncompressed blocks.
-- `<folder>.7z.manifest.json`: every file's path, size, times, BLAKE3 and SHA-256.
-- `catalog.db`: SQLite with `archives`, `entries` (full-text index `entries_fts`) and `runs`.
+  jpg, mp4, whl, safetensors and similar) go in uncompressed blocks. Each archive also holds
+  `.atticarc/manifest.json` (hidden): every file's path, size, times, BLAKE3 and SHA-256, so the
+  record travels with the archive. It sits in a small block of its own, so reading it is quick.
+- `.atticarc\catalog.db` (hidden folder): SQLite with `archives`, `entries` (full-text index
+  `entries_fts`) and `runs`. It can be rebuilt from the archives' manifests (**Rebuild from archives**
+  in the Catalogue, or `atticarc-cli rebuild`). A `catalog.db` left loose by earlier versions is
+  moved in automatically, and `.7z.manifest.json` files they left beside archives are still read.
 
-Settings are kept in `%APPDATA%\attic\settings.json`; settings saved by foldarc are picked up on
-first run.
+Settings are kept in `%APPDATA%\atticarc\settings.json`; settings saved by earlier versions (`attic`,
+`foldarc`) are picked up on first run.
 
 ## Command line
 
 ```
-attic scan <folder> [--top N]                  Possible duplicates by size, without reading files
-attic archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
-attic search <words> [--out DIR]               Search the catalogue
+atticarc-cli scan <folder> [--top N]                  Possible duplicates by size, without reading files
+atticarc-cli archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
+atticarc-cli search <words> [--out DIR]               Search the catalogue
+atticarc-cli rebuild [--out DIR]                      Add archives missing from the catalogue
+atticarc-cli soak --work DIR [--hours H] [--gb G] [--source FOLDER]   Robustness test (below)
+atticarc-cli watch [atticarc|PID] [--every S]         Log the window's memory until it exits
 ```
+
+### Robustness testing
+
+`soak` runs every engine path a long job uses, round after round: archive (with set-aside and
+discarded files), the full check before a delete (nothing is deleted), putting a file back and
+discarding the rest, removing a duplicate, then clearing and rebuilding the catalogue. It works on
+G GB of generated files (large, medium, thousands of small ones in deep folders, odd names), or with
+`--source` archives a real folder, which is only read. Everything is written inside `--work`, which
+must be empty or a soak's own and may not be a protected folder; each round's archives are removed
+before the next.
+
+Every `--every` seconds (default 10) it writes the process's resident and private memory, handles,
+threads, phase and free disk space to a CSV in the work folder, and after each round prints the
+same. It passes only if every round succeeds and, after two warm-up rounds, private memory, handles
+and threads stop climbing (private memory may not grow by more than 64 MB at more than 16 MB an
+hour). Exit code 0 means passed.
+
+`watch` samples the window the same way while you run a real job in it, so the GUI's own memory is
+measured too; it stops when the window closes and prints the trend.
 
 ## Build
 

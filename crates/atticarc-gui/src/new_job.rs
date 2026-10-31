@@ -3,8 +3,9 @@
 
 use eframe::egui::{self, Color32, RichText};
 
-use attic_core::archive;
-use attic_core::settings::Threads;
+use atticarc_core::archive;
+use atticarc_core::exclude::{Action, Exclusions, Kind, Rule};
+use atticarc_core::settings::Threads;
 
 use crate::jobs::{Dialog, RowState};
 use crate::{App, Screen, caption, card, heading, human, pill, primary_button, theme};
@@ -28,15 +29,18 @@ impl App {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let (count, bytes) = self.jobs.selection();
+                let rules_ok = Exclusions::new(&self.saved.exclusions).is_ok();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let start = primary_button(&format!("Start archiving · {count} folders · {}", human(bytes)));
-                    if ui.add_enabled(!busy && count > 0, start).clicked() {
+                    if ui.add_enabled(!busy && count > 0 && rules_ok, start).clicked() {
                         self.save();
                         self.jobs.archive_selected(self.settings());
                         self.screen = Screen::Progress;
                     }
                     if busy {
                         ui.label(RichText::new("A job is running; see Progress.").color(theme::muted()));
+                    } else if !rules_ok {
+                        ui.label(RichText::new("Fix the exclusion marked in red first.").color(theme::danger()));
                     }
                 });
             });
@@ -52,7 +56,7 @@ impl App {
                 ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
                 if ui.button("Change source…").clicked()
                     && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
-                        self.source_dir = attic_core::settings::strip_verbatim(&p);
+                        self.source_dir = atticarc_core::settings::strip_verbatim(&p);
                         changed = true;
                     }
             });
@@ -66,7 +70,7 @@ impl App {
                 if resp.lost_focus() {
                     changed = true;
                 }
-                ui.label(RichText::new("Archives, manifests and catalog.db are kept here.").color(theme::muted()));
+                ui.label(RichText::new("Archives are kept here, with the catalogue in a hidden .atticarc folder.").color(theme::muted()));
                 if archive::is_protected(&self.out_dir(), &self.settings()) {
                     ui.label(
                         RichText::new("This folder is protected, so archiving here will be refused. Choose another one.")
@@ -75,7 +79,7 @@ impl App {
                 }
                 if ui.button("Change destination…").clicked()
                     && let Some(p) = rfd::FileDialog::new().set_directory(nearest_existing(&self.out_dir())).pick_folder() {
-                        self.out_dir_text = attic_core::settings::strip_verbatim(&p).display().to_string();
+                        self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
                         changed = true;
                     }
             });
@@ -122,6 +126,7 @@ impl App {
                 });
             });
             ui.add_space(4.0);
+            exclusions(ui, &mut self.saved.exclusions);
             egui::CollapsingHeader::new("Protected folders (never deleted)").show(ui, |ui| {
                 let resp = ui.add(egui::TextEdit::multiline(&mut self.protected_text).desired_rows(3).desired_width(f32::INFINITY));
                 if resp.lost_focus() {
@@ -222,6 +227,70 @@ impl App {
             });
         });
     }
+}
+
+/// The list of exclusion rules: each can be switched on and off, edited or
+/// removed, and a rule that doesn't compile says why.
+fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
+    let on = rules.iter().filter(|r| r.enabled && !r.pattern.trim().is_empty()).count();
+    let title = if on == 0 { "Exclusions (none on)".to_string() } else { format!("Exclusions ({on} on)") };
+    egui::CollapsingHeader::new(title).id_salt("exclusions").default_open(true).show(ui, |ui| {
+        ui.label(
+            RichText::new(
+                "Files matching a ticked rule are left out of the main archive. Set aside keeps them in a second \
+                 archive, <folder>.excluded.7z; Discard keeps them nowhere, for junk like shortcuts. A wildcard \
+                 without / matches file names anywhere (*.lnk); * stays within a folder, ** crosses folders. A regex \
+                 matches anywhere in the path inside the folder. Case is ignored. See the Excluded page for what \
+                 was left out.",
+            )
+            .color(theme::muted()),
+        );
+        ui.add_space(4.0);
+        let mut remove = None;
+        for (i, rule) in rules.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut rule.enabled, "").on_hover_text("Use this rule");
+                // A fixed-width cell, so the patterns line up whichever kind is picked.
+                let h = ui.spacing().interact_size.y;
+                ui.allocate_ui_with_layout(egui::vec2(110.0, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_width(110.0);
+                    egui::ComboBox::from_id_salt(("exclusion-kind", i)).selected_text(rule.kind.label()).show_ui(ui, |ui| {
+                        for k in [Kind::Wildcard, Kind::Regex] {
+                            ui.selectable_value(&mut rule.kind, k, k.label());
+                        }
+                    });
+                });
+                egui::ComboBox::from_id_salt(("exclusion-action", i))
+                    .selected_text(rule.action.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut rule.action, Action::SetAside, "Set aside")
+                            .on_hover_text("Keep these files, in a second archive: <folder>.excluded.7z");
+                        ui.selectable_value(&mut rule.action, Action::Discard, "Discard")
+                            .on_hover_text("Keep these nowhere: they are listed, then deleted with the folder");
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut rule.pattern)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(if rule.kind == Kind::Regex { r"\.(tmp|bak)$" } else { "*.lnk" })
+                        .desired_width(320.0),
+                );
+                if ui.button("✕").on_hover_text("Remove this rule").clicked() {
+                    remove = Some(i);
+                }
+                if !rule.pattern.trim().is_empty()
+                    && let Err(e) = rule.compile()
+                {
+                    ui.label(RichText::new(e.to_string()).color(theme::danger())).on_hover_text(format!("{e:#}"));
+                }
+            });
+        }
+        if let Some(i) = remove {
+            rules.remove(i);
+        }
+        if ui.button("+ Add exclusion").clicked() {
+            rules.push(Rule::default());
+        }
+    });
 }
 
 /// `path`, or its closest parent that exists, so a folder picker can open

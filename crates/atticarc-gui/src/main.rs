@@ -1,23 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Attic ARC desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
+//! AtticARC desktop GUI, laid out like the "Archiver GUI mockups" canvas: a dark
 //! sidebar with New job, Progress, Catalogue and Duplicates.
 //!
-//! The archive, verify and delete logic is foldarc's, now in attic-core.
+//! The archive, verify and delete logic is foldarc's, now in atticarc-core.
 
+mod browse;
 mod catalogue;
 mod duplicates;
+mod excluded;
 mod jobs;
 mod new_job;
 mod progress;
 mod theme;
+
+/// mimalloc hands freed memory back to the system, so memory stays flat
+/// over hours of archiving; the system allocator kept growing in the soak
+/// test as many threads freed and reused large buffers.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 
-use attic_core::settings;
+use atticarc_core::settings;
 
 use jobs::Jobs;
 
@@ -25,13 +33,13 @@ fn main() -> eframe::Result {
     let source_dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Attic ARC")
+            .with_title("AtticARC")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Attic ARC",
+        "AtticARC",
         options,
         Box::new(move |cc| {
             let app = App::new(source_dir);
@@ -47,10 +55,11 @@ pub enum Screen {
     Progress,
     Catalogue,
     Duplicates,
+    Excluded,
 }
 
 impl Screen {
-    const ALL: [Screen; 4] = [Screen::NewJob, Screen::Progress, Screen::Catalogue, Screen::Duplicates];
+    const ALL: [Screen; 5] = [Screen::NewJob, Screen::Progress, Screen::Catalogue, Screen::Duplicates, Screen::Excluded];
 
     fn label(self) -> &'static str {
         match self {
@@ -58,6 +67,7 @@ impl Screen {
             Screen::Progress => "Progress",
             Screen::Catalogue => "Catalogue",
             Screen::Duplicates => "Duplicates",
+            Screen::Excluded => "Excluded",
         }
     }
 }
@@ -71,6 +81,7 @@ pub struct App {
     jobs: Jobs,
     catalogue: catalogue::State,
     duplicates: duplicates::State,
+    excluded: excluded::State,
 }
 
 impl App {
@@ -92,6 +103,7 @@ impl App {
             jobs: Jobs::new(),
             catalogue: catalogue::State::default(),
             duplicates: duplicates::State::default(),
+            excluded: excluded::State::default(),
         };
         app.reload();
         app
@@ -101,7 +113,7 @@ impl App {
         PathBuf::from(self.out_dir_text.trim())
     }
 
-    fn settings(&self) -> attic_core::archive::Settings {
+    fn settings(&self) -> atticarc_core::archive::Settings {
         let mut s = self.saved.settings_for(&self.source_dir);
         s.out_dir = self.out_dir();
         s
@@ -121,11 +133,12 @@ impl App {
         self.jobs.reload(&self.source_dir, &out);
         self.catalogue.invalidate();
         self.duplicates.invalidate();
+        self.excluded.invalidate();
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Attic ARC").size(18.0).strong().color(theme::sidebar_text()));
+        ui.label(RichText::new("AtticARC").size(18.0).strong().color(theme::sidebar_text()));
         ui.add_space(16.0);
         for s in Screen::ALL {
             let on = self.screen == s;
@@ -166,9 +179,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let out = self.out_dir();
         let finished_batch = self.jobs.handle_messages(&out);
-        if finished_batch {
+        if finished_batch || std::mem::take(&mut self.jobs.deleted) {
             self.catalogue.invalidate();
             self.duplicates.invalidate();
+            self.excluded.invalidate();
         }
         egui::Panel::left("nav")
             .resizable(false)
@@ -182,11 +196,12 @@ impl eframe::App for App {
                 Screen::Progress => self.progress(ui),
                 Screen::Catalogue => self.catalogue(ui),
                 Screen::Duplicates => self.duplicates(ui),
+                Screen::Excluded => self.excluded(ui),
             });
         let ctx = ui.ctx().clone();
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
-        if self.jobs.needs_repaint() || self.catalogue.busy() {
+        if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() || self.duplicates.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
