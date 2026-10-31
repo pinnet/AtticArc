@@ -119,7 +119,28 @@ atticarc-cli scan <folder> [--top N]                  Possible duplicates by siz
 atticarc-cli archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
 atticarc-cli search <words> [--out DIR]               Search the catalogue
 atticarc-cli rebuild [--out DIR]                      Add archives missing from the catalogue
+atticarc-cli soak --work DIR [--hours H] [--gb G] [--source FOLDER]   Robustness test (below)
+atticarc-cli watch [atticarc|PID] [--every S]         Log the window's memory until it exits
 ```
+
+### Robustness testing
+
+`soak` runs every engine path a long job uses, round after round: archive (with set-aside and
+discarded files), the full check before a delete (nothing is deleted), putting a file back and
+discarding the rest, removing a duplicate, then clearing and rebuilding the catalogue. It works on
+G GB of generated files (large, medium, thousands of small ones in deep folders, odd names), or with
+`--source` archives a real folder, which is only read. Everything is written inside `--work`, which
+must be empty or a soak's own and may not be a protected folder; each round's archives are removed
+before the next.
+
+Every `--every` seconds (default 10) it writes the process's resident and private memory, handles,
+threads, phase and free disk space to a CSV in the work folder, and after each round prints the
+same. It passes only if every round succeeds and, after two warm-up rounds, private memory, handles
+and threads stop climbing (private memory may not grow by more than 64 MB at more than 16 MB an
+hour). Exit code 0 means passed.
+
+`watch` samples the window the same way while you run a real job in it, so the GUI's own memory is
+measured too; it stops when the window closes and prints the trend.
 
 ## Build
 

@@ -14,6 +14,12 @@ mod new_job;
 mod progress;
 mod theme;
 
+/// mimalloc hands freed memory back to the system, so memory stays flat
+/// over hours of archiving; the system allocator kept growing in the soak
+/// test as many threads freed and reused large buffers.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::time::Duration;
 

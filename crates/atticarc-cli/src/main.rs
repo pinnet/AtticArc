@@ -1,3 +1,12 @@
+mod mem;
+mod soak;
+
+/// mimalloc hands freed memory back to the system, so memory stays flat
+/// over hours of archiving; the system allocator kept growing in the soak
+/// test as many threads freed and reused large buffers.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -18,6 +27,14 @@ Usage:
   atticarc-cli search <words> [--out DIR] Search the catalogue in the output folder.
   atticarc-cli rebuild [--out DIR]       Add the archives in the output folder that the
                                   catalogue is missing, from their manifests.
+  atticarc-cli soak --work DIR           Robustness test: archive, check, put back, de-duplicate
+        [--hours H | --minutes M]  and rebuild in a loop (default 60 minutes), logging
+        [--rounds N] [--gb G]      memory, handles and threads to a CSV in DIR. Uses G GB
+        [--source FOLDER]          of generated files (default 1), or archives FOLDER
+        [--every S]                (only read) each round. DIR must be empty or a soak's.
+                                  Fails if a round fails or memory keeps climbing.
+  atticarc-cli watch [atticarc|PID]      Log the window's memory, handles and threads every
+        [--every S] [--csv FILE]   S seconds (default 10) until it exits.
   atticarc-cli help                      Show this message.
 
 Exit code 0 means every folder was archived and verified.";
@@ -54,6 +71,14 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("soak") => match soak::parse_soak(&args[1..]) {
+            Ok(a) => soak::run_soak(a),
+            Err(msg) => {
+                eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("watch") => soak::run_watch(&args[1..]),
         Some("help" | "-h" | "--help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS

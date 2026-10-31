@@ -10,4 +10,19 @@ name = "atticarc-cli"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.104"
 atticarc-core = { path = "../atticarc-core" }
+chrono = "0.4.45"
+mimalloc = "0.1.52"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
