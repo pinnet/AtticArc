@@ -1,7 +1,8 @@
 //! Duplicates: files with the same size and BLAKE3 hash across all archives.
-//! A split pane: the duplicated files on the left, the copies of the one
-//! picked on the right, each with a tick box to delete it. Ticks stay while
-//! moving between files, so copies of many files are deleted together.
+//! One file at a time, in a split pane: one copy on the right, which is
+//! kept, and the other copies on the left, each with a tick box to delete
+//! it. Previous and Next (or the arrow keys) move between files, and ticks
+//! stay, so copies of many files are deleted together.
 //! Deleting removes a copy from its archive, which is rewritten, verified
 //! and swapped in; one copy of every file always stays.
 
@@ -23,8 +24,10 @@ pub struct State {
     loaded: bool,
     groups: Vec<DuplicateGroup>,
     error: Option<String>,
-    /// The group shown on the right, by hash.
-    selected: Option<String>,
+    /// The file shown, as an index into `groups`.
+    index: usize,
+    /// For each file, by hash, the copy shown on the right, which is kept.
+    kept: BTreeMap<String, i64>,
     /// Copies ticked for deleting, by catalogue entry id.
     ticked: BTreeSet<i64>,
     confirm: bool,
@@ -113,9 +116,7 @@ impl App {
             }
             let ids: BTreeSet<i64> = st.groups.iter().flat_map(|g| &g.copies).map(|c| c.entry_id).collect();
             st.ticked.retain(|id| ids.contains(id));
-            if !st.selected.as_ref().is_some_and(|h| st.groups.iter().any(|g| &g.blake3 == h)) {
-                st.selected = st.groups.first().map(|g| g.blake3.clone());
-            }
+            st.index = st.index.min(st.groups.len().saturating_sub(1));
         }
         let reclaimable: u64 = st.groups.iter().map(|g| g.reclaimable()).sum();
         let ticked = st.ticked_copies();
@@ -176,16 +177,18 @@ impl App {
             return;
         }
 
+        let locked = running.is_some();
+        nav_bar(ui, st, locked);
+        ui.add_space(8.0);
         let w = ui.available_width();
         let h = ui.available_height();
         let gap = ui.spacing().item_spacing.x;
-        let locked = running.is_some();
         ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(w * 0.4 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                card(ui, |ui| file_list(ui, st))
+            ui.allocate_ui_with_layout(egui::vec2(w * 0.55 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                card(ui, |ui| others_view(ui, st, locked))
             });
-            ui.allocate_ui_with_layout(egui::vec2(w * 0.6, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                card(ui, |ui| copies_view(ui, st, locked))
+            ui.allocate_ui_with_layout(egui::vec2(w * 0.45, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                card(ui, |ui| kept_view(ui, st))
             });
         });
 
@@ -199,88 +202,116 @@ impl App {
     }
 }
 
-/// The left pane: one row per duplicated file.
-fn file_list(ui: &mut egui::Ui, st: &mut State) {
-    ui.label(RichText::new("Duplicated files").strong());
-    ui.add_space(4.0);
-    let row_h = 58.0;
-    egui::ScrollArea::vertical().id_salt("dup-files").auto_shrink([false, false]).show_rows(ui, row_h, st.groups.len(), |ui, range| {
-        for g in &st.groups[range] {
-            let on = st.selected.as_deref() == Some(g.blake3.as_str());
-            let marked = g.copies.iter().filter(|c| st.ticked.contains(&c.entry_id)).count();
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h - 4.0), egui::Sense::click());
-            let fill = if on { theme::accent().gamma_multiply(0.35) } else if resp.hovered() { theme::neutral_soft() } else { egui::Color32::TRANSPARENT };
-            ui.painter().rect_filled(rect, 6.0, fill);
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 4.0))));
-            child.horizontal(|ui| {
-                ui.label(RichText::new(file_name(g)).monospace().strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if marked > 0 {
-                        pill(ui, &format!("{marked} to delete"), theme::danger(), theme::neutral_soft());
-                    }
-                });
-            });
-            child.label(RichText::new(format!("{} · {}", human(g.size), copies(g.copies.len()))).size(12.5).color(theme::muted()));
-            if resp.clicked() {
-                st.selected = Some(g.blake3.clone());
-            }
-            ui.add_space(4.0);
-        }
-    });
+/// The file shown, the copy on the right, and the other copies.
+fn current(st: &State) -> Option<(&DuplicateGroup, &FoundFile, Vec<&FoundFile>)> {
+    let g = st.groups.get(st.index)?;
+    let kept_id = st.kept.get(&g.blake3).copied();
+    let kept = g
+        .copies
+        .iter()
+        .find(|c| Some(c.entry_id) == kept_id)
+        .or_else(|| g.copies.iter().find(|c| !in_aside(c)))
+        .unwrap_or(&g.copies[0]);
+    let others = g.copies.iter().filter(|c| c.entry_id != kept.entry_id).collect();
+    Some((g, kept, others))
 }
 
-/// The right pane: every copy of the file picked, each with a tick box.
-fn copies_view(ui: &mut egui::Ui, st: &mut State, locked: bool) {
-    let Some(g) = st.groups.iter().find(|g| Some(&g.blake3) == st.selected.as_ref()) else {
-        ui.label("Pick a file on the left to see its copies.");
-        return;
-    };
-    ui.label(RichText::new(file_name(g)).monospace().strong().size(16.0));
-    let short = format!("{}…{}", &g.blake3[..8], &g.blake3[g.blake3.len() - 8..]);
-    ui.label(RichText::new(format!("{} · {} · BLAKE3 {short}", human(g.size), copies(g.copies.len()))).color(theme::muted()));
-    ui.add_space(8.0);
-    let kept = g.copies.iter().filter(|c| !st.ticked.contains(&c.entry_id)).count();
+/// Above the panes: which file this is, moving between files, and the
+/// quick choices that move on to the next one.
+fn nav_bar(ui: &mut egui::Ui, st: &mut State, locked: bool) {
+    let n = st.groups.len();
+    let Some((g, _, others)) = current(st) else { return };
+    let other_ids: Vec<i64> = others.iter().filter(|c| !in_aside(c)).map(|c| c.entry_id).collect();
+    let (name, size, count) = (file_name(g).to_string(), g.size, g.copies.len());
+    let (prev, mut next) = (st.index > 0, st.index + 1 < n);
+    let mut delete_others = false;
+    let mut keep_all = false;
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(prev, egui::Button::new("◀ Previous")).on_hover_text("Left arrow").clicked() {
+                st.index -= 1;
+            }
+            ui.vertical(|ui| {
+                ui.label(RichText::new(format!("File {} of {n}", st.index + 1)).size(12.5).color(theme::muted()));
+                ui.label(RichText::new(&name).monospace().strong().size(16.0));
+            });
+            ui.label(RichText::new(format!("{} · {}", human(size), copies(count))).color(theme::muted()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(next, egui::Button::new("Next ▶")).on_hover_text("Right arrow").clicked() {
+                    st.index += 1;
+                    next = false;
+                }
+                let keep = egui::Button::new("Keep all, next");
+                if ui.add_enabled(!locked, keep).on_hover_text("Unticks the other copies of this file and moves on (K)").clicked() {
+                    keep_all = true;
+                }
+                let del = egui::Button::new(RichText::new("Delete the others, next").color(theme::danger()));
+                if ui
+                    .add_enabled(!locked && !other_ids.is_empty(), del)
+                    .on_hover_text("Ticks every copy on the left and moves on (D). Nothing is deleted until you press Delete above.")
+                    .clicked()
+                {
+                    delete_others = true;
+                }
+            });
+        });
+    });
+    // Keys, unless a text box has them.
+    if !locked && !ui.ctx().egui_wants_keyboard_input() {
+        ui.input(|i| {
+            if i.key_pressed(egui::Key::ArrowLeft) && prev {
+                st.index -= 1;
+            } else if i.key_pressed(egui::Key::ArrowRight) && next {
+                st.index += 1;
+            } else if i.key_pressed(egui::Key::D) && !other_ids.is_empty() {
+                delete_others = true;
+            } else if i.key_pressed(egui::Key::K) {
+                keep_all = true;
+            }
+        });
+    }
+    if delete_others || keep_all {
+        for id in &other_ids {
+            if delete_others {
+                st.ticked.insert(*id);
+            } else {
+                st.ticked.remove(id);
+            }
+        }
+        if next {
+            st.index += 1;
+        }
+    }
+}
+
+/// The left pane: the other copies of the file, each with a tick box.
+fn others_view(ui: &mut egui::Ui, st: &mut State, locked: bool) {
+    let Some((g, _, others)) = current(st) else { return };
+    ui.label(RichText::new("Other copies").strong());
+    ui.label(RichText::new("Tick the ones to delete. Unticked copies are kept.").size(12.5).color(theme::muted()));
+    ui.add_space(6.0);
+    let hash = g.blake3.clone();
     let mut toggle = None;
-    let mut keep_only = None;
-    egui::ScrollArea::vertical().id_salt("dup-copies").auto_shrink([false, false]).show(ui, |ui| {
-        for (i, c) in g.copies.iter().enumerate() {
+    let mut swap = None;
+    egui::ScrollArea::vertical().id_salt("dup-others").auto_shrink([false, false]).show(ui, |ui| {
+        for (i, c) in others.iter().enumerate() {
             let marked = st.ticked.contains(&c.entry_id);
             let fill = if i % 2 == 1 { theme::neutral_soft().gamma_multiply(0.6) } else { egui::Color32::TRANSPARENT };
             egui::Frame::NONE.fill(fill).corner_radius(egui::CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    // The last copy kept can't be ticked.
-                    let can = !locked && !in_aside(c) && (marked || kept > 1);
                     let mut on = marked;
-                    let resp = ui.add_enabled(can, egui::Checkbox::new(&mut on, "Delete"));
-                    let resp = if in_aside(c) {
-                        resp.on_disabled_hover_text("This copy is in a set-aside archive; manage it on the Excluded page")
-                    } else if !marked && kept <= 1 {
-                        resp.on_disabled_hover_text("One copy must stay")
-                    } else {
-                        resp
-                    };
+                    let resp = ui.add_enabled(!locked && !in_aside(c), egui::Checkbox::new(&mut on, "Delete"));
+                    let resp = resp.on_disabled_hover_text("This copy is in a set-aside archive; manage it on the Excluded page");
                     if resp.changed() {
                         toggle = Some(c.entry_id);
                     }
                     ui.add_space(6.0);
-                    let info_w = (ui.available_width() - 130.0).max(120.0);
-                    ui.allocate_ui_with_layout(egui::vec2(info_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{}.7z", c.archive_name)).strong());
-                            if marked {
-                                pill(ui, "Delete", theme::danger(), theme::neutral_soft());
-                            } else {
-                                pill(ui, "Keep", theme::ok(), theme::ok_soft());
-                            }
-                        });
-                        ui.add(egui::Label::new(RichText::new(&c.rel_path).monospace().size(13.0)).wrap());
-                        let when = c.modified_utc.as_deref().map(|m| m.replace('T', " ").replace('Z', " UTC")).unwrap_or_default();
-                        ui.add(egui::Label::new(RichText::new(format!("from {}   ·   {when}", c.source_path)).size(12.0).color(theme::muted())).wrap());
-                    });
+                    let info_w = (ui.available_width() - 120.0).max(120.0);
+                    ui.allocate_ui_with_layout(egui::vec2(info_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| copy_info(ui, c, marked));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!locked && !in_aside(c), egui::Button::new("Keep only this")).on_hover_text("Ticks every other copy").clicked() {
-                            keep_only = Some(c.entry_id);
+                        if ui.add_enabled(!locked, egui::Button::new("Show on right")).on_hover_text("Makes this the copy on the right, and keeps it").clicked() {
+                            swap = Some(c.entry_id);
                         }
                     });
                 });
@@ -293,15 +324,48 @@ fn copies_view(ui: &mut egui::Ui, st: &mut State, locked: bool) {
     {
         st.ticked.insert(id);
     }
-    if let Some(keep) = keep_only {
-        for c in &g.copies {
-            if c.entry_id == keep {
-                st.ticked.remove(&c.entry_id);
-            } else if !in_aside(c) {
-                st.ticked.insert(c.entry_id);
-            }
-        }
+    if let Some(id) = swap {
+        // The copy on the right is never deleted.
+        st.ticked.remove(&id);
+        st.kept.insert(hash, id);
     }
+}
+
+/// The right pane: the copy that stays.
+fn kept_view(ui: &mut egui::Ui, st: &State) {
+    let Some((g, kept, _)) = current(st) else { return };
+    ui.label(RichText::new("This copy").strong());
+    ui.label(RichText::new("Always kept, so one copy of every file stays.").size(12.5).color(theme::muted()));
+    ui.add_space(6.0);
+    copy_info(ui, kept, false);
+    ui.add_space(10.0);
+    egui::Grid::new("dup-kept").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+            ui.label(RichText::new(k).color(theme::muted()));
+            ui.add(egui::Label::new(RichText::new(v).monospace().size(13.0)).wrap());
+            ui.end_row();
+        };
+        row(ui, "Size", human(g.size));
+        row(ui, "BLAKE3", g.blake3.clone());
+        if let Some(sha) = &kept.sha256 {
+            row(ui, "SHA-256", sha.clone());
+        }
+    });
+}
+
+/// A copy's archive, path inside it, folder and date.
+fn copy_info(ui: &mut egui::Ui, c: &FoundFile, marked: bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}.7z", c.archive_name)).strong());
+        if marked {
+            pill(ui, "Delete", theme::danger(), theme::neutral_soft());
+        } else {
+            pill(ui, "Keep", theme::ok(), theme::ok_soft());
+        }
+    });
+    ui.add(egui::Label::new(RichText::new(&c.rel_path).monospace().size(13.0)).wrap());
+    let when = c.modified_utc.as_deref().map(|m| m.replace('T', " ").replace('Z', " UTC")).unwrap_or_default();
+    ui.add(egui::Label::new(RichText::new(format!("from {}   ·   {when}", c.source_path)).size(12.0).color(theme::muted())).wrap());
 }
 
 fn confirm_delete(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: &archive::Settings) {

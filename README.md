@@ -85,12 +85,13 @@ Starts on the given source folder (or the last one used).
   Select a file to see its original path, hashes and how many copies exist, and extract it.
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
 - **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first,
-  in a split pane: the duplicated files on the left, the copies of the one picked on the right. Tick
-  **Delete** on the copies to remove (or **Keep only this** on the one to keep); ticks stay while you
-  move between files, so one **Delete N copies…** removes them all together. One copy of every file
-  always stays. Each archive losing a copy is unpacked into a work folder, written again without it,
-  verified and swapped in; its manifest lists the removed copies as duplicates, so its folder still
-  passes the check before a delete, and every removal is logged.
+  one file at a time. The right pane shows the copy that is kept; the left pane shows the other copies,
+  each with a **Delete** tick box (**Show on right** swaps which copy is kept). **◀ Previous** and
+  **Next ▶** (or the arrow keys) move between files; **Delete the others, next** (D) and **Keep all,
+  next** (K) decide a file and move on. Ticks stay, so one **Delete N copies…** removes them all
+  together, and the copy on the right is never deleted. Each archive losing a copy is unpacked into a
+  work folder, written again without it, verified and swapped in; its manifest lists the removed copies
+  as duplicates, so its folder still passes the check before a delete, and every removal is logged.
 - **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output
