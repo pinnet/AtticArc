@@ -86,7 +86,8 @@ Starts on the given source folder (or the last one used).
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
 - **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first,
   one file at a time. The right pane shows the copy that is kept; the left pane shows the other copies,
-  each with a **Delete** tick box (**Show on right** swaps which copy is kept). **◀ Previous** and
+  one line each with a **Delete** tick box (**→** makes that copy the kept one; sizes and hashes are
+  behind the ⓘ). **◀ Previous** and
   **Next ▶** (or the arrow keys) move between files; **Delete the others, next** (D) and **Keep all,
   next** (K) decide a file and move on. Ticks stay, so one **Delete N copies…** removes them all
   together, and the copy on the right is never deleted. Each archive losing a copy is unpacked into a

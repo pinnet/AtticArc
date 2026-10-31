@@ -15,7 +15,7 @@ use eframe::egui::{self, RichText};
 use atticarc_core::archive;
 use atticarc_core::catalog::{self, Catalog, DuplicateGroup, FoundFile};
 
-use crate::{App, card, heading, human, pill, theme};
+use crate::{App, card, heading, human, theme};
 
 const MAX_GROUPS: usize = 300;
 
@@ -231,10 +231,8 @@ fn nav_bar(ui: &mut egui::Ui, st: &mut State, locked: bool) {
             if ui.add_enabled(prev, egui::Button::new("◀ Previous")).on_hover_text("Left arrow").clicked() {
                 st.index -= 1;
             }
-            ui.vertical(|ui| {
-                ui.label(RichText::new(format!("File {} of {n}", st.index + 1)).size(12.5).color(theme::muted()));
-                ui.label(RichText::new(&name).monospace().strong().size(16.0));
-            });
+            ui.label(RichText::new(format!("{} of {n}", st.index + 1)).size(12.5).color(theme::muted()));
+            ui.label(RichText::new(&name).monospace().strong().size(15.0));
             ui.label(RichText::new(format!("{} · {}", human(size), copies(count))).color(theme::muted()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(next, egui::Button::new("Next ▶")).on_hover_text("Right arrow").clicked() {
@@ -284,39 +282,41 @@ fn nav_bar(ui: &mut egui::Ui, st: &mut State, locked: bool) {
     }
 }
 
-/// The left pane: the other copies of the file, each with a tick box.
+const LINE_H: f32 = 30.0;
+
+/// The left pane: the other copies of the file, one line each, with a tick
+/// box to delete and an arrow to make it the kept copy.
 fn others_view(ui: &mut egui::Ui, st: &mut State, locked: bool) {
     let Some((g, _, others)) = current(st) else { return };
-    ui.label(RichText::new("Other copies").strong());
-    ui.label(RichText::new("Tick the ones to delete. Unticked copies are kept.").size(12.5).color(theme::muted()));
-    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Other copies").strong());
+        ui.label(RichText::new("· tick to delete").size(12.5).color(theme::muted()));
+    });
+    ui.add_space(2.0);
     let hash = g.blake3.clone();
     let mut toggle = None;
     let mut swap = None;
     egui::ScrollArea::vertical().id_salt("dup-others").auto_shrink([false, false]).show(ui, |ui| {
         for (i, c) in others.iter().enumerate() {
             let marked = st.ticked.contains(&c.entry_id);
-            let fill = if i % 2 == 1 { theme::neutral_soft().gamma_multiply(0.6) } else { egui::Color32::TRANSPARENT };
-            egui::Frame::NONE.fill(fill).corner_radius(egui::CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let mut on = marked;
-                    let resp = ui.add_enabled(!locked && !in_aside(c), egui::Checkbox::new(&mut on, "Delete"));
-                    let resp = resp.on_disabled_hover_text("This copy is in a set-aside archive; manage it on the Excluded page");
-                    if resp.changed() {
-                        toggle = Some(c.entry_id);
+            line(ui, i, |ui| {
+                let mut on = marked;
+                let resp = ui.add_enabled(!locked && !in_aside(c), egui::Checkbox::without_text(&mut on));
+                let resp = if in_aside(c) {
+                    resp.on_disabled_hover_text("This copy is in a set-aside archive; manage it on the Excluded page")
+                } else {
+                    resp.on_hover_text("Delete this copy")
+                };
+                if resp.changed() {
+                    toggle = Some(c.entry_id);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!locked, egui::Button::new("→").small()).on_hover_text("Keep this copy instead").clicked() {
+                        swap = Some(c.entry_id);
                     }
-                    ui.add_space(6.0);
-                    let info_w = (ui.available_width() - 120.0).max(120.0);
-                    ui.allocate_ui_with_layout(egui::vec2(info_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| copy_info(ui, c, marked));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!locked, egui::Button::new("Show on right")).on_hover_text("Makes this the copy on the right, and keeps it").clicked() {
-                            swap = Some(c.entry_id);
-                        }
-                    });
+                    copy_line(ui, c, marked);
                 });
             });
-            ui.add_space(4.0);
         }
     });
     if let Some(id) = toggle
@@ -331,41 +331,54 @@ fn others_view(ui: &mut egui::Ui, st: &mut State, locked: bool) {
     }
 }
 
-/// The right pane: the copy that stays.
+/// The right pane: the copy that stays, on one line, with the details
+/// behind an ⓘ.
 fn kept_view(ui: &mut egui::Ui, st: &State) {
     let Some((g, kept, _)) = current(st) else { return };
-    ui.label(RichText::new("This copy").strong());
-    ui.label(RichText::new("Always kept, so one copy of every file stays.").size(12.5).color(theme::muted()));
-    ui.add_space(6.0);
-    copy_info(ui, kept, false);
-    ui.add_space(10.0);
-    egui::Grid::new("dup-kept").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
-        let row = |ui: &mut egui::Ui, k: &str, v: String| {
-            ui.label(RichText::new(k).color(theme::muted()));
-            ui.add(egui::Label::new(RichText::new(v).monospace().size(13.0)).wrap());
-            ui.end_row();
-        };
-        row(ui, "Size", human(g.size));
-        row(ui, "BLAKE3", g.blake3.clone());
-        if let Some(sha) = &kept.sha256 {
-            row(ui, "SHA-256", sha.clone());
-        }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Kept copy").strong());
+        ui.label(RichText::new("· never deleted").size(12.5).color(theme::muted()));
+    });
+    ui.add_space(2.0);
+    line(ui, 0, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut tip = format!("{}\nSize: {}\nBLAKE3: {}", kept.source_path, human(g.size), g.blake3);
+            if let Some(sha) = &kept.sha256 {
+                tip.push_str(&format!("\nSHA-256: {sha}"));
+            }
+            if let Some(m) = &kept.modified_utc {
+                tip.push_str(&format!("\nModified: {}", m.replace('T', " ").replace('Z', " UTC")));
+            }
+            ui.label(RichText::new("ⓘ").color(theme::muted())).on_hover_text(tip);
+            copy_line(ui, kept, false);
+        });
     });
 }
 
-/// A copy's archive, path inside it, folder and date.
-fn copy_info(ui: &mut egui::Ui, c: &FoundFile, marked: bool) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{}.7z", c.archive_name)).strong());
-        if marked {
-            pill(ui, "Delete", theme::danger(), theme::neutral_soft());
-        } else {
-            pill(ui, "Keep", theme::ok(), theme::ok_soft());
-        }
+/// One striped row of fixed height.
+fn line(ui: &mut egui::Ui, i: usize, add: impl FnOnce(&mut egui::Ui)) {
+    let fill = if i % 2 == 1 { theme::neutral_soft().gamma_multiply(0.6) } else { egui::Color32::TRANSPARENT };
+    egui::Frame::NONE.fill(fill).corner_radius(egui::CornerRadius::same(4)).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), LINE_H), egui::Layout::left_to_right(egui::Align::Center), add);
     });
-    ui.add(egui::Label::new(RichText::new(&c.rel_path).monospace().size(13.0)).wrap());
-    let when = c.modified_utc.as_deref().map(|m| m.replace('T', " ").replace('Z', " UTC")).unwrap_or_default();
-    ui.add(egui::Label::new(RichText::new(format!("from {}   ·   {when}", c.source_path)).size(12.0).color(theme::muted())).wrap());
+}
+
+/// A copy on one line, laid out right to left: date, then archive and path
+/// truncated to fit, with the folder and date in the hover.
+fn copy_line(ui: &mut egui::Ui, c: &FoundFile, marked: bool) {
+    let date = c.modified_utc.as_deref().map(|m| m.get(..10).unwrap_or(m).to_string()).unwrap_or_default();
+    ui.label(RichText::new(date).size(12.5).color(theme::muted()));
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        let colour = if marked { theme::danger() } else { theme::ink() };
+        let mut text = RichText::new(format!("{}.7z", c.archive_name)).strong().color(colour);
+        if marked {
+            text = text.strikethrough();
+        }
+        ui.label(text);
+        ui.add(egui::Label::new(RichText::new(format!("› {}", c.rel_path)).monospace().size(13.0).color(theme::muted())).truncate())
+            .on_hover_text(format!("{}\nfrom {}", c.rel_path, c.source_path));
+    });
 }
 
 fn confirm_delete(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: &archive::Settings) {
