@@ -58,6 +58,56 @@ pub struct Excluded {
     /// identical copy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duplicates: Vec<EntryRecord>,
+    /// Duplicates replaced by a reference file pointing to their original.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<Replaced>,
+}
+
+/// The extension of the small reference file that stands in for a
+/// duplicate: `IMG_1.jpg` becomes `IMG_1.jpg.atticarcdep`. Not a Windows
+/// shortcut, so it isn't mistaken for one.
+pub const DEP_EXT: &str = "atticarcdep";
+
+/// Where the reference file for the file at `rel` goes.
+pub fn dep_path(rel: &str) -> String {
+    format!("{rel}.{DEP_EXT}")
+}
+
+/// A duplicate replaced by a reference file: the file as it was archived
+/// here, and where the original is kept.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Replaced {
+    /// The file as it was archived here.
+    pub entry: EntryRecord,
+    /// Path inside this archive of the reference file standing in for it.
+    pub dep_path: String,
+    /// File name of the archive that holds the original, in the same folder.
+    pub original_archive: String,
+    /// Path of the original inside that archive.
+    pub original_path: String,
+    pub replaced_utc: String,
+}
+
+/// What a `.atticarcdep` file holds: plain JSON, so it can be read in any
+/// text editor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DepFile {
+    /// Format version.
+    pub atticarc_dep: u32,
+    pub note: String,
+    #[serde(flatten)]
+    pub replaced: Replaced,
+}
+
+impl DepFile {
+    pub fn new(replaced: Replaced) -> Self {
+        let note = format!(
+            "AtticARC replaced this file with a reference because an identical copy (same size and BLAKE3 hash) \
+             is kept in {} at {}. AtticARC can extract the original or put the file back.",
+            replaced.original_archive, replaced.original_path
+        );
+        DepFile { atticarc_dep: 1, note, replaced }
+    }
 }
 
 /// Files at least this big go in a block of their own; smaller files are
@@ -622,7 +672,12 @@ fn write_archive(
             w.push_archive_entries_send(entries, readers)?;
         }
     }
-    let records = file_records(scan, &hashes.lock().unwrap(), &is_store)?;
+    let mut records = file_records(scan, &hashes.lock().unwrap(), &is_store)?;
+    for r in &mut records {
+        if excluded.deps.iter().any(|d| d.dep_path == r.rel_path) {
+            r.method = "dep".into();
+        }
+    }
     let manifest = serde_json::to_vec_pretty(&Manifest {
         archive: record.clone(),
         entries: records.clone(),
@@ -769,7 +824,12 @@ fn summarize(problems: &[String]) -> String {
 /// name, and returns the path written. Refuses to overwrite an existing file.
 pub fn extract_file(archive: &Path, rel_path: &str, dest_dir: &Path, threads: u32) -> Result<PathBuf> {
     let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    let dest = dest_dir.join(name);
+    extract_file_as(archive, rel_path, &dest_dir.join(name), threads)
+}
+
+/// Extracts the file `rel_path` in `archive` to `dest`, refusing to overwrite.
+fn extract_file_as(archive: &Path, rel_path: &str, dest: &Path, threads: u32) -> Result<PathBuf> {
+    let dest = dest.to_path_buf();
     if dest.exists() {
         bail!("{} already exists", dest.display());
     }
@@ -798,6 +858,47 @@ pub fn extract_file(archive: &Path, rel_path: &str, dest_dir: &Path, threads: u3
     Ok(dest)
 }
 
+/// Extracts several files from `archive` in one pass, each (path inside the
+/// archive, where to write it). Every file must be found.
+fn extract_many(archive: &Path, files: &[(String, PathBuf)], threads: u32) -> Result<()> {
+    let mut want: HashMap<&str, Vec<&Path>> = HashMap::new();
+    for (rel, to) in files {
+        want.entry(rel.as_str()).or_default().push(to.as_path());
+    }
+    let mut found = 0;
+    let mut reader = ArchiveReader::open(archive, Password::empty())
+        .with_context(|| format!("can't open {}", archive.display()))?
+        .with_threads(threads.max(1));
+    reader
+        .for_each_entries(|entry, data| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+            if let Some(dests) = want.get(entry.name()) {
+                let mut bytes = Vec::new();
+                data.read_to_end(&mut bytes)?;
+                for to in dests {
+                    if let Some(parent) = to.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(to, &bytes)?;
+                }
+                found += 1;
+            }
+            Ok(found < want.len())
+        })
+        .map_err(|e| anyhow!("can't unpack from {}: {e}", archive.display()))?;
+    if found < want.len() {
+        let missing: Vec<&str> = want.keys().copied().collect();
+        bail!("{} doesn't hold all of: {}", archive.display(), missing.join(", "));
+    }
+    Ok(())
+}
+
+fn parse_utc(t: Option<&str>) -> Option<SystemTime> {
+    t.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(SystemTime::from)
+}
+
 /// What putting excluded files back into an archive did.
 #[derive(Debug, Default)]
 pub struct Restored {
@@ -824,7 +925,7 @@ pub fn restore_excluded(
     settings: &Settings,
     progress: &Arc<Progress>,
 ) -> Result<Restored> {
-    rewrite(archive, keep, discard_rest, &[], settings, progress)
+    rewrite(archive, &Changes { keep, discard_rest, ..Changes::default() }, settings, progress)
 }
 
 /// What removing duplicates did.
@@ -847,6 +948,9 @@ pub fn remove_duplicates(out_dir: &Path, entry_ids: &[i64], settings: &Settings,
     for id in entry_ids {
         let f = cat.entry_location(*id)?.ok_or_else(|| anyhow!("a file picked is no longer in the catalogue; refresh and try again"))?;
         let hash = f.blake3.as_deref().ok_or_else(|| anyhow!("{} has no recorded hash", f.rel_path))?;
+        if cat.is_dep_original(&f.archive_path, &f.rel_path)? {
+            bail!("{} is the original that reference files point to, so it can't be removed", f.rel_path);
+        }
         let kept = cat
             .copies_of(hash, f.size)?
             .into_iter()
@@ -860,31 +964,222 @@ pub fn remove_duplicates(out_dir: &Path, entry_ids: &[i64], settings: &Settings,
     }
     drop(cat);
     for (archive, rels) in &by_archive {
-        rewrite(archive, &[], false, rels, settings, progress)
+        rewrite(archive, &Changes { remove: rels, ..Changes::default() }, settings, progress)
             .with_context(|| format!("{} was left as it was", archive.file_name().unwrap_or_default().to_string_lossy()))?;
         out.archives += 1;
     }
     Ok(out)
 }
 
-/// Rewrites `archive`: puts back the left-out files `keep`, optionally
-/// discards the rest of the set-aside files, and removes `remove` as
-/// duplicates.
-fn rewrite(
-    archive: &Path,
-    keep: &[String],
-    discard_rest: bool,
-    remove: &[String],
+/// What replacing duplicates by reference files did, or in a dry run, would do.
+#[derive(Debug, Default)]
+pub struct ReplaceReport {
+    pub dry_run: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// Each archive changed (or to change), oldest first, with its file
+    /// count and bytes.
+    pub archives: Vec<(String, usize, u64)>,
+    /// Originals decoded from their archives and found to match their hash.
+    pub originals_checked: usize,
+}
+
+/// Replaces each catalogued duplicate `entry_ids` inside its archive with a
+/// small `.atticarcdep` reference file pointing to the original: the oldest
+/// copy, in the oldest archive, which stays. Before anything changes, every
+/// original is decoded from its archive and must match its recorded hash;
+/// if any doesn't, nothing is changed. With `dry_run`, only those checks
+/// run. Each archive is then unpacked, the duplicate checked against its
+/// hash and swapped for its reference file, and the archive written again,
+/// verified and swapped in, oldest archive first.
+pub fn replace_duplicates(
+    out_dir: &Path,
+    entry_ids: &[i64],
+    dry_run: bool,
     settings: &Settings,
     progress: &Arc<Progress>,
-) -> Result<Restored> {
+) -> Result<ReplaceReport> {
+    let cat = Catalog::open_existing(out_dir)?;
+    let mut report = ReplaceReport { dry_run, ..ReplaceReport::default() };
+    // By archive, in catalogue order (oldest first).
+    let mut by_archive: Vec<(PathBuf, String, Vec<Replaced>)> = Vec::new();
+    let mut originals: BTreeMap<PathBuf, BTreeMap<String, (String, u64)>> = BTreeMap::new();
+    let now = now_utc();
+    let mut leaves = Vec::new();
+    for id in entry_ids {
+        leaves.push(cat.dedupe_leaf(*id)?.ok_or_else(|| anyhow!("a file picked is no longer a duplicate in the catalogue; refresh and try again"))?);
+    }
+    leaves.sort_by(|a, b| (&a.archive_created, a.archive_id, &a.entry.rel_path).cmp(&(&b.archive_created, b.archive_id, &b.entry.rel_path)));
+    for leaf in leaves {
+        if !leaf.original_archive_path.is_file() {
+            bail!("{} holds the original of {} but isn't there; nothing was changed", leaf.original_archive_path.display(), leaf.entry.rel_path);
+        }
+        if !leaf.archive_path.is_file() {
+            bail!("{} isn't there; nothing was changed", leaf.archive_path.display());
+        }
+        if leaf.original_archive_path.parent() != leaf.archive_path.parent() {
+            bail!("{} and its original's archive aren't in the same folder", leaf.entry.rel_path);
+        }
+        let hash = leaf.entry.blake3.clone().ok_or_else(|| anyhow!("{} has no recorded hash", leaf.entry.rel_path))?;
+        originals.entry(leaf.original_archive_path.clone()).or_default().insert(leaf.original_path.clone(), (hash, leaf.entry.size));
+        let r = Replaced {
+            dep_path: dep_path(&leaf.entry.rel_path),
+            original_archive: leaf.original_archive_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            original_path: leaf.original_path,
+            replaced_utc: now.clone(),
+            entry: leaf.entry,
+        };
+        report.files += 1;
+        report.bytes += r.entry.size;
+        match by_archive.iter_mut().find(|(p, ..)| *p == leaf.archive_path) {
+            Some((.., v)) => v.push(r),
+            None => by_archive.push((leaf.archive_path, leaf.archive_name, vec![r])),
+        }
+    }
+    drop(cat);
+    report.archives = by_archive.iter().map(|(_, n, v)| (n.clone(), v.len(), v.iter().map(|r| r.entry.size).sum())).collect();
+
+    // Every original must decode with its hash before anything changes.
+    let mut problems = Vec::new();
+    for (archive, want) in &originals {
+        let name = archive.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        progress.set_phase(&format!("Checking the originals in {name}"), want.values().map(|v| v.1).sum());
+        let got = hash_entries(archive, &want.keys().cloned().collect::<Vec<_>>(), settings.threads, progress)?;
+        for (rel, (hash, size)) in want {
+            match got.get(rel) {
+                Some((h, n)) if h == hash && n == size => report.originals_checked += 1,
+                Some(_) => problems.push(format!("{rel} in {name} doesn't match its recorded hash")),
+                None => problems.push(format!("{rel} is missing from {name}")),
+            }
+        }
+    }
+    if !problems.is_empty() {
+        problems.sort();
+        bail!("nothing was changed, because some originals failed their check:\n{}", summarize(&problems));
+    }
+    if dry_run {
+        return Ok(report);
+    }
+    let total = by_archive.len();
+    for (i, (archive, name, reps)) in by_archive.iter().enumerate() {
+        rewrite(archive, &Changes { replace: reps, ..Changes::default() }, settings, progress).with_context(|| {
+            let done = if i == 0 { "no archive was changed".to_string() } else { format!("the {i} archives before it were done") };
+            format!("{name}.7z was left as it was (archive {} of {total}); {done}", i + 1)
+        })?;
+    }
+    Ok(report)
+}
+
+/// Puts the files in `archive` that were replaced by reference files back,
+/// from their originals, by their paths. The originals must match their
+/// recorded hash; the archive is rewritten, verified and swapped in.
+pub fn put_back_replaced(archive: &Path, rels: &[String], settings: &Settings, progress: &Arc<Progress>) -> Result<usize> {
+    rewrite(archive, &Changes { put_back: rels, ..Changes::default() }, settings, progress)?;
+    Ok(rels.len())
+}
+
+/// Follows a reference file: extracts the original it points to into
+/// `dest_dir`, under the replaced file's name, and checks its hash.
+pub fn extract_original(out_dir: &Path, dep: &Replaced, dest_dir: &Path, threads: u32) -> Result<PathBuf> {
+    let from = out_dir.join(&dep.original_archive);
+    if !from.is_file() {
+        bail!("{} holds the original but isn't there", from.display());
+    }
+    let name = dep.entry.rel_path.rsplit('/').next().unwrap_or(&dep.entry.rel_path);
+    let to = extract_file_as(&from, &dep.original_path, &dest_dir.join(name), threads)?;
+    if let Err(e) = check_hash(&to, &dep.entry) {
+        let _ = std::fs::remove_file(&to);
+        return Err(e.context("the original doesn't match the replaced file's hash, so it was not kept"));
+    }
+    set_times(&to, parse_utc(dep.entry.modified_utc.as_deref()), parse_utc(dep.entry.created_utc.as_deref()), false);
+    Ok(to)
+}
+
+/// Decodes `archive` and returns the BLAKE3 hash and size of each of the
+/// files `rels` found in it. Nothing is written to disk.
+fn hash_entries(archive: &Path, rels: &[String], threads: u32, progress: &Arc<Progress>) -> Result<HashMap<String, (String, u64)>> {
+    let want: std::collections::HashSet<&str> = rels.iter().map(String::as_str).collect();
+    let mut out = HashMap::new();
+    let mut reader = ArchiveReader::open(archive, Password::empty())
+        .with_context(|| format!("can't open {}", archive.display()))?
+        .with_threads(threads.max(1));
+    let mut buf = vec![0u8; 1 << 20];
+    reader
+        .for_each_entries(|entry, data| {
+            if entry.is_directory() || !want.contains(entry.name()) {
+                return Ok(true);
+            }
+            let mut h = blake3::Hasher::new();
+            let mut n = 0u64;
+            loop {
+                progress.check_cancel()?;
+                let k = data.read(&mut buf)?;
+                if k == 0 {
+                    break;
+                }
+                h.update(&buf[..k]);
+                n += k as u64;
+                progress.done.fetch_add(k as u64, Ordering::Relaxed);
+            }
+            out.insert(entry.name().to_string(), (h.finalize().to_hex().to_string(), n));
+            Ok(out.len() < want.len())
+        })
+        .map_err(|e| {
+            if progress.cancel.load(Ordering::Relaxed) { anyhow!("cancelled") } else { anyhow!("{} can't be decoded: {e}", archive.display()) }
+        })?;
+    Ok(out)
+}
+
+/// What to change when an archive is rewritten.
+#[derive(Default)]
+struct Changes<'a> {
+    /// Left-out files to put back.
+    keep: &'a [String],
+    /// Move the set-aside files not kept to the discarded list.
+    discard_rest: bool,
+    /// Files to remove as duplicates.
+    remove: &'a [String],
+    /// Duplicates to replace by a reference file.
+    replace: &'a [Replaced],
+    /// Files replaced by a reference file to put back, by their path.
+    put_back: &'a [String],
+}
+
+/// Rewrites `archive` with `ch`: puts back left-out files, optionally
+/// discards the rest of the set-aside files, removes duplicates, replaces
+/// duplicates by reference files, and puts replaced files back.
+fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc<Progress>) -> Result<Restored> {
+    let (keep, discard_rest, remove) = (ch.keep, ch.discard_rest, ch.remove);
     let m = read_manifest(archive)?;
-    if !remove.is_empty() && m.archive.source_path.ends_with("|excluded") {
+    let changes_files = !remove.is_empty() || !ch.replace.is_empty();
+    if changes_files && m.archive.source_path.ends_with("|excluded") {
         bail!("{} holds set-aside files; manage those on the Excluded page", archive.display());
     }
+    let recorded = |rel: &str| m.entries.iter().find(|e| !e.is_dir && e.rel_path == rel);
     for rel in remove {
-        if !m.entries.iter().any(|e| !e.is_dir && &e.rel_path == rel) {
+        if recorded(rel).is_none() {
             bail!("{rel} isn't in {}", archive.display());
+        }
+    }
+    // Each replaced file as the manifest records it, which must match the copy the caller expects.
+    let mut replace = Vec::new();
+    for r in ch.replace {
+        let rel = &r.entry.rel_path;
+        let e = recorded(rel).ok_or_else(|| anyhow!("{rel} isn't in {}", archive.display()))?;
+        if e.method == "dep" {
+            bail!("{rel} is already a reference file");
+        }
+        if e.size != r.entry.size || e.blake3 != r.entry.blake3 {
+            bail!("{rel} in {} isn't the copy the catalogue lists; rebuild the catalogue and try again", archive.display());
+        }
+        if m.entries.iter().any(|x| x.rel_path == r.dep_path) {
+            bail!("{} already has a file called {}", archive.display(), r.dep_path);
+        }
+        replace.push(Replaced { entry: e.clone(), ..r.clone() });
+    }
+    for rel in ch.put_back {
+        if !m.excluded.deps.iter().any(|d| &d.entry.rel_path == rel) {
+            bail!("{rel} wasn't replaced by a reference file in {}", archive.display());
         }
     }
     let ex = &m.excluded;
@@ -930,6 +1225,44 @@ fn rewrite(
                 set_times(&to, std::fs::metadata(&from)?.modified().ok(), std::fs::metadata(&from)?.created().ok(), false);
             }
         }
+        // Duplicates out, reference files in: the copy unpacked must match its hash first.
+        for r in &replace {
+            let at = main_dir.join(&r.entry.rel_path);
+            check_hash(&at, &r.entry).with_context(|| format!("{} didn't unpack with its recorded hash", r.entry.rel_path))?;
+            std::fs::remove_file(&at).with_context(|| format!("can't remove {} from the work folder", r.entry.rel_path))?;
+            let dep = main_dir.join(&r.dep_path);
+            std::fs::write(&dep, serde_json::to_vec_pretty(&DepFile::new(r.clone()))?)
+                .with_context(|| format!("can't write {}", r.dep_path))?;
+            set_times(&dep, parse_utc(r.entry.modified_utc.as_deref()), parse_utc(r.entry.created_utc.as_deref()), false);
+        }
+        // Replaced files back from their originals, one pass per original archive.
+        let mut wanted: BTreeMap<PathBuf, Vec<(String, PathBuf)>> = BTreeMap::new();
+        for rel in ch.put_back {
+            let d = ex.deps.iter().find(|d| &d.entry.rel_path == rel).unwrap();
+            let from = out_dir.join(&d.original_archive);
+            if !from.is_file() {
+                bail!("{} holds the original of {rel} but isn't there", from.display());
+            }
+            wanted.entry(from).or_default().push((d.original_path.clone(), main_dir.join(rel)));
+        }
+        for (from, files) in &wanted {
+            progress.set_phase("Unpacking the originals", 0);
+            extract_many(from, files, settings.threads)?;
+        }
+        for rel in ch.put_back {
+            let d = ex.deps.iter().find(|d| &d.entry.rel_path == rel).unwrap();
+            let to = main_dir.join(rel);
+            check_hash(&to, &d.entry).with_context(|| format!("the original of {rel} doesn't match its recorded hash"))?;
+            set_times(&to, parse_utc(d.entry.modified_utc.as_deref()), parse_utc(d.entry.created_utc.as_deref()), false);
+            let dep = main_dir.join(&d.dep_path);
+            if dep.is_file() {
+                std::fs::remove_file(&dep).with_context(|| format!("can't remove {} from the work folder", d.dep_path))?;
+            }
+        }
+        let mut deps: Vec<Replaced> = ex.deps.iter().filter(|d| !ch.put_back.contains(&d.entry.rel_path)).cloned().collect();
+        deps.extend(replace.iter().cloned());
+        deps.sort_by(|a, b| a.entry.rel_path.cmp(&b.entry.rel_path));
+
         let mut duplicates = ex.duplicates.clone();
         for rel in remove {
             std::fs::remove_file(main_dir.join(rel)).with_context(|| format!("can't remove {rel} from the work folder"))?;
@@ -945,6 +1278,7 @@ fn rewrite(
             set_aside: ex.set_aside.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
             discarded: ex.discarded.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
             duplicates,
+            deps,
         };
         let mut moved = 0;
         if discard_rest {
@@ -1032,7 +1366,12 @@ fn rewrite(
         aside_removed = true;
     }
     if let Some(id) = main_id {
-        let (what, detail) = if remove.is_empty() {
+        let names = |v: Vec<&str>| v.join(", ");
+        let (what, detail) = if !ch.replace.is_empty() {
+            ("reference", format!("replaced by reference files: {}", names(ch.replace.iter().map(|r| r.entry.rel_path.as_str()).collect())))
+        } else if !ch.put_back.is_empty() {
+            ("unreference", format!("put back from their originals: {}", ch.put_back.join(", ")))
+        } else if remove.is_empty() {
             ("restore", format!("put back: {}", keep.join(", ")))
         } else {
             ("dedupe", format!("removed as duplicates: {}", remove.join(", ")))
@@ -1183,6 +1522,7 @@ pub fn check_before_delete(
         .chain(&excluded.set_aside)
         .chain(&excluded.discarded)
         .chain(&excluded.duplicates)
+        .chain(excluded.deps.iter().map(|d| &d.entry))
         .filter(|e| !e.is_dir)
         .map(|e| (e.rel_path.as_str(), e))
         .collect();
@@ -1534,6 +1874,108 @@ mod tests {
 
         // The folder still on disk passes the check before a delete.
         let src = tmp.path().join("two");
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+    }
+
+    #[test]
+    fn duplicates_are_replaced_by_references_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let s = settings(&out, false);
+        let p = Arc::new(Progress::default());
+        for name in ["one", "two"] {
+            let src = tmp.path().join(name);
+            std::fs::create_dir_all(src.join("pics")).unwrap();
+            std::fs::write(src.join("pics/same.jpg"), "identical bytes ".repeat(1000)).unwrap();
+            std::fs::write(src.join(format!("{name}.txt")), name).unwrap();
+            if name == "two" {
+                std::fs::create_dir_all(src.join("other")).unwrap();
+                std::fs::write(src.join("other/again.jpg"), "identical bytes ".repeat(1000)).unwrap();
+            }
+            archive_folder(&src, &s, &p).unwrap();
+        }
+        let cat = Catalog::open_existing(&out).unwrap();
+        let tree = cat.dedupe_tree().unwrap();
+        assert_eq!(tree.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["one", "two"], "oldest first");
+        assert_eq!((tree[0].originals, tree[0].leaves.len()), (1, 0));
+        let leaves: Vec<(&str, &str, &str)> =
+            tree[1].leaves.iter().map(|l| (l.rel_path.as_str(), l.original_archive.as_str(), l.original_path.as_str())).collect();
+        assert_eq!(leaves, [("other/again.jpg", "one", "pics/same.jpg"), ("pics/same.jpg", "one", "pics/same.jpg")]);
+        let ids: Vec<i64> = tree[1].leaves.iter().map(|l| l.entry_id).collect();
+        // The original itself can't be replaced.
+        let original = cat.copies_of(&tree[1].leaves[0].blake3, tree[1].leaves[0].size).unwrap()[0].0;
+        assert!(cat.dedupe_leaf(original).unwrap().is_none());
+        drop(cat);
+        let two = out.join("two.7z");
+        let before = std::fs::read(&two).unwrap();
+
+        // A dry run checks the original and changes nothing.
+        let r = replace_duplicates(&out, &ids, true, &s, &p).unwrap();
+        assert_eq!((r.files, r.originals_checked, r.archives.len()), (2, 1, 1));
+        assert_eq!(std::fs::read(&two).unwrap(), before);
+
+        // With the original's archive gone, nothing is changed either.
+        std::fs::rename(out.join("one.7z"), out.join("one.moved")).unwrap();
+        let e = replace_duplicates(&out, &ids, false, &s, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("nothing was changed"), "{e:#}");
+        assert_eq!(std::fs::read(&two).unwrap(), before);
+        std::fs::rename(out.join("one.moved"), out.join("one.7z")).unwrap();
+
+        let r = replace_duplicates(&out, &ids, false, &s, &p).unwrap();
+        assert_eq!((r.files, r.bytes), (2, 32_000));
+        let m = read_manifest(&two).unwrap();
+        let files: Vec<(&str, &str)> = m.entries.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e.method.as_str())).collect();
+        assert_eq!(
+            files,
+            [("other/again.jpg.atticarcdep", "dep"), ("pics/same.jpg.atticarcdep", "dep"), ("two.txt", "lzma2")]
+        );
+        assert_eq!(m.excluded.deps.len(), 2);
+        // The reference file says where the original is.
+        let dir = tmp.path().join("x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dep = extract_file(&two, "pics/same.jpg.atticarcdep", &dir, 2).unwrap();
+        let d: DepFile = serde_json::from_slice(&std::fs::read(dep).unwrap()).unwrap();
+        assert_eq!((d.replaced.original_archive.as_str(), d.replaced.original_path.as_str()), ("one.7z", "pics/same.jpg"));
+
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert!(cat.dedupe_tree().unwrap().iter().all(|a| a.leaves.is_empty()));
+        assert!(cat.duplicate_groups(10).unwrap().is_empty());
+        assert_eq!(cat.dedupe_tree().unwrap()[1].replaced, 2);
+        // The original is protected now.
+        let e = remove_duplicates(&out, &[original], &s, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("reference files point to"), "{e:#}");
+        let two_id = cat.archive_id_for(&two).unwrap().unwrap();
+        let rep = cat.dep_at(two_id, "other/again.jpg.atticarcdep").unwrap().unwrap();
+        drop(cat);
+
+        // Following a reference extracts the original under the replaced file's name.
+        let got = extract_original(&out, &rep, &dir, 2).unwrap();
+        assert_eq!(got.file_name().unwrap(), "again.jpg");
+        assert_eq!(std::fs::read(&got).unwrap(), "identical bytes ".repeat(1000).as_bytes());
+
+        // The folder still on disk passes the check before a delete.
+        let src = tmp.path().join("two");
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+
+        // The references survive a rebuild of the catalogue.
+        Catalog::open_existing(&out).unwrap().clear().unwrap();
+        rebuild_catalog(&out).unwrap();
+        let cat = Catalog::open_existing(&out).unwrap();
+        let two_id = cat.archive_id_for(&two).unwrap().unwrap();
+        assert_eq!(cat.deps(two_id).unwrap().len(), 2);
+        drop(cat);
+
+        // Putting one back brings the real file back into the archive.
+        assert_eq!(put_back_replaced(&two, &["pics/same.jpg".to_string()], &s, &p).unwrap(), 1);
+        let m = read_manifest(&two).unwrap();
+        assert!(m.entries.iter().any(|e| e.rel_path == "pics/same.jpg" && e.method == "lzma2"));
+        assert!(!m.entries.iter().any(|e| e.rel_path == "pics/same.jpg.atticarcdep"));
+        assert_eq!(m.excluded.deps.len(), 1);
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.dedupe_tree().unwrap()[1].leaves.len(), 1);
+        drop(cat);
         let (a, entries) = recorded(&out, &src);
         check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
     }

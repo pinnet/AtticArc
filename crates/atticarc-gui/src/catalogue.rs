@@ -2,12 +2,13 @@
 //! archive, without unpacking; see a file's details and extract it. Mockup:
 //! Catalogue.dc.html.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText};
 
-use atticarc_core::archive;
+use atticarc_core::archive::{self, DEP_EXT, Replaced};
 use atticarc_core::catalog::{self, ArchiveSummary, Catalog, FoundFile};
 
 use crate::browse::Browse;
@@ -36,6 +37,16 @@ pub struct State {
     confirm_clear: bool,
     /// Set after the catalogue was cleared, so the folder list reloads.
     cleared: bool,
+    /// For the file shown, by entry id: what it stands for if it is a reference file.
+    dep: Option<(i64, Option<Replaced>)>,
+    /// For the file shown, by entry id: the reference files pointing to it.
+    refs: Option<(i64, Vec<(String, String)>)>,
+    /// Putting a replaced file back into its archive.
+    putting_back: Option<(Arc<archive::Progress>, Receiver<Result<usize, String>>)>,
+    /// A file to show once its archive is open in the browser: (archive id, path).
+    goto: Option<(i64, String)>,
+    /// Set when an archive was rewritten, so other pages reload.
+    pub changed: bool,
 }
 
 impl State {
@@ -53,7 +64,7 @@ impl State {
     }
 
     pub fn busy(&self) -> bool {
-        self.extracting.is_some() || self.rebuilding.is_some()
+        self.extracting.is_some() || self.rebuilding.is_some() || self.putting_back.is_some()
     }
 
     /// Adds the archives in `out` that the catalogue is missing, from the
@@ -75,8 +86,23 @@ impl App {
         if std::mem::take(&mut self.catalogue.cleared) {
             self.reload();
         }
-        let busy = self.jobs.is_busy();
+        let busy = self.jobs.is_busy() || self.duplicates.busy();
+        let settings = self.settings();
         let st = &mut self.catalogue;
+        if let Some((_, rx)) = &st.putting_back
+            && let Ok(res) = rx.try_recv()
+        {
+            // Shown under the search bar, since the browser reloads.
+            st.rebuild_note = Some(match res {
+                Ok(_) => "The file was put back from its original; the archive was rewritten and verified.".into(),
+                Err(e) => format!("Putting the file back failed, and the archive was left as it was: {e}"),
+            });
+            st.putting_back = None;
+            st.changed = true;
+            let keep = st.archive_filter;
+            st.invalidate();
+            st.archive_filter = keep;
+        }
         if let Some(rx) = &st.extracting
             && let Ok(res) = rx.try_recv() {
                 st.note = Some(match res {
@@ -188,7 +214,7 @@ impl App {
 
         if st.query.trim().is_empty() {
             match st.archive_filter {
-                Some(id) => browse_view(ui, st, id),
+                Some(id) => browse_view(ui, st, id, &out, &settings),
                 None => archive_list(ui, st),
             }
             return;
@@ -218,7 +244,7 @@ impl App {
                 None => {
                     ui.label("No file selected.");
                 }
-                Some(f) => details(ui, st, &f),
+                Some(f) => details(ui, st, &f, &out, &settings),
             });
         });
     }
@@ -277,7 +303,12 @@ fn load_browse(st: &mut State, out: &std::path::Path) {
         return;
     };
     match Catalog::open_existing(out).and_then(|c| Browse::load(&c, id)) {
-        Ok(b) => st.browse = Some(b),
+        Ok(mut b) => {
+            if let Some((_, rel)) = st.goto.take().filter(|g| g.0 == id) {
+                b.select_path(&rel);
+            }
+            st.browse = Some(b)
+        }
         Err(e) => {
             st.error = Some(format!("Couldn't open {name}: {e:#}"));
             st.archive_filter = None;
@@ -385,7 +416,7 @@ fn title(ui: &mut egui::Ui, st: &mut State) {
     }
 }
 
-fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64) {
+fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64, out: &Path, settings: &archive::Settings) {
     let Some(a) = st.archives.iter().find(|a| a.id == id).cloned() else {
         st.archive_filter = None;
         return;
@@ -398,12 +429,97 @@ fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64) {
         ui.allocate_ui_with_layout(egui::vec2(w * 0.66 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| card(ui, |ui| b.table(ui)));
         ui.allocate_ui_with_layout(egui::vec2(w * 0.34, h), egui::Layout::top_down(egui::Align::Min), |ui| {
             card(ui, |ui| match b.selected_file().cloned() {
-                Some(f) => details(ui, st, &f),
+                Some(f) => details(ui, st, &f, out, settings),
                 None => archive_info(ui, &a),
             })
         });
     });
     st.browse = Some(b);
+}
+
+/// A reference file that stands in for a duplicate: what it replaced, where
+/// the original is, and following it or putting the file back.
+fn reference_details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replaced, out: &Path, settings: &archive::Settings) {
+    egui::ScrollArea::vertical().id_salt("dep-details").auto_shrink([false, true]).show(ui, |ui| reference_body(ui, st, f, dep, out, settings));
+}
+
+fn reference_body(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replaced, out: &Path, settings: &archive::Settings) {
+    let e = &dep.entry;
+    let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
+    ui.label(RichText::new(&name).monospace().strong().size(16.0));
+    ui.label(RichText::new("Replaced by a reference to an identical original").color(theme::warn()));
+    ui.add_space(4.0);
+    ui.add_space(8.0);
+    let idle = st.extracting.is_none() && st.putting_back.is_none();
+    let there = out.join(&dep.original_archive).is_file();
+    ui.horizontal_wrapped(|ui| {
+        let tip = "Follows the reference: extracts the original under this file's name and checks its hash";
+        if ui.add_enabled(idle && there, primary_button("Extract the original to…")).on_hover_text(tip).clicked()
+            && let Some(dest) = rfd::FileDialog::new().pick_folder()
+        {
+            let (tx, rx) = channel();
+            let (out, d) = (out.to_path_buf(), dep.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(archive::extract_original(&out, &d, &dest, archive::default_threads()).map_err(|e| format!("{e:#}")));
+            });
+            st.extracting = Some(rx);
+            st.note = Some(format!("Extracting {name} from {}…", dep.original_archive));
+        }
+        let tip = "Rewrites this archive with the real file in place of the reference, taken from the original and checked against its hash";
+        let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
+        if ui.add_enabled(idle && there && archive_path.is_some(), egui::Button::new("Put the file back")).on_hover_text(tip).clicked()
+            && let Some(arch) = archive_path
+        {
+            let (tx, rx) = channel();
+            let progress = Arc::new(archive::Progress::default());
+            let (p, rel, settings) = (progress.clone(), e.rel_path.clone(), settings.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(archive::put_back_replaced(&arch, &[rel], &settings, &p).map_err(|e| format!("{e:#}")));
+            });
+            st.putting_back = Some((progress, rx));
+            st.note = None;
+        }
+        let target = st
+            .archives
+            .iter()
+            .find(|a| Path::new(&a.archive_path).file_name().is_some_and(|n| n.to_string_lossy() == dep.original_archive))
+            .map(|a| a.id);
+        if ui.add_enabled(target.is_some(), egui::Button::new("Show the original")).clicked()
+            && let Some(id) = target
+        {
+            st.query.clear();
+            st.archive_filter = Some(id);
+            st.browse = None;
+            st.goto = Some((id, dep.original_path.clone()));
+        }
+    });
+    if !there {
+        ui.colored_label(theme::danger(), format!("{} isn't in {}", dep.original_archive, out.display()));
+    }
+    if let Some((p, _)) = &st.putting_back {
+        ui.label(RichText::new(p.phase.lock().unwrap().clone()).color(theme::muted()));
+        ui.add(egui::ProgressBar::new(p.fraction()).desired_height(10.0).fill(theme::accent()));
+    }
+    if let Some(n) = &st.note {
+        ui.label(RichText::new(n).color(theme::muted()));
+    }
+    ui.add_space(8.0);
+    let original = PathBuf::from(&f.source_path).join(e.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    egui::Grid::new("dep-details").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+            ui.label(RichText::new(k).color(theme::muted()));
+            ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
+            ui.end_row();
+        };
+        row(ui, "Path here", format!("{}.7z › {}", f.archive_name, e.rel_path));
+        row(ui, "Reference file", dep.dep_path.clone());
+        row(ui, "Original kept in", format!("{} › {}", dep.original_archive, dep.original_path));
+        row(ui, "Came from", original.display().to_string());
+        row(ui, "Size", human(e.size));
+        row(ui, "Modified", e.modified_utc.clone().unwrap_or_default().replace('T', " ").replace('Z', " UTC"));
+        row(ui, "BLAKE3", e.blake3.clone().unwrap_or_default());
+        row(ui, "Replaced", dep.replaced_utc.replace('T', " ").replace('Z', " UTC"));
+    });
 }
 
 fn archive_info(ui: &mut egui::Ui, a: &ArchiveSummary) {
@@ -461,8 +577,25 @@ fn archive_list(ui: &mut egui::Ui, st: &mut State) {
     });
 }
 
-fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
+fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, out: &Path, settings: &archive::Settings) {
     let name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path).to_string();
+    if f.rel_path.ends_with(&format!(".{DEP_EXT}")) {
+        if st.dep.as_ref().map(|d| d.0) != Some(f.entry_id) {
+            let dep = Catalog::open_existing(out).and_then(|c| c.dep_at(f.archive_id, &f.rel_path)).ok().flatten();
+            st.dep = Some((f.entry_id, dep));
+        }
+        if let Some((_, Some(dep))) = st.dep.clone() {
+            return reference_details(ui, st, f, &dep, out, settings);
+        }
+    }
+    if st.refs.as_ref().map(|r| r.0) != Some(f.entry_id) {
+        let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
+        let refs = archive_path
+            .and_then(|p| Catalog::open_existing(out).and_then(|c| c.references_to(&p, &f.rel_path)).ok())
+            .unwrap_or_default();
+        st.refs = Some((f.entry_id, refs));
+    }
+    let refs = st.refs.as_ref().map(|r| r.1.clone()).unwrap_or_default();
     ui.label(RichText::new(&name).monospace().strong().size(16.0));
     ui.add_space(4.0);
     let original = PathBuf::from(&f.source_path).join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -479,6 +612,10 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile) {
         row(ui, "BLAKE3", f.blake3.clone().unwrap_or_default());
         row(ui, "SHA-256", f.sha256.clone().unwrap_or_default());
         row(ui, "Copies", if f.copies > 1 { format!("{} (see Duplicates)", f.copies) } else { "1".into() });
+        if !refs.is_empty() {
+            let list: Vec<String> = refs.iter().map(|(a, p)| format!("{a}.7z › {p}")).collect();
+            row(ui, "Referenced by", list.join("\n"));
+        }
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {

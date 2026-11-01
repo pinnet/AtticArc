@@ -179,6 +179,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let out = self.out_dir();
         let finished_batch = self.jobs.handle_messages(&out);
+        if std::mem::take(&mut self.catalogue.changed) {
+            self.duplicates.invalidate();
+            self.excluded.invalidate();
+        }
         if finished_batch || std::mem::take(&mut self.jobs.deleted) {
             self.catalogue.invalidate();
             self.duplicates.invalidate();
