@@ -237,8 +237,8 @@ fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
     egui::CollapsingHeader::new(title).id_salt("exclusions").default_open(true).show(ui, |ui| {
         ui.label(
             RichText::new(
-                "Files matching a ticked rule are left out of the main archive. Set aside keeps them in a second \
-                 archive, <folder>.excluded.7z; Discard keeps them nowhere, for junk like shortcuts. A wildcard \
+                "Files matching a ticked rule are left out of the main archive. Set aside keeps them in an archive \
+                 of their own inside the main one, so they can be put back or discarded later; Discard keeps them nowhere, for junk like shortcuts. A wildcard \
                  without / matches file names anywhere (*.lnk); * stays within a folder, ** crosses folders. A regex \
                  matches anywhere in the path inside the folder. Case is ignored. See the Excluded page for what \
                  was left out.",
@@ -264,7 +264,7 @@ fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
                     .selected_text(rule.action.label())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut rule.action, Action::SetAside, "Set aside")
-                            .on_hover_text("Keep these files, in a second archive: <folder>.excluded.7z");
+                            .on_hover_text("Keep these files in an archive of their own inside the main archive");
                         ui.selectable_value(&mut rule.action, Action::Discard, "Discard")
                             .on_hover_text("Keep these nowhere: they are listed, then deleted with the folder");
                     });

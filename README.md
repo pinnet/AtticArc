@@ -64,20 +64,25 @@ Starts on the given source folder (or the last one used).
 - **New job → Exclusions**: rules for files to leave out of the main archive, each ticked on or off.
   A *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a
   folder, `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is
-  ignored. Each rule either **sets aside** its files, into a second verified archive
-  `<folder>.excluded.7z`, or **discards** them (junk such as shortcuts): they are archived nowhere,
+  ignored. Each rule either **sets aside** its files, into a verified archive of their own that is
+  stored, without compressing it again, inside the main archive at `.atticarc/excluded.7z` (so the
+  destination holds one archive per folder), or **discards** them (junk such as shortcuts): they are archived nowhere,
   but the manifest lists them with their hashes. If both kinds match, the file is set aside. An
   unticked `*.lnk` discard rule is there to start from.
 - **Excluded**: every archived folder whose exclusions left files out, with what was set aside or
-  discarded, buttons to browse either archive, and **Delete the folder…**. Deleting checks every file
-  in the folder against the main archive, the set-aside archive or the discard list (same hash), and
-  the confirmation lists the discarded files that will be gone for good.
+  discarded, and **Delete the folder…**. Deleting checks every file in the folder against the main
+  archive, the set-aside archive or the discard list (same hash): the set-aside archive inside is
+  saved to a check folder in `.atticarc` as the main archive is decoded, then decoded itself. The
+  confirmation lists the discarded files that will be gone for good.
   Tick files under *Files left out* and **Put them back in the archive**: the main archive is unpacked
   into a work folder in `.atticarc`, written again with those files (set-aside ones from the set-aside
-  archive, discarded ones from the folder while it still has them), verified, and only then swapped in,
+  archive inside it, discarded ones from the folder while it still has them), verified, and only then swapped in,
   so it needs free space for the unpacked archive. **Put ticked back, discard the rest…** also moves
-  the remaining set-aside files to the discard list and deletes the set-aside archive, so you can keep
-  what you want and throw the rest away with the folder.
+  the remaining set-aside files to the discard list and takes the set-aside archive out, so you can
+  keep what you want and throw the rest away with the folder.
+  Archives made before this keep `<folder>.excluded.7z` beside them, and still work: the check before
+  a delete reads it there, and **Move it inside the archive** (or any put back, discard or duplicate
+  change) moves it inside, verifies the new archive, and only then deletes the one beside it.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
