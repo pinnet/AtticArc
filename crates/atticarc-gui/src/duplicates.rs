@@ -49,6 +49,9 @@ pub struct State {
     expanded: BTreeSet<i64>,
     /// Copies unticked in the list before a run, which stay as they are.
     left_out: BTreeSet<Key>,
+    /// Only copies of at least `min_mb` megabytes are replaced.
+    min_on: bool,
+    min_mb: f64,
     review: bool,
     running: Option<Running>,
     /// The last preview, shown in the list until the ticks change.
@@ -80,7 +83,17 @@ impl State {
 
     /// The copies ticked to replace.
     fn ticked(&self) -> Vec<(&TreeArchive, &TreeLeaf)> {
-        self.leaves().filter(|(a, l)| !self.left_out.contains(&key(a, l))).collect()
+        self.leaves().filter(|(a, l)| self.big_enough(l) && !self.left_out.contains(&key(a, l))).collect()
+    }
+
+    /// Whether a copy passes the size limit, if one is set.
+    fn big_enough(&self, l: &TreeLeaf) -> bool {
+        !self.min_on || l.size as f64 >= self.min_mb * 1_000_000.0
+    }
+
+    /// The copies below the size limit, and their total size.
+    fn too_small(&self) -> (usize, u64) {
+        self.leaves().filter(|(_, l)| !self.big_enough(l)).fold((0, 0), |(n, b), (_, l)| (n + 1, b + l.size))
     }
 
     fn ticked_keys(&self) -> BTreeSet<Key> {
@@ -145,6 +158,9 @@ impl App {
                 changed = true;
             }
         }
+        if st.min_mb == 0.0 && !st.min_on {
+            st.min_mb = 1.0;
+        }
         if !st.loaded {
             st.loaded = true;
             st.error = None;
@@ -201,6 +217,8 @@ impl App {
                 if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
                     st.loaded = false;
                 }
+                ui.add_space(12.0);
+                ui.add_enabled_ui(idle, |ui| size_limit(ui, st));
             });
         });
         ui.add_space(8.0);
@@ -323,7 +341,7 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                 Row::Leaf(i, j) => {
                     let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
                     let on = st.selected == Some(Sel::Leaf(l.entry_id));
-                    let left_out = st.left_out.contains(&key(a, l));
+                    let left_out = st.left_out.contains(&key(a, l)) || !st.big_enough(l);
                     let resp = row_frame(ui, stripe, on, 44.0, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
@@ -525,7 +543,7 @@ fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: 
     let ticked = st.ticked();
     let (n, bytes) = (ticked.len(), ticked.iter().map(|(_, l)| l.size).sum::<u64>());
     let n_archives = ticked.iter().map(|(a, _)| a.id).collect::<BTreeSet<_>>().len();
-    let total = st.leaves().count();
+    let total = st.leaves().filter(|(_, l)| st.big_enough(l)).count();
     let previewing = st.running.as_ref().filter(|r| r.dry_run).map(|r| r.progress.clone());
     let keys = st.ticked_keys();
     egui::Modal::new(egui::Id::unique("replace-duplicates")).show(ctx, |ui| {
@@ -536,6 +554,14 @@ fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: 
              original, which stays. Untick any copy to leave it as it is.",
         ).color(theme::muted()));
         ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let locked = previewing.is_some();
+            ui.add_enabled_ui(!locked, |ui| size_limit(ui, st));
+            let (small, small_bytes) = st.too_small();
+            if small > 0 {
+                ui.label(RichText::new(format!("{} smaller ({}) not shown, left as they are", copies(small), human(small_bytes))).color(theme::muted()));
+            }
+        });
         ui.horizontal(|ui| {
             let locked = previewing.is_some();
             if ui.add_enabled(!locked, egui::Button::new("Tick all")).clicked() {
@@ -607,9 +633,10 @@ fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: 
 fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
     let mut rows = Vec::new();
     for (i, a) in st.tree.iter().enumerate() {
-        if !a.leaves.is_empty() {
+        let shown: Vec<usize> = (0..a.leaves.len()).filter(|&j| st.big_enough(&a.leaves[j])).collect();
+        if !shown.is_empty() {
             rows.push(Row::Archive(i));
-            rows.extend((0..a.leaves.len()).map(|j| Row::Leaf(i, j)));
+            rows.extend(shown.into_iter().map(|j| Row::Leaf(i, j)));
         }
     }
     let mut flip: Option<(Vec<Key>, bool)> = None;
@@ -620,7 +647,7 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
                 match *row {
                     Row::Archive(i) => {
                         let a = &st.tree[i];
-                        let keys: Vec<Key> = a.leaves.iter().map(|l| key(a, l)).collect();
+                        let keys: Vec<Key> = a.leaves.iter().filter(|l| st.big_enough(l)).map(|l| key(a, l)).collect();
                         let n_on = keys.iter().filter(|k| !st.left_out.contains(*k)).count();
                         let mut on = n_on == keys.len();
                         let cb = egui::Checkbox::without_text(&mut on).indeterminate(n_on > 0 && n_on < keys.len());
@@ -665,6 +692,27 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
                 st.left_out.insert(k);
             }
         }
+    }
+}
+
+/// The size limit: a tick box and the smallest size, in MB, of a copy to replace.
+fn size_limit(ui: &mut egui::Ui, st: &mut State) {
+    // Laid out right to left on the page, so the parts go in reverse there.
+    let rtl = ui.layout().prefer_right_to_left();
+    let mut parts: [&dyn Fn(&mut egui::Ui, &mut State); 2] = [
+        &|ui, st| {
+            ui.checkbox(&mut st.min_on, "Only copies of at least")
+                .on_hover_text("Smaller copies stay as they are; only copies this big or bigger are replaced");
+        },
+        &|ui, st| {
+            ui.add_enabled(st.min_on, egui::DragValue::new(&mut st.min_mb).range(0.0..=100_000.0).speed(0.1).max_decimals(1).suffix(" MB"));
+        },
+    ];
+    if rtl {
+        parts.reverse();
+    }
+    for p in parts {
+        p(ui, st);
     }
 }
 
