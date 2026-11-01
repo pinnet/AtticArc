@@ -33,7 +33,7 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 
 ## Open items
 
-- [x] Duplicates: choose the copy to keep and remove the rest, logging each removal.
+- [x] Duplicates: replace later copies with `.atticarcdep` references to the oldest copy, and put them back.
 - [ ] Archive breakdown screen (pie / treemap of an archive's contents).
 - [ ] MD5 as an optional hash for compatibility with the older tool.
 - [ ] Skip locked files instead of failing the folder; free-space check before archiving.
@@ -84,15 +84,21 @@ Starts on the given source folder (or the last one used).
   date, sortable), or search every file in every archive by name or folder, all without unpacking.
   Select a file to see its original path, hashes and how many copies exist, and extract it.
 - **Catalogue → Clear the catalogue…** (for development): forgets every archive in the catalogue after a confirmation. The .7z files and manifests stay on disk.
-- **Duplicates**: files with the same size and BLAKE3 hash across all archives, largest saving first,
-  one file at a time. The right pane shows the copy that is kept; the left pane shows the other copies,
-  one line each with a **Delete** tick box (**→** makes that copy the kept one; sizes and hashes are
-  behind the ⓘ). **◀ Previous** and
-  **Next ▶** (or the arrow keys) move between files; **Delete the others, next** (D) and **Keep all,
-  next** (K) decide a file and move on. Ticks stay, so one **Delete N copies…** removes them all
-  together, and the copy on the right is never deleted. Each archive losing a copy is unpacked into a
-  work folder, written again without it, verified and swapped in; its manifest lists the removed copies
-  as duplicates, so its folder still passes the check before a delete, and every removal is logged.
+- **Duplicates**: a tree on the right lists every archive, oldest first. The oldest copy of each file
+  (same size and BLAKE3 hash) is the original and always stays; every later copy is a leaf under its
+  archive, shown with its full path and the archive and path of its original. The left pane shows the
+  details of what is selected. **Replace duplicates…** opens the list of every copy, all ticked: untick
+  any to leave them as they are. **Preview (dry run)** decodes every original from its archive and checks
+  its hash, changing nothing. **Replace** runs the same check (nothing changes if any original fails),
+  then works through the archives oldest first: each is unpacked, every ticked copy is checked against
+  its hash and swapped for a small `<name>.atticarcdep` reference file, and the archive is written
+  again, verified and swapped in. A `.atticarcdep` file is plain JSON naming the original's archive and
+  path, its size and hashes, so it can be read in any text editor. The manifest records each replaced
+  file, so the folder still passes the check before a delete, the references survive a catalogue
+  rebuild, and an original that references point to can't be removed.
+- **Catalogue → a reference file** shows the file it stands for and where the original is:
+  **Extract the original to…** follows it (checking the hash), **Show the original** opens it, and
+  **Put the file back** rewrites the archive with the real file again, taken from the original.
 - **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
 
 ## Output

@@ -74,6 +74,12 @@ impl Browse {
         self.selected.and_then(|i| self.files.get(i))
     }
 
+    /// Opens the folder holding `rel` and selects that file.
+    pub fn select_path(&mut self, rel: &str) {
+        self.open(parent(rel).to_string());
+        self.selected = self.files.iter().position(|f| f.rel_path == rel);
+    }
+
     pub fn open(&mut self, dir: String) {
         self.dir = dir;
         self.selected = None;
@@ -204,7 +210,12 @@ impl Browse {
                                 let f = &self.files[*i];
                                 let name = leaf(&f.rel_path);
                                 let modified = f.modified_utc.as_deref().map(short_time).unwrap_or_default();
-                                (format!("🗋  {name}"), file_type(name), human(f.size), modified, self.selected == Some(*i))
+                                // A reference file shows as the file it stands in for.
+                                let shown = match name.strip_suffix(&format!(".{}", atticarc_core::archive::DEP_EXT)) {
+                                    Some(stem) => format!("🔗  {stem}"),
+                                    None => format!("🗋  {name}"),
+                                };
+                                (shown, file_type(name), human(f.size), modified, self.selected == Some(*i))
                             }
                         };
                         let resp = cell(ui, w[0], row_h - 4.0, false, |ui| {
@@ -326,6 +337,7 @@ pub fn file_type(name: &str) -> String {
         "bat" | "cmd" => "Windows batch file",
         "ps1" => "PowerShell script",
         "lnk" => "Shortcut",
+        "atticarcdep" => "AtticARC reference",
         "ini" | "cfg" | "conf" => "Settings file",
         "ttf" | "otf" => "Font",
         "rs" => "Rust source",

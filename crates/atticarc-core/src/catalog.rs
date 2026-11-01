@@ -141,6 +141,21 @@ CREATE TABLE IF NOT EXISTS excluded (
     aside_archive   TEXT
 );
 CREATE INDEX IF NOT EXISTS excluded_archive ON excluded(archive_id);
+
+-- Duplicates replaced inside an archive by a .atticarcdep reference file:
+-- the replaced file's path, the reference file's path, and where the
+-- original is (archive file name, path inside it). record is the whole
+-- manifest record as JSON.
+CREATE TABLE IF NOT EXISTS deps (
+    archive_id       INTEGER NOT NULL REFERENCES archives(id),
+    rel_path         TEXT NOT NULL,
+    dep_path         TEXT NOT NULL,
+    original_archive TEXT NOT NULL,
+    original_path    TEXT NOT NULL,
+    record           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deps_archive ON deps(archive_id);
+CREATE INDEX IF NOT EXISTS deps_original ON deps(original_archive, original_path);
 "#;
 
 /// One file or folder as recorded in the catalog and the manifest.
@@ -274,6 +289,7 @@ impl Catalog {
         delete_entries(&tx, id)?;
         insert_entries(&tx, id, entries)?;
         tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.execute("DELETE FROM deps WHERE archive_id = ?1", params![id])?;
         tx.commit()?;
         self.insert_excluded(id, ex)
     }
@@ -283,6 +299,7 @@ impl Catalog {
         let tx = self.conn.transaction()?;
         delete_entries(&tx, id)?;
         tx.execute("DELETE FROM excluded WHERE archive_id = ?1", params![id])?;
+        tx.execute("DELETE FROM deps WHERE archive_id = ?1", params![id])?;
         tx.execute("UPDATE runs SET archive_id = NULL WHERE archive_id = ?1", params![id])?;
         tx.execute("DELETE FROM archives WHERE id = ?1", params![id])?;
         tx.commit()?;
@@ -351,6 +368,20 @@ impl Catalog {
             for e in &ex.discarded {
                 q.execute(params![archive_id, e.rel_path, e.size as i64, "discard", Option::<String>::None])?;
             }
+            let mut d = tx.prepare(
+                "INSERT INTO deps (archive_id, rel_path, dep_path, original_archive, original_path, record)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for r in &ex.deps {
+                d.execute(params![
+                    archive_id,
+                    r.entry.rel_path,
+                    r.dep_path,
+                    r.original_archive,
+                    r.original_path,
+                    serde_json::to_string(r)?
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -404,6 +435,211 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// The duplicates replaced by reference files in archive `archive_id`.
+    pub fn deps(&self, archive_id: i64) -> Result<Vec<crate::archive::Replaced>> {
+        let mut q = self.conn.prepare("SELECT record FROM deps WHERE archive_id = ?1 ORDER BY rel_path")?;
+        let rows = q.query_map(params![archive_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// The replaced file a reference file at `dep_path` in archive `archive_id` stands for.
+    pub fn dep_at(&self, archive_id: i64, dep_path: &str) -> Result<Option<crate::archive::Replaced>> {
+        let rec: Option<String> = self
+            .conn
+            .query_row("SELECT record FROM deps WHERE archive_id = ?1 AND dep_path = ?2", params![archive_id, dep_path], |r| r.get(0))
+            .optional()?;
+        Ok(rec.map(|r| serde_json::from_str(&r)).transpose()?)
+    }
+
+    /// Whether the file `rel_path` in the archive at `archive_path` is the
+    /// original some reference file points to.
+    pub fn is_dep_original(&self, archive_path: &Path, rel_path: &str) -> Result<bool> {
+        let name = archive_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM deps d JOIN archives a ON a.id = d.archive_id
+             WHERE d.original_archive = ?1 AND d.original_path = ?2",
+            params![name, rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The reference files that point to the file `rel_path` in the archive
+    /// at `archive_path`, as (archive name, path of the replaced file).
+    pub fn references_to(&self, archive_path: &Path, rel_path: &str) -> Result<Vec<(String, String)>> {
+        let name = archive_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let mut q = self.conn.prepare(
+            "SELECT a.name, d.rel_path FROM deps d JOIN archives a ON a.id = d.archive_id
+             WHERE d.original_archive = ?1 AND d.original_path = ?2 ORDER BY a.created_utc, a.id, d.rel_path",
+        )?;
+        let rows = q.query_map(params![name, rel_path], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every verified archive, oldest first, with each file in it that is a
+    /// later copy of a file kept in an older archive (or earlier in the same
+    /// one). The oldest copy of each file is the original and stays; the
+    /// others are the leaves that can be replaced by reference files. Files
+    /// in set-aside archives are left out: those are managed on the Excluded
+    /// page and are rewritten from there.
+    pub fn dedupe_tree(&self) -> Result<Vec<TreeArchive>> {
+        let mut out: Vec<TreeArchive> = {
+            let mut q = self.conn.prepare(
+                "SELECT a.id, a.name, a.archive_path, COALESCE(a.source_display, a.source_path), a.created_utc, a.file_count,
+                        a.source_path LIKE '%|excluded',
+                        (SELECT COUNT(*) FROM deps d WHERE d.archive_id = a.id)
+                 FROM archives a WHERE a.status = 'verified' ORDER BY a.created_utc, a.id",
+            )?;
+            q.query_map([], |r| {
+                Ok(TreeArchive {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    archive_path: r.get(2)?,
+                    source_path: r.get(3)?,
+                    created_utc: r.get(4)?,
+                    file_count: r.get::<_, i64>(5)? as u64,
+                    set_aside: r.get(6)?,
+                    replaced: r.get::<_, i64>(7)? as u64,
+                    referenced: 0,
+                    originals: 0,
+                    leaves: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        {
+            // Originals that reference files point to, by the archive's file name.
+            let mut q = self.conn.prepare("SELECT original_archive, COUNT(DISTINCT original_path) FROM deps GROUP BY original_archive")?;
+            let counts: std::collections::HashMap<String, u64> =
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?.collect::<std::result::Result<_, _>>()?;
+            for a in &mut out {
+                let name = Path::new(&a.archive_path).file_name().unwrap_or_default().to_string_lossy().into_owned();
+                a.referenced = counts.get(&name).copied().unwrap_or(0);
+            }
+        }
+        let mut q = self.conn.prepare(&format!(
+            "SELECT e.id, a.id, e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256
+             FROM entries e JOIN archives a ON a.id = e.archive_id
+             JOIN (SELECT e2.blake3 AS b, e2.size AS s FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
+                   WHERE {COPY} GROUP BY e2.blake3, e2.size HAVING COUNT(*) > 1) g ON g.b = e.blake3 AND g.s = e.size
+             WHERE {}
+             ORDER BY e.blake3, e.size, a.created_utc, a.id, e.rel_path",
+            COPY.replace("e2.", "e.").replace("a2.", "a.")
+        ))?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? as u64,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let at: std::collections::HashMap<i64, usize> = out.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+        let mut original: Option<(String, u64, i64, i64, String)> = None;
+        for row in rows {
+            let (entry_id, archive_id, rel_path, size, modified_utc, blake3, sha256) = row?;
+            let Some(&i) = at.get(&archive_id) else { continue };
+            match &original {
+                Some((b, s, ..)) if *b == blake3 && *s == size => {}
+                _ => {
+                    out[i].originals += 1;
+                    original = Some((blake3, size, entry_id, archive_id, rel_path));
+                    continue;
+                }
+            }
+            let (_, _, original_entry_id, original_archive_id, original_path) = original.clone().unwrap();
+            let original_archive = out[at[&original_archive_id]].name.clone();
+            out[i].leaves.push(TreeLeaf {
+                entry_id,
+                rel_path,
+                size,
+                modified_utc,
+                blake3,
+                sha256,
+                original_entry_id,
+                original_archive_id,
+                original_archive,
+                original_path,
+            });
+        }
+        for a in &mut out {
+            a.leaves.sort_by(|x, y| x.rel_path.cmp(&y.rel_path));
+        }
+        Ok(out)
+    }
+
+    /// Catalogued file `entry_id` as a duplicate to replace, with its
+    /// original, if it is a later copy of a file kept elsewhere.
+    pub fn dedupe_leaf(&self, entry_id: i64) -> Result<Option<DedupeLeaf>> {
+        let Some((size, blake3)) = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT e.size, e.blake3 FROM entries e JOIN archives a ON a.id = e.archive_id WHERE e.id = ?1 AND {}",
+                    COPY.replace("e2.", "e.").replace("a2.", "a.")
+                ),
+                params![entry_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        // The oldest copy is the original.
+        let first: i64 = self.conn.query_row(
+            &format!("SELECT e2.id FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
+              WHERE e2.blake3 = ?1 AND e2.size = ?2 AND {COPY} ORDER BY a2.created_utc, a2.id, e2.rel_path LIMIT 1"),
+            params![blake3, size],
+            |r| r.get(0),
+        )?;
+        if first == entry_id {
+            return Ok(None);
+        }
+        let row = |id: i64| {
+            self.conn.query_row(
+                "SELECT a.id, a.name, a.archive_path, a.created_utc, e.rel_path, e.size, e.modified_utc, e.created_utc, e.blake3, e.sha256, e.method
+                 FROM entries e JOIN archives a ON a.id = e.archive_id WHERE e.id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        PathBuf::from(r.get::<_, String>(2)?),
+                        r.get::<_, String>(3)?,
+                        EntryRecord {
+                            rel_path: r.get(4)?,
+                            is_dir: false,
+                            size: r.get::<_, i64>(5)? as u64,
+                            modified_utc: r.get(6)?,
+                            created_utc: r.get(7)?,
+                            blake3: r.get(8)?,
+                            sha256: r.get(9)?,
+                            method: r.get(10)?,
+                        },
+                    ))
+                },
+            )
+        };
+        let (archive_id, archive_name, archive_path, archive_created, entry) = row(entry_id)?;
+        let (_, _, original_archive_path, _, original) = row(first)?;
+        Ok(Some(DedupeLeaf {
+            archive_id,
+            archive_name,
+            archive_path,
+            archive_created,
+            entry,
+            original_archive_path,
+            original_path: original.rel_path,
+        }))
     }
 
     /// Where catalogued file `entry_id` is: its archive and path inside it.
@@ -480,7 +716,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)
@@ -571,7 +807,7 @@ impl Catalog {
             let mut q = self.conn.prepare(
                 "SELECT e.blake3, e.size, COUNT(*) AS n
                  FROM entries e JOIN archives a ON a.id = e.archive_id
-                 WHERE e.kind = 'file' AND e.size > 0 AND e.blake3 IS NOT NULL AND a.status = 'verified'
+                 WHERE e.kind = 'file' AND e.size > 0 AND e.blake3 IS NOT NULL AND a.status = 'verified' AND e.method != 'dep'
                  GROUP BY e.blake3, e.size HAVING n > 1
                  ORDER BY e.size * (n - 1) DESC
                  LIMIT ?1",
@@ -587,7 +823,7 @@ impl Catalog {
         let mut q = self.conn.prepare(
             "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256, 0
              FROM entries e JOIN archives a ON a.id = e.archive_id
-             WHERE e.blake3 = ?1 AND e.size = ?2 AND e.kind = 'file' AND a.status = 'verified'
+             WHERE e.blake3 = ?1 AND e.size = ?2 AND e.kind = 'file' AND a.status = 'verified' AND e.method != 'dep'
              ORDER BY a.name, e.rel_path",
         )?;
         for g in &mut groups {
@@ -596,6 +832,60 @@ impl Catalog {
         }
         Ok(groups)
     }
+}
+
+/// The conditions for a file to count as a copy in the duplicates tree:
+/// a file with content and a hash, not a reference file, in a verified
+/// archive that isn't a set-aside archive.
+const COPY: &str = "e2.kind = 'file' AND e2.size > 0 AND e2.blake3 IS NOT NULL AND e2.method != 'dep'
+     AND a2.status = 'verified' AND a2.source_path NOT LIKE '%|excluded'";
+
+/// An archive in the duplicates tree.
+#[derive(Clone, Debug)]
+pub struct TreeArchive {
+    pub id: i64,
+    pub name: String,
+    pub archive_path: String,
+    pub source_path: String,
+    pub created_utc: String,
+    pub file_count: u64,
+    /// A set-aside archive, whose files are never originals or leaves.
+    pub set_aside: bool,
+    /// Files already replaced by reference files.
+    pub replaced: u64,
+    /// Files here that reference files in other archives point to.
+    pub referenced: u64,
+    /// Files whose oldest copy is in this archive.
+    pub originals: u64,
+    /// Later copies in this archive, by path.
+    pub leaves: Vec<TreeLeaf>,
+}
+
+/// A later copy of a file, and the original it duplicates.
+#[derive(Clone, Debug)]
+pub struct TreeLeaf {
+    pub entry_id: i64,
+    pub rel_path: String,
+    pub size: u64,
+    pub modified_utc: Option<String>,
+    pub blake3: String,
+    pub sha256: Option<String>,
+    pub original_entry_id: i64,
+    pub original_archive_id: i64,
+    pub original_archive: String,
+    pub original_path: String,
+}
+
+/// A duplicate to replace, as [`crate::archive::replace_duplicates`] needs it.
+#[derive(Clone, Debug)]
+pub struct DedupeLeaf {
+    pub archive_id: i64,
+    pub archive_name: String,
+    pub archive_path: PathBuf,
+    pub archive_created: String,
+    pub entry: EntryRecord,
+    pub original_archive_path: PathBuf,
+    pub original_path: String,
 }
 
 /// An archive as the catalogue screen lists it.
