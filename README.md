@@ -36,8 +36,9 @@ catalogue and verified-delete engine comes from foldarc, which is now part of At
 - [x] Duplicates: replace later copies with `.atticarcdep` references to the oldest copy, and put them back.
 - [ ] Archive breakdown screen (pie / treemap of an archive's contents).
 - [ ] MD5 as an optional hash for compatibility with the older tool.
-- [ ] Skip locked files instead of failing the folder; free-space check before archiving.
-- [ ] Hash the size-collision candidates from `atticarc-cli scan` before archiving.
+- [x] Free-space check before archiving and before rewriting an archive (worst case: nothing compresses).
+- [ ] Skip locked files instead of failing the folder.
+- [x] Hash the size-collision candidates from `atticarc-cli scan` before archiving (`scan --hash`).
 - [ ] EXE version info in the catalogue.
 - [ ] Macrium Reflect image reader: mount `.mrimg` files read-only and catalogue their contents to prune the NAS image collection.
 
@@ -123,12 +124,30 @@ Settings are kept in `%APPDATA%\atticarc\settings.json`; settings saved by earli
 
 ```
 atticarc-cli scan <folder> [--top N]                  Possible duplicates by size, without reading files
+        [--hash] [--csv FILE]                         Then confirm them by BLAKE3; list them in a CSV
 atticarc-cli archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
 atticarc-cli search <words> [--out DIR]               Search the catalogue
 atticarc-cli rebuild [--out DIR]                      Add archives missing from the catalogue
 atticarc-cli soak --work DIR [--hours H] [--gb G] [--source FOLDER]   Robustness test (below)
 atticarc-cli watch [atticarc|PID] [--every S]         Log the window's memory until it exits
 ```
+
+### Confirming duplicates before archiving
+
+`scan --hash` hashes only the files that share a size with another file. Files over 64 KiB are
+first compared by a hash of their first 64 KiB, and only those still matching are read in full,
+so most same-size files that differ cost one small read. It prints the confirmed groups and the
+space keeping one copy of each would free; `--csv FILE` writes every confirmed file as
+`group,size,blake3,path`. Files that can't be read, or changed since the scan, are reported and
+left out rather than stopping the run. Nothing is changed on disk.
+
+### Free space
+
+Before a folder is archived, its destination must have room for the archive (and the set-aside
+archive) as if nothing compressed, plus 1% and a 256 MB margin; otherwise that folder fails with a
+not-enough-space message before anything is written, and the job moves on to the next. Putting
+files back and replacing duplicates check the same way for the unpacked archive plus its new copy.
+The GUI log and `atticarc-cli archive` also warn up front when the whole selection may not fit.
 
 ### Robustness testing
 

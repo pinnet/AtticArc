@@ -3,7 +3,7 @@
 //! The pipeline, in order:
 //! 1. [`scan`]: walk a source folder and record path, size and modified time (fast, no file reads).
 //! 2. Size collisions from the scan pick out the only files that *can* be duplicates.
-//! 3. [`archive`]: compress each top-level folder to its own .7z (sevenz-turbo, LZMA2),
+//! 3. [`archive`]: check the destination has room ([`disk`]), then compress each top-level folder to its own .7z (sevenz-turbo, LZMA2),
 //!    hashing every file (BLAKE3 and SHA-256) as it is read, then decode the archive and
 //!    check every hash before it counts as done. Files matching the [`exclude`] rules
 //!    are left out.
@@ -15,6 +15,7 @@
 
 pub mod archive;
 pub mod catalog;
+pub mod disk;
 pub mod exclude;
 pub mod scan;
 pub mod settings;
