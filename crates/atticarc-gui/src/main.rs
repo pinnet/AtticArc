@@ -78,6 +78,8 @@ pub struct App {
     source_dir: PathBuf,
     out_dir_text: String,
     protected_text: String,
+    /// When a folder dialog last closed, so its stray clicks can be ignored.
+    picker_closed: Option<std::time::Instant>,
     jobs: Jobs,
     catalogue: catalogue::State,
     duplicates: duplicates::State,
@@ -100,6 +102,7 @@ impl App {
             source_dir,
             out_dir_text: out_dir.display().to_string(),
             protected_text,
+            picker_closed: None,
             jobs: Jobs::new(),
             catalogue: catalogue::State::default(),
             duplicates: duplicates::State::default(),
