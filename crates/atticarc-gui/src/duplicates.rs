@@ -159,7 +159,7 @@ impl App {
             }
         }
         if st.min_mb == 0.0 && !st.min_on {
-            st.min_mb = 1.0;
+            st.min_mb = 200.0;
         }
         if !st.loaded {
             st.loaded = true;
@@ -705,7 +705,7 @@ fn size_limit(ui: &mut egui::Ui, st: &mut State) {
                 .on_hover_text("Smaller copies stay as they are; only copies this big or bigger are replaced");
         },
         &|ui, st| {
-            ui.add_enabled(st.min_on, egui::DragValue::new(&mut st.min_mb).range(0.0..=100_000.0).speed(0.1).max_decimals(1).suffix(" MB"));
+            ui.add_enabled(st.min_on, egui::DragValue::new(&mut st.min_mb).range(0.0..=100_000.0).speed(1.0).max_decimals(1).suffix(" MB"));
         },
     ];
     if rtl {

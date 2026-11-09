@@ -94,7 +94,7 @@ Starts on the given source folder (or the last one used).
   (same size and BLAKE3 hash) is the original and always stays; every later copy is a leaf under its
   archive, shown with its full path and the archive and path of its original. The left pane shows the
   details of what is selected. **Replace duplicates…** opens the list of every copy, all ticked: untick
-  any to leave them as they are, or tick **Only copies of at least … MB** (1 MB to start) to leave smaller
+  any to leave them as they are, or tick **Only copies of at least … MB** (200 MB to start; type or drag any size) to leave smaller
   copies alone. **Preview (dry run)** decodes every original from its archive and checks
   its hash, changing nothing. **Replace** runs the same check (nothing changes if any original fails),
   then works through the archives oldest first: each is unpacked, every ticked copy is checked against
