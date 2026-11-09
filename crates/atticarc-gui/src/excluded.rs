@@ -45,6 +45,8 @@ struct Request {
     name: String,
     keep: Vec<String>,
     discard_rest: bool,
+    /// Only move an older archive's set-aside archive inside it.
+    move_inside: bool,
     /// Set-aside files that will be discarded.
     rest: usize,
     folder_gone: bool,
@@ -64,7 +66,11 @@ impl State {
         let progress = Arc::new(archive::Progress::default());
         let p = progress.clone();
         std::thread::spawn(move || {
-            let res = archive::restore_excluded(&r.archive, &r.keep, r.discard_rest, &settings, &p);
+            let res = if r.move_inside {
+                archive::move_aside_inside(&r.archive, &settings, &p)
+            } else {
+                archive::restore_excluded(&r.archive, &r.keep, r.discard_rest, &settings, &p)
+            };
             let _ = tx.send(res.map_err(|e| format!("{e:#}")));
         });
         self.ticked.retain(|(id, _)| *id != r.archive_id);
@@ -85,12 +91,19 @@ impl App {
         {
             st.note = Some(match res {
                 Ok(r) => {
-                    let mut t = format!("{}: put back {} and verified the archive.", run.name, files(r.put_back));
+                    let mut t = if r.put_back == 0 && r.discarded == 0 {
+                        format!("{}: rewrote and verified the archive.", run.name)
+                    } else {
+                        format!("{}: put back {} and verified the archive.", run.name, files(r.put_back))
+                    };
+                    if r.moved_inside {
+                        t.push_str(" The set-aside archive beside it is now inside it.");
+                    }
                     if r.discarded > 0 {
                         t.push_str(&format!(" {} moved to discarded.", files(r.discarded)));
                     }
                     if r.aside_removed {
-                        t.push_str(" The set-aside archive was emptied and removed.");
+                        t.push_str(" No set-aside files are left.");
                     }
                     (true, t)
                 }
@@ -127,8 +140,8 @@ impl App {
         heading(
             ui,
             "Excluded",
-            "Archived folders whose exclusions left files out. Set-aside files are kept in a second archive; \
-             discarded files are kept nowhere. A folder can be deleted once every file in it is accounted for.",
+            "Archived folders whose exclusions left files out. Set-aside files are kept in an archive of their own \
+             inside the main one; discarded files are kept nowhere. A folder can be deleted once every file in it is accounted for.",
         );
         if let Some(e) = &st.error {
             ui.colored_label(theme::danger(), e);
@@ -167,8 +180,12 @@ impl App {
                     ui.add_space(4.0);
                     let total = |v: &[(String, u64)]| human(v.iter().map(|x| x.1).sum());
                     if !f.set_aside.is_empty() {
-                        let name = f.aside_archive.as_ref().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy();
-                        ui.label(format!("{} set aside ({}) in {name}", files(f.set_aside.len()), total(&f.set_aside)));
+                        let place = match &f.aside_archive {
+                            _ if f.aside_inside => format!("inside the archive, in {}", archive::EXCLUDED_ENTRY),
+                            Some(p) => format!("in {}, beside the archive", p.file_name().unwrap_or_default().to_string_lossy()),
+                            None => "in a set-aside archive".into(),
+                        };
+                        ui.label(format!("{} set aside ({}) {place}", files(f.set_aside.len()), total(&f.set_aside)));
                     }
                     if !f.discarded.is_empty() {
                         ui.label(
@@ -185,6 +202,26 @@ impl App {
                             && ui.button("Browse the set-aside archive").clicked()
                         {
                             browse = Some(*id);
+                        }
+                        if let Some(p) = f.aside_archive.as_ref().filter(|p| !f.aside_inside && p.is_file()) {
+                            let b = ui
+                                .add_enabled(!busy && running.is_none(), egui::Button::new("Move it inside the archive"))
+                                .on_hover_text(format!(
+                                    "Puts {} inside the main archive, verifies it, then deletes the one beside it",
+                                    p.file_name().unwrap_or_default().to_string_lossy()
+                                ));
+                            if b.clicked() {
+                                request = Some(Request {
+                                    archive_id: f.archive.archive_id,
+                                    archive: f.archive.archive_path.clone(),
+                                    name: f.name.clone(),
+                                    keep: Vec::new(),
+                                    discard_rest: false,
+                                    move_inside: true,
+                                    rest: 0,
+                                    folder_gone: false,
+                                });
+                            }
                         }
                         let can_delete = f.source_deleted_utc.is_none() && f.source.is_dir();
                         if can_delete {
@@ -250,6 +287,7 @@ impl App {
                             name: f.name.clone(),
                             keep: keep.clone(),
                             discard_rest,
+                            move_inside: false,
                             rest,
                             folder_gone: !folder_there,
                         };
@@ -312,7 +350,7 @@ fn confirm_discard(ctx: &egui::Context, st: &mut State, settings: &archive::Sett
             text.push_str(&format!("{} go back into the main archive. ", files(r.keep.len())));
         }
         text.push_str(&format!(
-            "The other {} set aside are moved to the discarded list and the set-aside archive is deleted, \
+            "The other {} set aside are moved to the discarded list and taken out of the archive, \
              so they are kept nowhere. ",
             files(r.rest)
         ));

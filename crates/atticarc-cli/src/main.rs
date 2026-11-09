@@ -214,8 +214,8 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 let names = |v: &[atticarc_core::catalog::EntryRecord]| {
                     v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ")
                 };
-                if let Some(a) = &o.excluded.set_aside_archive {
-                    println!("  set aside in {a}: {}", names(&o.excluded.set_aside));
+                if !o.excluded.set_aside.is_empty() {
+                    println!("  set aside inside the archive ({}): {}", archive::EXCLUDED_ENTRY, names(&o.excluded.set_aside));
                 }
                 if !o.excluded.discarded.is_empty() {
                     println!("  discarded: {}", names(&o.excluded.discarded));
