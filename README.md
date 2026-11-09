@@ -61,7 +61,8 @@ Starts on the given source folder (or the last one used).
 - **New job**: source and destination, compression level, threads, store mode and protected folders.
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
-  **X** that starts the check-then-delete flow.
+  **X** that starts the check-then-delete flow. While the folder is being deleted, a window with a
+  spinner and the time so far stays up until it's done.
 - **New job → Exclusions**: rules for files to leave out of the main archive, each ticked on or off.
   A *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a
   folder, `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is
