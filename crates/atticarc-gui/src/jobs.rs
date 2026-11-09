@@ -46,6 +46,8 @@ pub enum Dialog {
     ConfirmDelete(PathBuf),
     Checking(PathBuf),
     CheckPassed(PathBuf, DeleteCheck),
+    /// The delete is running; it can't be cancelled once started.
+    Deleting(PathBuf, Instant),
     Message(String, String),
 }
 
@@ -453,6 +455,10 @@ impl Jobs {
             return;
         }
         self.task = Some(Task { progress: Arc::new(Progress::default()) });
+        // Stays up, with a spinner, until the delete finishes: a big folder on
+        // a USB disk can take a minute or more, and Explorer shows it going
+        // away bit by bit until then.
+        self.dialog = Some(Dialog::Deleting(path.clone(), Instant::now()));
         let tx = self.tx.clone();
         let out_dir = settings.out_dir.clone();
         std::thread::spawn(move || {
@@ -554,6 +560,18 @@ impl Jobs {
                             keep = false;
                         }
                     });
+                }
+                Dialog::Deleting(p, started) => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(22.0));
+                        ui.heading("Deleting…");
+                    });
+                    ui.label(RichText::new(p.display().to_string()).monospace());
+                    ui.add_space(6.0);
+                    ui.label(format!("Still deleting after {}. This can take a while for a large folder.", crate::duration(started.elapsed().as_secs_f64())));
+                    ui.label(
+                        RichText::new("Leave the drive connected and AtticARC open until this says it's done.").color(theme::muted()),
+                    );
                 }
                 Dialog::Message(title, body) => {
                     ui.heading(title);
