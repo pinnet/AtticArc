@@ -14,4 +14,5 @@ atticarc-core = { path = "../atticarc-core" }
 anyhow = "1.0.104"
 mimalloc = "0.1.52"
 eframe = "0.37.0"
+raw-window-handle = "0.6.2"
 rfd = "0.17.2"

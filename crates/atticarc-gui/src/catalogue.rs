@@ -455,7 +455,7 @@ fn reference_body(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replac
     ui.horizontal_wrapped(|ui| {
         let tip = "Follows the reference: extracts the original under this file's name and checks its hash";
         if ui.add_enabled(idle && there, primary_button("Extract the original to…")).on_hover_text(tip).clicked()
-            && let Some(dest) = rfd::FileDialog::new().pick_folder()
+            && let Some(dest) = crate::dialog::pick_folder("Choose where to extract to", None)
         {
             let (tx, rx) = channel();
             let (out, d) = (out.to_path_buf(), dep.clone());
@@ -622,7 +622,7 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, out: &Path, setting
         let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
         let can = archive_path.as_ref().is_some_and(|p| p.is_file()) && st.extracting.is_none();
         if ui.add_enabled(can, primary_button("Extract to…")).clicked()
-            && let (Some(dest), Some(arch)) = (rfd::FileDialog::new().pick_folder(), archive_path) {
+            && let (Some(dest), Some(arch)) = (crate::dialog::pick_folder("Choose where to extract to", None), archive_path) {
                 let (tx, rx) = channel();
                 let rel = f.rel_path.clone();
                 std::thread::spawn(move || {

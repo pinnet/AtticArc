@@ -7,6 +7,7 @@
 
 mod browse;
 mod catalogue;
+mod dialog;
 mod duplicates;
 mod excluded;
 mod jobs;
@@ -179,7 +180,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        dialog::set_parent(frame);
         let out = self.out_dir();
         let finished_batch = self.jobs.handle_messages(&out);
         if std::mem::take(&mut self.catalogue.changed) {

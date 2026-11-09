@@ -310,10 +310,10 @@ fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
 /// How long the folder buttons ignore clicks after a folder dialog closes.
 const PICKER_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// A folder dialog with a title saying which folder it is for. Notes when it
-/// closed, so stray clicks from it can be ignored.
+/// A modal folder dialog with a title saying which folder it is for. Notes
+/// when it closed, so a stray click as it closes can be ignored too.
 fn pick_folder(title: &str, start: &std::path::Path, closed: &mut Option<std::time::Instant>) -> Option<std::path::PathBuf> {
-    let picked = rfd::FileDialog::new().set_title(title).set_directory(start).pick_folder();
+    let picked = crate::dialog::pick_folder(title, Some(start));
     *closed = Some(std::time::Instant::now());
     picked
 }
