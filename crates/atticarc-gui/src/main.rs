@@ -90,7 +90,12 @@ pub struct App {
 impl App {
     fn new(arg_dir: Option<PathBuf>) -> Self {
         let saved = settings::load();
+        // The folder given on the command line, else the last one used, else
+        // the most recent one still there (the last may be on a drive that
+        // isn't plugged in).
         let source_dir = arg_dir
+            .or_else(|| saved.source_dir.clone().filter(|p| p.is_dir()))
+            .or_else(|| saved.recent_sources.iter().find(|p| p.is_dir()).cloned())
             .or_else(|| saved.source_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
@@ -126,6 +131,8 @@ impl App {
     fn save(&mut self) {
         self.saved.source_dir = Some(self.source_dir.clone());
         self.saved.out_dir = Some(self.out_dir());
+        settings::remember(&mut self.saved.recent_sources, &self.source_dir);
+        settings::remember(&mut self.saved.recent_dests, &self.out_dir());
         self.saved.protected =
             self.protected_text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect();
         settings::store(&self.saved);

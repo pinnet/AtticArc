@@ -65,11 +65,17 @@ impl App {
                 ui.label(caption("Source"));
                 ui.label(RichText::new(self.source_dir.display().to_string()).monospace().size(17.0).color(theme::ink()));
                 ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
-                if ui.add_enabled(!settling, egui::Button::new("Change source…")).clicked()
-                    && let Some(p) = pick_folder("Choose the SOURCE folder (the one whose subfolders get archived)", &self.source_dir, &mut self.picker_closed) {
-                        self.source_dir = atticarc_core::settings::strip_verbatim(&p);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!settling, egui::Button::new("Change source…")).clicked()
+                        && let Some(p) = pick_folder("Choose the SOURCE folder (the one whose subfolders get archived)", &self.source_dir, &mut self.picker_closed) {
+                            self.source_dir = atticarc_core::settings::strip_verbatim(&p);
+                            changed = true;
+                        }
+                    if let Some(p) = recent_menu(ui, !settling, &self.saved.recent_sources, &self.source_dir, true) {
+                        self.source_dir = p;
                         changed = true;
                     }
+                });
             });
             card(&mut cols[1], |ui| {
                 ui.label(caption("Destination"));
@@ -88,11 +94,18 @@ impl App {
                             .color(theme::danger()),
                     );
                 }
-                if ui.add_enabled(!settling, egui::Button::new("Change destination…")).clicked()
-                    && let Some(p) = pick_folder("Choose the DESTINATION folder (where the archives go)", &nearest_existing(&self.out_dir()), &mut self.picker_closed) {
-                        self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!settling, egui::Button::new("Change destination…")).clicked()
+                        && let Some(p) = pick_folder("Choose the DESTINATION folder (where the archives go)", &nearest_existing(&self.out_dir()), &mut self.picker_closed) {
+                            self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
+                            changed = true;
+                        }
+                    let current = self.out_dir();
+                    if let Some(p) = recent_menu(ui, !settling, &self.saved.recent_dests, &current, false) {
+                        self.out_dir_text = p.display().to_string();
                         changed = true;
                     }
+                });
             });
         });
         if let Some(problem) = overlap(&self.source_dir, &self.out_dir()) {
@@ -305,6 +318,49 @@ fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
             rules.push(Rule::default());
         }
     });
+}
+
+/// A "Recent" menu of folders used before, leaving out `current`. Returns the
+/// one picked. With `must_exist`, folders that aren't there now (a drive
+/// unplugged, a folder deleted) are listed but greyed out. Hidden when there
+/// is nothing to list.
+fn recent_menu(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    recent: &[std::path::PathBuf],
+    current: &std::path::Path,
+    must_exist: bool,
+) -> Option<std::path::PathBuf> {
+    let others: Vec<&std::path::PathBuf> = recent.iter().filter(|p| !same_folder(p, current)).collect();
+    if others.is_empty() {
+        return None;
+    }
+    let mut picked = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.menu_button("Recent ▾", |ui| {
+            for p in others {
+                let there = !must_exist || p.is_dir();
+                let label = RichText::new(p.display().to_string()).monospace();
+                let resp = ui.add_enabled(there, egui::Button::new(label));
+                if resp.clicked() {
+                    picked = Some(p.clone());
+                    ui.close();
+                }
+                if !there {
+                    resp.on_disabled_hover_text("Not there now: is the drive plugged in?");
+                }
+            }
+        });
+    });
+    picked
+}
+
+/// Whether `a` and `b` are the same folder, ignoring case and `\\?\`.
+fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        atticarc_core::settings::strip_verbatim(p).to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    };
+    norm(a) == norm(b)
 }
 
 /// How long the folder buttons ignore clicks after a folder dialog closes.
