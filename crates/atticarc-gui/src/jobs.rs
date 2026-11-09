@@ -520,6 +520,9 @@ impl Jobs {
                         ui.add_space(6.0);
                         let name = a.file_name().unwrap_or_default().to_string_lossy();
                         ui.label(format!("Files the exclusions set aside are safe in {name}, which was checked too."));
+                    } else if c.set_aside_inside {
+                        ui.add_space(6.0);
+                        ui.label("Files the exclusions set aside are safe in the archive inside it, which was unpacked and checked too.");
                     }
                     if !c.discarded.is_empty() {
                         ui.add_space(6.0);

@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 -- Files the exclusions left out of an archive: set aside in a second
--- archive (aside_archive is its file name) or discarded.
+-- archive (aside_archive is its file name beside the main archive, or
+-- .atticarc/excluded.7z when it is inside) or discarded.
 CREATE TABLE IF NOT EXISTS excluded (
     archive_id      INTEGER NOT NULL REFERENCES archives(id),
     rel_path        TEXT NOT NULL,
@@ -362,8 +363,10 @@ impl Catalog {
             let mut q = tx.prepare(
                 "INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
+            // The archive beside (older archives), or the one inside.
+            let aside = ex.set_aside_archive.as_deref().or(ex.set_aside_inside.as_ref().map(|_| crate::archive::EXCLUDED_ENTRY));
             for e in &ex.set_aside {
-                q.execute(params![archive_id, e.rel_path, e.size as i64, "set_aside", ex.set_aside_archive])?;
+                q.execute(params![archive_id, e.rel_path, e.size as i64, "set_aside", aside])?;
             }
             for e in &ex.discarded {
                 q.execute(params![archive_id, e.rel_path, e.size as i64, "discard", Option::<String>::None])?;
@@ -410,6 +413,7 @@ impl Catalog {
                     source: PathBuf::from(r.get::<_, String>(3)?),
                     source_deleted_utc: r.get(6)?,
                     aside_archive: None,
+                    aside_inside: false,
                     set_aside: Vec::new(),
                     discarded: Vec::new(),
                 })
@@ -428,7 +432,9 @@ impl Catalog {
                     f.discarded.push((rel, size));
                 } else {
                     f.set_aside.push((rel, size));
-                    if f.aside_archive.is_none() {
+                    if aside.as_deref() == Some(crate::archive::EXCLUDED_ENTRY) {
+                        f.aside_inside = true;
+                    } else if f.aside_archive.is_none() {
                         f.aside_archive = aside.map(|n| f.archive.archive_path.with_file_name(n));
                     }
                 }
@@ -981,8 +987,11 @@ pub struct ExcludedFolder {
     /// The folder that was archived, as spelled on disk.
     pub source: PathBuf,
     pub source_deleted_utc: Option<String>,
-    /// The second archive holding the set-aside files.
+    /// The second archive beside the main one holding the set-aside files,
+    /// for archives made before those went inside.
     pub aside_archive: Option<PathBuf>,
+    /// Whether the set-aside files are in an archive inside the main one.
+    pub aside_inside: bool,
     /// (path inside the folder, size) of each set-aside file.
     pub set_aside: Vec<(String, u64)>,
     /// (path inside the folder, size) of each discarded file.

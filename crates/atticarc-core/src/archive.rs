@@ -33,6 +33,10 @@ use crate::exclude::{Action, Exclusions, Rule};
 /// catalogue can be rebuilt from it.
 pub const MANIFEST_ENTRY: &str = ".atticarc/manifest.json";
 
+/// Where the archive of set-aside files goes inside the main archive, so
+/// the destination holds one archive per folder.
+pub const EXCLUDED_ENTRY: &str = ".atticarc/excluded.7z";
+
 /// What an archive's manifest holds. Written inside the archive before it
 /// is finished, so `archive.archive_path` and `archive.archive_bytes` are
 /// empty there; [`read_manifest`] fills them in.
@@ -49,8 +53,14 @@ pub struct Manifest {
 /// can still be checked before it is deleted.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Excluded {
-    /// File name of the archive beside this one holding the set-aside files.
+    /// File name of the archive beside this one holding the set-aside
+    /// files. Only archives made before the set-aside files went inside
+    /// have one.
     pub set_aside_archive: Option<String>,
+    /// The archive of set-aside files kept inside this one, stored without
+    /// compressing it again at [`EXCLUDED_ENTRY`], with its size and hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_aside_inside: Option<EntryRecord>,
     pub set_aside: Vec<EntryRecord>,
     /// Files archived nowhere, deleted with the folder.
     pub discarded: Vec<EntryRecord>,
@@ -362,9 +372,9 @@ pub struct ArchiveOutcome {
 
 /// Archives `source` into `settings.out_dir`, verifies the archive by
 /// decoding it, and only then records it in the catalog. Files the
-/// exclusions set aside go into a second archive, `<name>.excluded.7z`,
-/// verified the same way; discarded files are hashed and listed in the
-/// main archive's manifest.
+/// exclusions set aside go into an archive of their own, verified the same
+/// way and then stored inside the main archive at [`EXCLUDED_ENTRY`];
+/// discarded files are hashed and listed in the main archive's manifest.
 pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<ArchiveOutcome> {
     let started = now_utc();
     let exclusions = Exclusions::new(&settings.exclusions).context("an exclusion can't be used")?;
@@ -412,53 +422,51 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     };
     let mut record = record_for(name.clone(), path_key(&source), &scan);
 
-    // The set-aside files, as a scan of their own for the second archive.
+    // The set-aside files, as a scan of their own for the inner archive,
+    // written beside the main archive's partial file until it goes inside.
     let aside_scan = Scan {
         total_bytes: scan.set_aside.iter().map(|f| f.size).sum(),
         files: scan.set_aside.clone(),
         ..Scan::default()
     };
-    let aside_path = (!aside_scan.files.is_empty()).then(|| unique_archive_path(&out_dir, &format!("{name}.excluded")));
-    let aside_partial = aside_path.as_ref().map(|p| PathBuf::from(format!("{}.partial", p.display())));
-    // Kept apart from the main archive's key, so the folder list and the
-    // delete flow only ever find the main archive.
-    let mut aside_record = record_for(format!("{name} (excluded)"), format!("{}|excluded", path_key(&source)), &aside_scan);
+    let aside_partial = (!aside_scan.files.is_empty()).then(|| PathBuf::from(format!("{}.excluded.partial", final_path.display())));
+    let aside_record = record_for(format!("{name} (excluded)"), format!("{}|excluded", path_key(&source)), &aside_scan);
 
-    let result = (|| -> Result<(Written, Excluded, Option<Written>)> {
-        // Both archives must fit, as if nothing compresses, before anything is written.
-        let needed = crate::disk::archive_worst_case(scan.total_bytes)
-            .saturating_add(crate::disk::archive_worst_case(aside_scan.total_bytes));
+    let result = (|| -> Result<(Written, Excluded)> {
+        // Must fit before anything is written, as if nothing compresses. The
+        // set-aside files count twice: their own archive is written first,
+        // then copied inside the main one before it is removed.
+        let aside_worst = crate::disk::archive_worst_case(aside_scan.total_bytes);
+        let needed = crate::disk::archive_worst_case(scan.total_bytes).saturating_add(aside_worst.saturating_mul(2));
         crate::disk::ensure_free(&out_dir, needed, &format!("archiving {name}"))?;
         let mut excluded = Excluded::default();
         if !scan.discarded.is_empty() {
             progress.set_phase("Hashing discarded files", scan.discarded.iter().map(|f| f.size).sum());
             excluded.discarded = scan.discarded.iter().map(|f| hash_record(f, progress)).collect::<Result<_>>()?;
         }
-        let mut aside = None;
-        if let (Some(path), Some(partial)) = (&aside_path, &aside_partial) {
+        if let Some(aside) = &aside_partial {
             progress.set_phase("Compressing set-aside files", aside_scan.total_bytes);
-            let entries = write_archive(&aside_scan, partial, settings, progress, &aside_record, &Excluded::default())?;
+            let entries = write_archive(&aside_scan, aside, settings, progress, &aside_record, &Excluded::default(), None)?;
             progress.set_phase("Verifying set-aside files", aside_scan.total_bytes);
-            verify_archive(partial, &entries, settings.threads, progress)?;
-            excluded.set_aside_archive = path.file_name().map(|n| n.to_string_lossy().into_owned());
-            excluded.set_aside = entries.clone();
-            aside = Some((entries, std::fs::metadata(partial)?.len()));
+            verify_archive(aside, &entries, settings.threads, progress)?;
+            excluded.set_aside = entries;
+            excluded.set_aside_inside = Some(inner_record(aside)?);
         }
         progress.set_phase("Compressing", scan.total_bytes);
-        let entries = write_archive(&scan, &partial, settings, progress, &record, &excluded)?;
+        let entries = write_archive(&scan, &partial, settings, progress, &record, &excluded, aside_partial.as_deref())?;
         progress.set_phase("Verifying", scan.total_bytes);
-        verify_archive(&partial, &entries, settings.threads, progress)?;
+        verify_archive(&partial, &with_inner(&entries, &excluded), settings.threads, progress)?;
         let archive_bytes = std::fs::metadata(&partial)?.len();
-        Ok(((entries, archive_bytes), excluded, aside))
+        Ok(((entries, archive_bytes), excluded))
     })();
+    if let Some(p) = &aside_partial {
+        let _ = std::fs::remove_file(p);
+    }
 
-    let ((entries, archive_bytes), excluded, aside) = match result {
+    let ((entries, archive_bytes), excluded) = match result {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&partial);
-            if let Some(p) = &aside_partial {
-                let _ = std::fs::remove_file(p);
-            }
             if let Ok(cat) = Catalog::open(&out_dir) {
                 let _ = cat.log_run(None, "archive", &source, &started, "failed", &format!("{e:#}"));
             }
@@ -467,12 +475,6 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     };
 
     let mut cat = Catalog::open(&out_dir)?;
-    if let (Some(path), Some(partial), Some((aside_entries, bytes))) = (&aside_path, &aside_partial, aside) {
-        std::fs::rename(partial, path).with_context(|| format!("can't rename {} to {}", partial.display(), path.display()))?;
-        aside_record.archive_path = crate::settings::strip_verbatim(path).to_string_lossy().into_owned();
-        aside_record.archive_bytes = bytes;
-        cat.insert_archive(&aside_record, &aside_entries)?;
-    }
     std::fs::rename(&partial, &final_path)
         .with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
     record.archive_path = crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned();
@@ -485,8 +487,8 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         detail.push(format!("links not followed: {}", scan.skipped_links.join(", ")));
     }
     let names = |v: &[EntryRecord]| v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ");
-    if let Some(a) = &excluded.set_aside_archive {
-        detail.push(format!("set aside in {a}: {}", names(&excluded.set_aside)));
+    if !excluded.set_aside.is_empty() {
+        detail.push(format!("set aside inside the archive: {}", names(&excluded.set_aside)));
     }
     if !excluded.discarded.is_empty() {
         detail.push(format!("discarded: {}", names(&excluded.discarded)));
@@ -494,6 +496,23 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     let detail = detail.join("; ");
     cat.log_run(Some(archive_id), "archive", &source, &started, "verified", &detail)?;
     Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded })
+}
+
+/// The record of an archive of set-aside files about to go inside the main
+/// archive at [`EXCLUDED_ENTRY`]: its size and hashes, so the main archive's
+/// check covers it byte for byte.
+fn inner_record(path: &Path) -> Result<EntryRecord> {
+    let meta = std::fs::metadata(path).with_context(|| format!("can't read {}", path.display()))?;
+    let f = ScannedFile { abs: path.to_path_buf(), rel: EXCLUDED_ENTRY.into(), size: meta.len(), modified: meta.modified().ok(), created: None };
+    let mut rec = hash_record(&f, &Arc::new(Progress::default()))?;
+    rec.method = "copy".into();
+    Ok(rec)
+}
+
+/// `entries` with the inner archive of set-aside files, if `excluded` has
+/// one: everything a check of the main archive must find.
+fn with_inner(entries: &[EntryRecord], excluded: &Excluded) -> Vec<EntryRecord> {
+    entries.iter().cloned().chain(excluded.set_aside_inside.clone()).collect()
 }
 
 /// Hashes one file that isn't archived, for the manifest.
@@ -609,7 +628,8 @@ fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
 
 /// Writes the archive, with the manifest describing `record` and the files
 /// last in a small block of its own so it can be read without decoding the
-/// rest.
+/// rest. `inner` is the archive of set-aside files to store, uncompressed,
+/// at [`EXCLUDED_ENTRY`]; `excluded.set_aside_inside` must describe it.
 fn write_archive(
     scan: &Scan,
     dest: &Path,
@@ -617,7 +637,11 @@ fn write_archive(
     progress: &Arc<Progress>,
     record: &ArchiveRecord,
     excluded: &Excluded,
+    inner: Option<&Path>,
 ) -> Result<Vec<EntryRecord>> {
+    if inner.is_some() != excluded.set_aside_inside.is_some() {
+        bail!("the set-aside files' archive and its record don't agree");
+    }
     let hashes: Arc<Mutex<Vec<Option<FileHash>>>> = Arc::new(Mutex::new(vec![None; scan.files.len()]));
     let mut w = ArchiveWriter::create(dest).with_context(|| format!("can't create {}", dest.display()))?;
 
@@ -698,6 +722,18 @@ fn write_archive(
     dir.has_last_modified_date = true;
     dir.last_modified_date = now;
     w.push_archive_entry::<File>(dir, None)?;
+    if let (Some(path), Some(rec)) = (inner, &excluded.set_aside_inside) {
+        let f = File::open(path).with_context(|| format!("can't open {}", path.display()))?;
+        if f.metadata()?.len() != rec.size {
+            bail!("the set-aside files' archive changed size before it went inside");
+        }
+        let mut entry = ArchiveEntry::new_file(EXCLUDED_ENTRY);
+        entry.size = rec.size;
+        entry.has_last_modified_date = true;
+        entry.last_modified_date = now;
+        w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+        w.push_archive_entry(entry, Some(f))?;
+    }
     let mut entry = ArchiveEntry::new_file(MANIFEST_ENTRY);
     entry.size = manifest.len() as u64;
     entry.has_last_modified_date = true;
@@ -755,6 +791,19 @@ fn file_records(scan: &Scan, hashes: &[Option<FileHash>], is_store: &dyn Fn(&Sca
 /// Decodes every file in `archive` and checks it against `expected`.
 /// Nothing is written to disk.
 pub fn verify_archive(archive: &Path, expected: &[EntryRecord], threads: u32, progress: &Arc<Progress>) -> Result<u64> {
+    verify_archive_saving(archive, expected, threads, progress, None)
+}
+
+/// [`verify_archive`], also writing the inner archive of set-aside files to
+/// `save_inner` as it is decoded, so it can be checked next without
+/// decoding the main archive again.
+fn verify_archive_saving(
+    archive: &Path,
+    expected: &[EntryRecord],
+    threads: u32,
+    progress: &Arc<Progress>,
+    save_inner: Option<&Path>,
+) -> Result<u64> {
     let want: HashMap<&str, &EntryRecord> =
         expected.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e)).collect();
     let mut seen: HashMap<String, ()> = HashMap::new();
@@ -772,13 +821,18 @@ pub fn verify_archive(archive: &Path, expected: &[EntryRecord], threads: u32, pr
                 let mut bytes = Vec::new();
                 data.read_to_end(&mut bytes)?;
                 match serde_json::from_slice::<Manifest>(&bytes) {
-                    Ok(m) if m.entries.len() == expected.len() => {}
+                    // The inner archive of set-aside files is checked like a file but isn't one of the entries.
+                    Ok(m) if m.entries.len() + usize::from(m.excluded.set_aside_inside.is_some()) == expected.len() => {}
                     _ => problems.push("the manifest in the archive doesn't match the record".into()),
                 }
                 return Ok(true);
             }
             let mut h = blake3::Hasher::new();
             let mut n = 0u64;
+            let mut save = match save_inner.filter(|_| entry.name() == EXCLUDED_ENTRY) {
+                Some(p) => Some(File::create(p)?),
+                None => None,
+            };
             loop {
                 progress.check_cancel()?;
                 let k = data.read(&mut buf)?;
@@ -786,6 +840,9 @@ pub fn verify_archive(archive: &Path, expected: &[EntryRecord], threads: u32, pr
                     break;
                 }
                 h.update(&buf[..k]);
+                if let Some(f) = &mut save {
+                    io::Write::write_all(f, &buf[..k])?;
+                }
                 n += k as u64;
                 progress.done.fetch_add(k as u64, Ordering::Relaxed);
             }
@@ -911,13 +968,17 @@ pub struct Restored {
     pub discarded: usize,
     /// Whether the set-aside archive was emptied and removed.
     pub aside_removed: bool,
+    /// Whether the set-aside archive beside the main one, from an older
+    /// version, was moved inside it.
+    pub moved_inside: bool,
 }
 
 /// Puts files the exclusions left out of `archive` back into it. Set-aside
-/// files come from the set-aside archive; discarded ones from the source
-/// folder, which must still hold them with their recorded hash. With
-/// `discard_rest`, the set-aside files not kept move to the discarded list
-/// and the set-aside archive goes.
+/// files come from the set-aside archive inside it (or, for older archives,
+/// beside it); discarded ones from the source folder, which must still hold
+/// them with their recorded hash. With `discard_rest`, the set-aside files
+/// not kept move to the discarded list and the set-aside archive goes.
+/// An older archive's set-aside archive beside it moves inside.
 ///
 /// The archive is unpacked into a work folder in the catalogue's folder and
 /// written again, then verified, and only then swapped in, so this needs
@@ -930,6 +991,19 @@ pub fn restore_excluded(
     progress: &Arc<Progress>,
 ) -> Result<Restored> {
     rewrite(archive, &Changes { keep, discard_rest, ..Changes::default() }, settings, progress)
+}
+
+/// Moves the set-aside archive beside an older `archive` inside it, so the
+/// destination holds one archive per folder. Its files are checked by
+/// decoding them first; the archive beside is deleted only once the new
+/// main archive is verified.
+pub fn move_aside_inside(archive: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<Restored> {
+    let m = read_manifest(archive)?;
+    match &m.excluded.set_aside_archive {
+        None => bail!("{} has no set-aside archive beside it", archive.display()),
+        Some(n) if !archive.with_file_name(n).is_file() => bail!("{n} isn't beside {}", archive.display()),
+        Some(_) => rewrite(archive, &Changes::default(), settings, progress),
+    }
 }
 
 /// What removing duplicates did.
@@ -1194,24 +1268,38 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
         }
     }
     let out_dir = archive.parent().ok_or_else(|| anyhow!("{} has no folder", archive.display()))?;
+    // Older archives keep their set-aside files in an archive beside them.
+    // Whenever one is rewritten, those files move inside it, unless that
+    // archive has gone missing and isn't needed.
     let aside_path = ex.set_aside_archive.as_ref().map(|n| archive.with_file_name(n));
+    let migrate = aside_path.as_ref().is_some_and(|p| p.is_file());
     let source = PathBuf::from(if m.archive.source_display.is_empty() { &m.archive.source_path } else { &m.archive.source_display });
     let work = out_dir.join(DATA_DIR).join(format!("work-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
     let main_dir = work.join("main");
     let aside_dir = work.join("aside");
 
     let result = (|| -> Result<_> {
-        // Room for the unpacked files (main and set-aside) and the new archive
-        // beside the old one, as if nothing compresses.
-        let unpacked = m.archive.input_bytes.saturating_add(ex.set_aside.iter().map(|e| e.size).sum::<u64>());
-        let needed = unpacked.saturating_add(crate::disk::archive_worst_case(unpacked));
+        // Room for the unpacked files (main and set-aside), a new set-aside
+        // archive and the new main archive beside the old one, as if nothing
+        // compresses.
+        let aside: u64 = ex.set_aside.iter().map(|e| e.size).sum();
+        let unpacked = m.archive.input_bytes.saturating_add(aside);
+        let needed = unpacked
+            .saturating_add(crate::disk::archive_worst_case(unpacked))
+            .saturating_add(crate::disk::archive_worst_case(aside));
         crate::disk::ensure_free(out_dir, needed, &format!("rewriting {}", m.archive.name))?;
         progress.set_phase("Unpacking the archive", m.archive.input_bytes);
+        // This unpacks the inner archive of set-aside files too, still packed.
         extract_all(archive, &main_dir, settings.threads, progress)?;
+        let old_inner = main_dir.join(EXCLUDED_ENTRY);
+        if let Some(rec) = &ex.set_aside_inside {
+            check_hash(&old_inner, rec).context("the set-aside files' archive inside didn't unpack with its recorded hash")?;
+        }
+        let old_aside = if ex.set_aside_inside.is_some() { Some(old_inner.clone()) } else { aside_path.clone() };
         // Only needed when a set-aside file is kept; otherwise the set-aside
         // archive stays as it is or goes whole.
         let takes_aside = keep.iter().any(|r| find(&ex.set_aside, r));
-        if let Some(p) = aside_path.as_ref().filter(|_| takes_aside) {
+        if let Some(p) = old_aside.as_ref().filter(|_| takes_aside) {
             progress.set_phase("Unpacking the set-aside files", ex.set_aside.iter().map(|e| e.size).sum());
             extract_all(p, &aside_dir, settings.threads, progress)?;
         }
@@ -1283,7 +1371,8 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
 
         // What is left out now.
         let mut left = Excluded {
-            set_aside_archive: ex.set_aside_archive.clone(),
+            set_aside_archive: if migrate { None } else { ex.set_aside_archive.clone() },
+            set_aside_inside: None,
             set_aside: ex.set_aside.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
             discarded: ex.discarded.iter().filter(|e| !keep.contains(&e.rel_path)).cloned().collect(),
             duplicates,
@@ -1302,25 +1391,35 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
             left.set_aside_archive = None;
         }
 
-        // The set-aside archive again, without the files taken from it.
-        let mut new_aside = None;
-        if let Some(p) = &aside_path
-            && !left.set_aside.is_empty()
-            && left.set_aside.len() != ex.set_aside.len()
-        {
-            let am = read_manifest(p)?;
-            // Files only, like the set-aside archive first written.
-            let s = Scan { dirs: Vec::new(), ..scan(&aside_dir)? };
-            let mut rec = am.archive.clone();
-            (rec.archive_path, rec.archive_bytes) = (String::new(), 0);
-            (rec.input_bytes, rec.file_count, rec.dir_count) = (s.total_bytes, s.files.len() as u64, s.dirs.len() as u64);
-            let partial = PathBuf::from(format!("{}.partial", p.display()));
-            progress.set_phase("Compressing the set-aside files", s.total_bytes);
-            let entries = write_archive(&s, &partial, settings, progress, &rec, &Excluded::default())?;
-            progress.set_phase("Verifying the set-aside files", s.total_bytes);
-            verify_archive(&partial, &entries, settings.threads, progress)?;
-            left.set_aside = entries.clone();
-            new_aside = Some((partial, rec, entries));
+        // The set-aside files' archive to keep inside: the one there already
+        // or beside, or written again without the files taken from it.
+        let mut inner = None;
+        let kept_aside = !left.set_aside.is_empty() && left.set_aside_archive.is_none();
+        if let Some(old) = old_aside.as_ref().filter(|_| kept_aside) {
+            if left.set_aside.len() == ex.set_aside.len() {
+                if ex.set_aside_inside.is_none() {
+                    progress.set_phase("Checking the set-aside files", ex.set_aside.iter().map(|e| e.size).sum());
+                    verify_archive(old, &ex.set_aside, settings.threads, progress)?;
+                }
+                inner = Some(old.clone());
+            } else {
+                let am = read_manifest(old)?;
+                // Files only, like the set-aside archive first written.
+                let s = Scan { dirs: Vec::new(), ..scan(&aside_dir)? };
+                let mut rec = am.archive.clone();
+                (rec.archive_path, rec.archive_bytes) = (String::new(), 0);
+                (rec.input_bytes, rec.file_count, rec.dir_count) = (s.total_bytes, s.files.len() as u64, s.dirs.len() as u64);
+                let new_inner = work.join("excluded.7z");
+                progress.set_phase("Compressing the set-aside files", s.total_bytes);
+                let entries = write_archive(&s, &new_inner, settings, progress, &rec, &Excluded::default(), None)?;
+                progress.set_phase("Verifying the set-aside files", s.total_bytes);
+                verify_archive(&new_inner, &entries, settings.threads, progress)?;
+                left.set_aside = entries;
+                inner = Some(new_inner);
+            }
+        }
+        if let Some(p) = &inner {
+            left.set_aside_inside = Some(inner_record(p)?);
         }
 
         let s = scan(&main_dir)?;
@@ -1329,50 +1428,43 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
         (rec.input_bytes, rec.file_count, rec.dir_count) = (s.total_bytes, s.files.len() as u64, s.dirs.len() as u64);
         let partial = PathBuf::from(format!("{}.partial", archive.display()));
         progress.set_phase("Compressing", s.total_bytes);
-        let entries = write_archive(&s, &partial, settings, progress, &rec, &left)?;
+        let entries = write_archive(&s, &partial, settings, progress, &rec, &left, inner.as_deref())?;
         progress.set_phase("Verifying", s.total_bytes);
-        verify_archive(&partial, &entries, settings.threads, progress)?;
-        Ok((partial, rec, entries, left, new_aside, moved))
+        verify_archive(&partial, &with_inner(&entries, &left), settings.threads, progress)?;
+        Ok((partial, rec, entries, left, moved))
     })();
     let _ = std::fs::remove_dir_all(&work);
-    let (partial, mut rec, entries, left, new_aside, moved) = match result {
+    let (partial, mut rec, entries, left, moved) = match result {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(format!("{}.partial", archive.display()));
-            if let Some(p) = &aside_path {
-                let _ = std::fs::remove_file(format!("{}.partial", p.display()));
-            }
             return Err(e);
         }
     };
 
-    // Everything is verified: swap the new archives in and update the catalogue.
+    // Everything is verified: swap the new archive in and update the catalogue.
     let mut cat = Catalog::open(out_dir)?;
     let main_id = cat.archive_id_for(archive)?;
     let aside_id = match &aside_path {
         Some(p) => cat.archive_id_for(p)?,
         None => None,
     };
-    if let Some((aside_partial, mut aside_rec, aside_entries)) = new_aside {
-        let p = aside_path.as_ref().unwrap();
-        std::fs::rename(&aside_partial, p).with_context(|| format!("can't replace {}", p.display()))?;
-        aside_rec.archive_bytes = std::fs::metadata(p)?.len();
-        if let Some(id) = aside_id {
-            cat.replace_contents(id, &aside_rec, &aside_entries, &Excluded::default())?;
-        }
-    }
     std::fs::rename(&partial, archive).with_context(|| format!("can't replace {}", archive.display()))?;
     rec.archive_bytes = std::fs::metadata(archive)?.len();
     if let Some(id) = main_id {
         cat.replace_contents(id, &rec, &entries, &left)?;
     }
-    let mut aside_removed = false;
+    // The archive beside goes once its files are inside, or discarded.
+    let had_aside = ex.set_aside_inside.is_some() || ex.set_aside_archive.is_some();
+    let aside_removed = had_aside && left.set_aside.is_empty();
+    let moved_inside = migrate && !left.set_aside.is_empty();
     if let Some(p) = aside_path.as_ref().filter(|_| left.set_aside_archive.is_none()) {
-        std::fs::remove_file(p).with_context(|| format!("can't remove {}", p.display()))?;
+        if p.is_file() {
+            std::fs::remove_file(p).with_context(|| format!("can't remove {}", p.display()))?;
+        }
         if let Some(id) = aside_id {
             cat.remove_archive(id)?;
         }
-        aside_removed = true;
     }
     if let Some(id) = main_id {
         let names = |v: Vec<&str>| v.join(", ");
@@ -1380,6 +1472,8 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
             ("reference", format!("replaced by reference files: {}", names(ch.replace.iter().map(|r| r.entry.rel_path.as_str()).collect())))
         } else if !ch.put_back.is_empty() {
             ("unreference", format!("put back from their originals: {}", ch.put_back.join(", ")))
+        } else if remove.is_empty() && keep.is_empty() && !discard_rest {
+            ("restore", "set-aside files moved inside the archive".to_string())
         } else if remove.is_empty() {
             ("restore", format!("put back: {}", keep.join(", ")))
         } else {
@@ -1387,7 +1481,7 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
         };
         cat.log_run(Some(id), what, &source, &now_utc(), "verified", &detail)?;
     }
-    Ok(Restored { put_back: keep.len(), discarded: moved, aside_removed })
+    Ok(Restored { put_back: keep.len(), discarded: moved, aside_removed, moved_inside })
 }
 
 /// Unpacks every file and folder in `archive` into `dest` except the
@@ -1490,8 +1584,12 @@ pub struct DeleteCheck {
     /// Files that will be deleted without being kept anywhere, because a
     /// discard rule left them out when the folder was archived.
     pub discarded: Vec<EntryRecord>,
-    /// The second archive holding the set-aside files, if there is one.
+    /// The second archive holding the set-aside files, if there is one
+    /// beside the main archive (older archives).
     pub set_aside_archive: Option<PathBuf>,
+    /// Whether the set-aside files are in an archive inside the main one,
+    /// which was unpacked and checked too.
+    pub set_aside_inside: bool,
 }
 
 pub fn is_protected(path: &Path, settings: &Settings) -> bool {
@@ -1526,6 +1624,8 @@ pub fn check_before_delete(
     {
         bail!("{} holds this folder's set-aside files but isn't there", p.display());
     }
+    let out_dir = archive.parent().ok_or_else(|| anyhow!("{} has no folder", archive.display()))?;
+    let check_dir = out_dir.join(DATA_DIR).join(format!("check-{}", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
     let rec_files: BTreeMap<&str, &EntryRecord> = recorded
         .iter()
         .chain(&excluded.set_aside)
@@ -1555,14 +1655,22 @@ pub fn check_before_delete(
     let (folder_result, archive_result) = std::thread::scope(|s| {
         let folder = s.spawn(|| hash_folder_against(&now, &rec_files, progress));
         let arch = s.spawn(|| {
-            verify_archive(archive, recorded, threads, progress)?;
-            match &aside_archive {
-                Some(p) => verify_archive(p, &excluded.set_aside, threads, progress),
-                None => Ok(0),
+            // The archive inside can only be read once it is unpacked, so it
+            // is saved as the main archive is checked, then checked itself.
+            let inner = (aside_archive.is_none() && excluded.set_aside_inside.is_some()).then(|| check_dir.join("excluded.7z"));
+            if inner.is_some() {
+                std::fs::create_dir_all(&check_dir)?;
+            }
+            verify_archive_saving(archive, &with_inner(recorded, &excluded), threads, progress, inner.as_deref())?;
+            match (&aside_archive, &inner) {
+                (Some(p), _) => verify_archive(p, &excluded.set_aside, threads, progress),
+                (None, Some(p)) => verify_archive(p, &excluded.set_aside, threads, progress),
+                (None, None) => Ok(0),
             }
         });
         (folder.join().unwrap(), arch.join().unwrap())
     });
+    let _ = std::fs::remove_dir_all(&check_dir);
     folder_result?;
     archive_result?;
     let discarded = excluded.discarded.iter().filter(|d| now.files.iter().any(|f| f.rel == d.rel_path)).cloned().collect();
@@ -1570,6 +1678,7 @@ pub fn check_before_delete(
         files_checked: now.files.len() as u64,
         bytes_checked: now.total_bytes,
         discarded,
+        set_aside_inside: excluded.set_aside_inside.is_some() && aside_archive.is_none(),
         set_aside_archive: aside_archive,
     })
 }
@@ -1742,8 +1851,16 @@ mod tests {
         assert_eq!(o.record.file_count, 4);
         assert_eq!(o.excluded.discarded.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["sub/Shortcut.LNK"]);
         assert_eq!(o.excluded.set_aside.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["sub/random.dat"]);
-        assert_eq!(o.excluded.set_aside_archive.as_deref(), Some("src.excluded.7z"));
-        let aside = out.join("src.excluded.7z");
+        // The set-aside files are inside the main archive: the destination holds one archive.
+        assert!(o.excluded.set_aside_archive.is_none());
+        let inner = o.excluded.set_aside_inside.clone().expect("set-aside archive inside");
+        assert_eq!((inner.rel_path.as_str(), inner.method.as_str()), (EXCLUDED_ENTRY, "copy"));
+        let names: Vec<String> = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.iter().filter(|n| !n.starts_with('.')).collect::<Vec<_>>(), ["src.7z"], "{names:?}");
+        let dir = tmp.path().join("unpacked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let aside = extract_file(&out.join("src.7z"), EXCLUDED_ENTRY, &dir, 2).unwrap();
+        check_hash(&aside, &inner).unwrap();
         assert_eq!(std::fs::read(src.join("sub/random.dat")).unwrap().len() as u64, read_manifest(&aside).unwrap().entries[0].size);
 
         // The folder list finds the main archive, and the catalogue knows what was left out.
@@ -1752,27 +1869,29 @@ mod tests {
         assert!(!entries.iter().any(|e| e.rel_path.ends_with(".LNK") || e.rel_path.ends_with(".dat")));
         let folders = Catalog::open_existing(&out).unwrap().excluded_folders().unwrap();
         assert_eq!(folders.len(), 1);
-        assert_eq!(folders[0].aside_archive.as_deref(), Some(aside.as_path()));
+        assert!(folders[0].aside_inside);
+        assert!(folders[0].aside_archive.is_none());
         assert_eq!((folders[0].set_aside.len(), folders[0].discarded.len()), (1, 1));
+        assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
 
         // Every file is accounted for, so the folder may go.
         let c = check_before_delete(&src, &a.archive_path, &entries, 2, &Arc::new(Progress::default())).unwrap();
         assert_eq!(c.discarded.len(), 1);
-        assert_eq!(c.set_aside_archive.as_deref(), Some(aside.as_path()));
+        assert!(c.set_aside_inside && c.set_aside_archive.is_none());
+        assert!(std::fs::read_dir(out.join(DATA_DIR)).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("check-")));
         // But not if a discarded file has changed since...
         std::fs::write(src.join("sub/Shortcut.LNK"), b"lunk").unwrap();
         assert!(check_before_delete(&src, &a.archive_path, &entries, 2, &Arc::new(Progress::default())).is_err());
         std::fs::write(src.join("sub/Shortcut.LNK"), b"link").unwrap();
-        // ...or the set-aside archive is gone.
-        std::fs::rename(&aside, out.join("moved.bin")).unwrap();
-        let e = check_before_delete(&src, &a.archive_path, &entries, 2, &Arc::new(Progress::default())).err().unwrap();
-        assert!(format!("{e:#}").contains("set-aside"), "{e:#}");
-        std::fs::rename(out.join("moved.bin"), &aside).unwrap();
+        // ...or the set-aside file has.
+        std::fs::write(src.join("sub/random.dat"), b"changed").unwrap();
+        assert!(check_before_delete(&src, &a.archive_path, &entries, 2, &Arc::new(Progress::default())).is_err());
+        make_tree(&src);
 
-        // Rebuilding brings back both archives and what was left out.
+        // Rebuilding brings back the archive and what was left out.
         Catalog::open_existing(&out).unwrap().clear().unwrap();
         let r = rebuild_catalog(&out).unwrap();
-        assert_eq!(r.added, 2, "{r:?}");
+        assert_eq!(r.added, 1, "{r:?}");
         let cat = Catalog::open_existing(&out).unwrap();
         assert_eq!(cat.excluded_folders().unwrap().len(), 1);
         assert!(cat.archived_folder(&src).unwrap().unwrap().archive_path.ends_with("src.7z"));
@@ -1796,8 +1915,13 @@ mod tests {
         s.exclusions = vec![rule("*.lnk", Action::Discard), rule("*.dat", Action::SetAside), rule("*.tmp", Action::SetAside)];
         archive_folder(&src, &s, &Arc::new(Progress::default())).unwrap();
         let main = out.join("src.7z");
-        let aside = out.join("src.excluded.7z");
         let p = Arc::new(Progress::default());
+        let inner_files = |main: &Path| {
+            let dir = tempfile::tempdir().unwrap();
+            let a = extract_file(main, EXCLUDED_ENTRY, dir.path(), 2).unwrap();
+            read_manifest(&a).unwrap().entries.iter().filter(|e| !e.is_dir).map(|e| e.rel_path.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(inner_files(&main), ["sub/deeper/keep.tmp", "sub/random.dat"]);
 
         // Not a file that was left out.
         assert!(restore_excluded(&main, &["notes.txt".into()], false, &s, &p).is_err());
@@ -1813,8 +1937,9 @@ mod tests {
         assert_eq!(m.archive.file_count, 6);
         assert!(m.excluded.discarded.is_empty());
         assert_eq!(m.excluded.set_aside.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["sub/random.dat"]);
-        let am = read_manifest(&aside).unwrap();
-        assert_eq!(am.entries.iter().filter(|e| !e.is_dir).count(), 1);
+        // The archive inside was written again without the file put back.
+        assert_eq!(inner_files(&main), ["sub/random.dat"]);
+        assert_eq!(m.excluded.set_aside_inside.as_ref().unwrap().rel_path, EXCLUDED_ENTRY);
         let orig = std::fs::metadata(src.join("notes.txt")).unwrap().modified().unwrap();
         assert_eq!(m.entries.iter().find(|e| e.rel_path == "notes.txt").unwrap().modified_utc, utc(Some(orig)));
 
@@ -1825,13 +1950,14 @@ mod tests {
         assert_eq!((folders[0].set_aside.len(), folders[0].discarded.len()), (1, 0));
         check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
 
-        // Discarding the rest removes the set-aside archive.
+        // Discarding the rest takes the set-aside archive out of the main one.
         let r = restore_excluded(&main, &[], true, &s, &p).unwrap();
         assert_eq!((r.put_back, r.discarded, r.aside_removed), (0, 1, true));
-        assert!(!aside.exists());
         let m = read_manifest(&main).unwrap();
         assert_eq!(m.excluded.discarded.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(), ["discard"]);
-        assert!(m.excluded.set_aside_archive.is_none());
+        assert!(m.excluded.set_aside_archive.is_none() && m.excluded.set_aside_inside.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(extract_file(&main, EXCLUDED_ENTRY, dir.path(), 2).is_err());
         let cat = Catalog::open_existing(&out).unwrap();
         assert_eq!(cat.archives().unwrap().len(), 1);
         let (a, entries) = recorded(&out, &src);
@@ -1844,6 +1970,108 @@ mod tests {
         let e = restore_excluded(&main, &["sub/random.dat".into()], false, &s, &p).err().unwrap();
         assert!(format!("{e:#}").contains("no longer has it"), "{e:#}");
         assert!(read_manifest(&main).is_ok());
+    }
+
+    /// Archives `src` the way versions before the set-aside files went
+    /// inside did: those files in `<name>.excluded.7z` beside the main archive.
+    fn archive_with_aside_beside(src: &Path, s: &Settings) -> (PathBuf, PathBuf) {
+        let p = Arc::new(Progress::default());
+        let scan = scan_excluding(src, &Exclusions::new(&s.exclusions).unwrap()).unwrap();
+        std::fs::create_dir_all(&s.out_dir).unwrap();
+        let (main, aside) = (s.out_dir.join("src.7z"), s.out_dir.join("src.excluded.7z"));
+        let record = |name: &str, key: String, sc: &Scan| ArchiveRecord {
+            name: name.into(),
+            archive_path: String::new(),
+            source_path: key,
+            source_display: src.display().to_string(),
+            created_utc: now_utc(),
+            engine: s.engine_label(),
+            level: s.level,
+            threads: s.threads,
+            input_bytes: sc.total_bytes,
+            archive_bytes: 0,
+            file_count: sc.files.len() as u64,
+            dir_count: sc.dirs.len() as u64,
+        };
+        let aside_scan = Scan { total_bytes: scan.set_aside.iter().map(|f| f.size).sum(), files: scan.set_aside.clone(), ..Scan::default() };
+        let mut aside_rec = record("src (excluded)", format!("{}|excluded", path_key(src)), &aside_scan);
+        let aside_entries = write_archive(&aside_scan, &aside, s, &p, &aside_rec, &Excluded::default(), None).unwrap();
+        let ex = Excluded {
+            set_aside_archive: Some("src.excluded.7z".into()),
+            set_aside: aside_entries.clone(),
+            discarded: scan.discarded.iter().map(|f| hash_record(f, &p).unwrap()).collect(),
+            ..Excluded::default()
+        };
+        let mut rec = record("src", path_key(src), &scan);
+        let entries = write_archive(&scan, &main, s, &p, &rec, &ex, None).unwrap();
+        let mut cat = Catalog::open(&s.out_dir).unwrap();
+        aside_rec.archive_path = aside.display().to_string();
+        cat.insert_archive(&aside_rec, &aside_entries).unwrap();
+        rec.archive_path = main.display().to_string();
+        let id = cat.insert_archive(&rec, &entries).unwrap();
+        cat.insert_excluded(id, &ex).unwrap();
+        (main, aside)
+    }
+
+    #[test]
+    fn set_aside_archives_beside_older_archives_still_work_and_move_inside() {
+        use crate::exclude::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = std::fs::canonicalize(tmp.path()).unwrap().join("src");
+        let out = tmp.path().join("out");
+        make_tree(&src);
+        std::fs::write(src.join("sub/deeper/keep.tmp"), b"keep me").unwrap();
+        let mut s = settings(&out, true);
+        s.exclusions = vec![
+            Rule { pattern: "*.dat".into(), action: Action::SetAside, ..Rule::default() },
+            Rule { pattern: "*.tmp".into(), action: Action::SetAside, ..Rule::default() },
+        ];
+        let p = Arc::new(Progress::default());
+        let (main, aside) = archive_with_aside_beside(&src, &s);
+
+        // The check before a delete still reads the archive beside.
+        let (a, entries) = recorded(&out, &src);
+        let c = check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+        assert_eq!(c.set_aside_archive.as_deref(), Some(aside.as_path()));
+        assert!(!c.set_aside_inside);
+        let folders = Catalog::open_existing(&out).unwrap().excluded_folders().unwrap();
+        assert_eq!(folders[0].aside_archive.as_deref(), Some(aside.as_path()));
+        assert!(!folders[0].aside_inside);
+
+        // Putting one back takes it from the archive beside, and the rest move inside.
+        let r = restore_excluded(&main, &["sub/deeper/keep.tmp".into()], false, &s, &p).unwrap();
+        assert!(r.moved_inside && !r.aside_removed, "{r:?}");
+        assert!(!aside.exists());
+        let m = read_manifest(&main).unwrap();
+        assert!(m.excluded.set_aside_archive.is_none());
+        assert_eq!(m.excluded.set_aside.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["sub/random.dat"]);
+        assert!(m.entries.iter().any(|e| e.rel_path == "sub/deeper/keep.tmp"));
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.archives().unwrap().len(), 1, "the archive beside left the catalogue");
+        assert!(cat.excluded_folders().unwrap()[0].aside_inside);
+        drop(cat);
+        let (a, entries) = recorded(&out, &src);
+        assert!(check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap().set_aside_inside);
+
+        // Moving inside on its own, with nothing put back.
+        std::fs::remove_dir_all(&out).unwrap();
+        let (main, aside) = archive_with_aside_beside(&src, &s);
+        assert!(move_aside_inside(&main, &s, &p).unwrap().moved_inside);
+        assert!(!aside.exists());
+        assert_eq!(read_manifest(&main).unwrap().excluded.set_aside.len(), 2);
+        assert!(move_aside_inside(&main, &s, &p).is_err(), "nothing beside it any more");
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+
+        // An archive beside that has gone missing stays named, and blocks a delete.
+        std::fs::remove_dir_all(&out).unwrap();
+        let (main, aside) = archive_with_aside_beside(&src, &s);
+        std::fs::remove_file(&aside).unwrap();
+        let (a, entries) = recorded(&out, &src);
+        let e = check_before_delete(&src, &a.archive_path, &entries, 2, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("set-aside"), "{e:#}");
+        assert!(restore_excluded(&main, &["sub/random.dat".into()], false, &s, &p).is_err());
+        assert_eq!(read_manifest(&main).unwrap().excluded.set_aside_archive.as_deref(), Some("src.excluded.7z"));
     }
 
     #[test]
