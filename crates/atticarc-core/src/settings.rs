@@ -25,6 +25,27 @@ pub struct Saved {
     pub exclusions: Vec<Rule>,
     /// GUI colour scheme.
     pub dark_mode: bool,
+    /// Source folders used before, most recent first (at most [`RECENT_MAX`]).
+    pub recent_sources: Vec<PathBuf>,
+    /// Destination folders used before, most recent first.
+    pub recent_dests: Vec<PathBuf>,
+}
+
+/// How many recent source and destination folders are remembered.
+pub const RECENT_MAX: usize = 8;
+
+/// Puts `path` at the front of `list`, removing any earlier copy of it
+/// (ignoring case and `\\?\`, as Windows does) and keeping at most
+/// [`RECENT_MAX`] entries.
+pub fn remember(list: &mut Vec<PathBuf>, path: &Path) {
+    let key = |p: &Path| strip_verbatim(p).to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    let k = key(path);
+    if k.is_empty() {
+        return;
+    }
+    list.retain(|p| key(p) != k);
+    list.insert(0, strip_verbatim(path));
+    list.truncate(RECENT_MAX);
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -65,6 +86,8 @@ impl Default for Saved {
             protected: vec![r"C:\7ztest".into(), r"D:\7ztest".into(), r"W:\7ztest".into()],
             exclusions: exclude::default_rules(),
             dark_mode: false,
+            recent_sources: Vec::new(),
+            recent_dests: Vec::new(),
         }
     }
 }
@@ -131,6 +154,22 @@ pub fn strip_verbatim(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remember_keeps_most_recent_first_without_duplicates() {
+        let mut list = Vec::new();
+        remember(&mut list, Path::new(r"E:\Source"));
+        remember(&mut list, Path::new(r"F:\Other"));
+        remember(&mut list, Path::new(r"e:\source\"));
+        assert_eq!(list, vec![PathBuf::from(r"e:\source\"), PathBuf::from(r"F:\Other")]);
+        for i in 0..20 {
+            remember(&mut list, Path::new(&format!(r"G:\f{i}")));
+        }
+        assert_eq!(list.len(), RECENT_MAX);
+        assert_eq!(list[0], PathBuf::from(r"G:\f19"));
+        remember(&mut list, Path::new(""));
+        assert_eq!(list.len(), RECENT_MAX, "an empty path isn't remembered");
+    }
 
     #[test]
     fn foldarc_settings_still_parse() {

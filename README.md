@@ -59,6 +59,8 @@ cargo run --release -p atticarc-gui -- D:\Photos
 Starts on the given source folder (or the last one used).
 
 - **New job**: source and destination, compression level, threads, store mode and protected folders.
+  Each has a **Recent ▾** menu of the last 8 folders used (a folder that isn't there now, such as on an
+  unplugged drive, is greyed out), and the app starts on the last ones used.
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
   **X** that starts the check-then-delete flow. While the folder is being deleted, a window with a
