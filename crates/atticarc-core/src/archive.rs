@@ -433,6 +433,12 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     let aside_record = record_for(format!("{name} (excluded)"), format!("{}|excluded", path_key(&source)), &aside_scan);
 
     let result = (|| -> Result<(Written, Excluded)> {
+        // Must fit before anything is written, as if nothing compresses. The
+        // set-aside files count twice: their own archive is written first,
+        // then copied inside the main one before it is removed.
+        let aside_worst = crate::disk::archive_worst_case(aside_scan.total_bytes);
+        let needed = crate::disk::archive_worst_case(scan.total_bytes).saturating_add(aside_worst.saturating_mul(2));
+        crate::disk::ensure_free(&out_dir, needed, &format!("archiving {name}"))?;
         let mut excluded = Excluded::default();
         if !scan.discarded.is_empty() {
             progress.set_phase("Hashing discarded files", scan.discarded.iter().map(|f| f.size).sum());
@@ -1273,6 +1279,15 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
     let aside_dir = work.join("aside");
 
     let result = (|| -> Result<_> {
+        // Room for the unpacked files (main and set-aside), a new set-aside
+        // archive and the new main archive beside the old one, as if nothing
+        // compresses.
+        let aside: u64 = ex.set_aside.iter().map(|e| e.size).sum();
+        let unpacked = m.archive.input_bytes.saturating_add(aside);
+        let needed = unpacked
+            .saturating_add(crate::disk::archive_worst_case(unpacked))
+            .saturating_add(crate::disk::archive_worst_case(aside));
+        crate::disk::ensure_free(out_dir, needed, &format!("rewriting {}", m.archive.name))?;
         progress.set_phase("Unpacking the archive", m.archive.input_bytes);
         // This unpacks the inner archive of set-aside files too, still packed.
         extract_all(archive, &main_dir, settings.threads, progress)?;

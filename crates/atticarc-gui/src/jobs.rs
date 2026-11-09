@@ -371,6 +371,20 @@ impl Jobs {
         };
         self.log.clear();
         self.log(format!("Archiving {} folders to {}", todo.len(), settings.out_dir.display()));
+        // Each folder is also checked on its own before it starts; this warns
+        // up front when the whole selection may not fit (nothing compressing).
+        let selected: u64 = todo.iter().map(|t| t.1).sum();
+        let needed = atticarc_core::disk::archive_worst_case(selected).saturating_add(atticarc_core::disk::MARGIN);
+        if let Some(free) = atticarc_core::disk::free_bytes(&settings.out_dir) {
+            if free < needed {
+                self.log(format!(
+                    "Warning: {} free on the destination, but the selection is {} before compression. \
+                     A folder that doesn't fit fails with a not-enough-space message and the rest carry on.",
+                    human(free),
+                    human(selected)
+                ));
+            }
+        }
         let (progress, stop_after, current) = (batch.progress.clone(), batch.stop_after.clone(), batch.current.clone());
         self.batch = Some(batch);
         let tx = self.tx.clone();

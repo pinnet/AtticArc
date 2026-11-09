@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use atticarc_core::archive::{self, Progress};
 use atticarc_core::catalog::Catalog;
-use atticarc_core::{scan, settings};
+use atticarc_core::{disk, scan, settings};
 
 const USAGE: &str = "\
 AtticARC – archive, catalogue and de-duplicate folders
@@ -21,6 +21,9 @@ AtticARC – archive, catalogue and de-duplicate folders
 Usage:
   atticarc-cli scan <folder> [--top N]   List files and show possible duplicates (by size).
                                   Reads no file contents, so it is fast.
+        [--hash] [--csv FILE]      Then hash the possible duplicates to confirm them
+                                  (64 KiB first, the whole file only if that matches),
+                                  and optionally write the confirmed ones to FILE.
   atticarc-cli archive <folder>...       Archive each folder to its own .7z and verify it,
                                   using the settings saved by the GUI.
         [--out DIR] [--level 5|9]  Override the output folder or level.
@@ -43,7 +46,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("scan") => match parse_scan(&args[1..]) {
-            Ok((folder, top)) => run_scan(folder, top),
+            Ok(a) => run_scan(a),
             Err(msg) => {
                 eprintln!("{msg}\n\n{USAGE}");
                 ExitCode::from(2)
@@ -90,14 +93,28 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_scan(args: &[String]) -> Result<(PathBuf, usize), String> {
+struct ScanArgs {
+    folder: PathBuf,
+    top: usize,
+    hash: bool,
+    csv: Option<PathBuf>,
+}
+
+fn parse_scan(args: &[String]) -> Result<ScanArgs, String> {
     let mut folder = None;
     let mut top = 10;
+    let mut hash = false;
+    let mut csv = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--top" {
             let n = it.next().ok_or("--top needs a number")?;
             top = n.parse().map_err(|_| format!("'{n}' is not a number"))?;
+        } else if a == "--hash" {
+            hash = true;
+        } else if a == "--csv" {
+            csv = Some(PathBuf::from(it.next().ok_or("--csv needs a file name")?));
+            hash = true;
         } else if folder.is_none() {
             folder = Some(PathBuf::from(a));
         } else {
@@ -108,10 +125,11 @@ fn parse_scan(args: &[String]) -> Result<(PathBuf, usize), String> {
     if !folder.is_dir() {
         return Err(format!("'{}' is not a folder", folder.display()));
     }
-    Ok((folder, top))
+    Ok(ScanArgs { folder, top, hash, csv })
 }
 
-fn run_scan(folder: PathBuf, top: usize) -> ExitCode {
+fn run_scan(a: ScanArgs) -> ExitCode {
+    let ScanArgs { folder, top, hash, csv } = a;
     let started = std::time::Instant::now();
     let r = scan::scan(&folder);
     let groups = r.size_collisions();
@@ -144,7 +162,88 @@ fn run_scan(folder: PathBuf, top: usize) -> ExitCode {
     for e in r.errors.iter().take(5) {
         eprintln!("warning: {}: {}", e.path.display(), e.error);
     }
+    if hash && !groups.is_empty() {
+        return run_hash(&folder, &groups, candidate_bytes, top, csv);
+    }
+    if let Some(csv) = csv {
+        // Nothing to hash: still write the (empty) file, so scripts find it.
+        if let Err(e) = write_csv(&csv, &[]) {
+            eprintln!("Can't write {}: {e}", csv.display());
+            return ExitCode::from(1);
+        }
+    }
     ExitCode::SUCCESS
+}
+
+fn run_hash(folder: &std::path::Path, groups: &[scan::SizeGroup<'_>], candidate_bytes: u64, top: usize, csv: Option<PathBuf>) -> ExitCode {
+    println!();
+    println!("Hashing possible duplicates…");
+    let started = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let rep = scan::hash_candidates(folder, groups, |read| {
+        if last.elapsed().as_secs() >= 2 {
+            last = std::time::Instant::now();
+            let rate = read as f64 / started.elapsed().as_secs_f64().max(0.001);
+            eprint!("\r  {} read, {}/s        ", human(read), human(rate as u64));
+        }
+        true
+    });
+    eprint!("\r{:60}\r", "");
+    let dup_files: usize = rep.groups.iter().map(|g| g.files.len() - 1).sum();
+    println!(
+        "Hashed in {:.1?}: read {} of {} candidates ({:.0}%)",
+        started.elapsed(),
+        human(rep.bytes_read),
+        human(candidate_bytes),
+        100.0 * rep.bytes_read as f64 / candidate_bytes.max(1) as f64
+    );
+    println!("Confirmed duplicates:");
+    println!("  {} groups, {} extra copies", rep.groups.len(), dup_files);
+    println!("  {} can be freed by keeping one copy of each", human(rep.wasted()));
+    if top > 0 && !rep.groups.is_empty() {
+        println!();
+        println!("Largest confirmed groups:");
+        for g in rep.groups.iter().take(top) {
+            println!("  {} × {} ({} freed)", g.files.len(), human(g.size), human(g.wasted()));
+            for f in g.files.iter().take(3) {
+                println!("      {}", f.display());
+            }
+            if g.files.len() > 3 {
+                println!("      … and {} more", g.files.len() - 3);
+            }
+        }
+    }
+    for e in rep.errors.iter().take(5) {
+        eprintln!("warning: not hashed: {}: {}", e.path.display(), e.error);
+    }
+    if rep.errors.len() > 5 {
+        eprintln!("warning: … and {} more not hashed", rep.errors.len() - 5);
+    }
+    if let Some(csv) = csv {
+        match write_csv(&csv, &rep.groups) {
+            Ok(()) => println!("\nWrote {}", csv.display()),
+            Err(e) => {
+                eprintln!("Can't write {}: {e}", csv.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// One row per file: its group number, size, BLAKE3 and path relative to
+/// the scanned folder. The first file of each group is listed first.
+fn write_csv(path: &std::path::Path, groups: &[scan::DuplicateGroup]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(w, "group,size,blake3,path")?;
+    for (i, g) in groups.iter().enumerate() {
+        for f in &g.files {
+            let p = f.to_string_lossy().replace('"', "\"\"");
+            writeln!(w, "{},{},{},\"{}\"", i + 1, g.size, g.blake3, p)?;
+        }
+    }
+    w.flush()
 }
 
 struct ArchiveArgs {
@@ -184,6 +283,7 @@ fn parse_archive(args: &[String]) -> Result<ArchiveArgs, String> {
 
 fn run_archive(a: ArchiveArgs) -> ExitCode {
     let saved = settings::load();
+    warn_if_job_may_not_fit(&a, &saved);
     let mut failed = 0;
     for folder in &a.folders {
         let source_dir = std::fs::canonicalize(folder)
@@ -228,6 +328,40 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
         }
     }
     if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) }
+}
+
+/// Each folder's own archive is checked for room before it starts; this
+/// warns up front when the whole run may not fit, so it doesn't come as a
+/// surprise hours in. Worst case: nothing compresses.
+fn warn_if_job_may_not_fit(a: &ArchiveArgs, saved: &settings::Saved) {
+    let mut by_out: Vec<(PathBuf, u64)> = Vec::new();
+    for folder in &a.folders {
+        let source_dir = std::fs::canonicalize(folder)
+            .ok()
+            .and_then(|p| p.parent().map(settings::strip_verbatim))
+            .unwrap_or_default();
+        let out = a.out.clone().unwrap_or_else(|| saved.settings_for(&source_dir).out_dir);
+        let (bytes, _) = archive::quick_size(folder);
+        match by_out.iter_mut().find(|(o, _)| *o == out) {
+            Some((_, total)) => *total += bytes,
+            None => by_out.push((out, bytes)),
+        }
+    }
+    for (out, bytes) in by_out {
+        let needed = disk::archive_worst_case(bytes).saturating_add(disk::MARGIN);
+        if let Some(free) = disk::free_bytes(&out) {
+            if free < needed {
+                eprintln!(
+                    "warning: {} is free on {}, but these folders total {} before compression. \
+                     Each folder is checked before it starts: any that doesn't fit fails with a \
+                     not-enough-space error and the rest carry on.",
+                    human(free),
+                    out.display(),
+                    human(bytes)
+                );
+            }
+        }
+    }
 }
 
 fn parse_search(args: &[String]) -> Result<(String, Option<PathBuf>), String> {

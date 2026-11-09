@@ -17,5 +17,8 @@ sevenz-turbo = { version = "0.29.3", features = ["compress", "util"] }
 sha2 = "0.11.1"
 walkdir = "2.5.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
