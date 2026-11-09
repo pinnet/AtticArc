@@ -32,13 +32,16 @@ impl App {
                 let rules_ok = Exclusions::new(&self.saved.exclusions).is_ok();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let start = primary_button(&format!("Start archiving · {count} folders · {}", human(bytes)));
-                    if ui.add_enabled(!busy && count > 0 && rules_ok, start).clicked() {
+                    let overlap_ok = overlap(&self.source_dir, &self.out_dir()).is_none();
+                    if ui.add_enabled(!busy && count > 0 && rules_ok && overlap_ok, start).clicked() {
                         self.save();
                         self.jobs.archive_selected(self.settings());
                         self.screen = Screen::Progress;
                     }
                     if busy {
                         ui.label(RichText::new("A job is running; see Progress.").color(theme::muted()));
+                    } else if !overlap_ok {
+                        ui.label(RichText::new("Choose a source and destination that don't overlap first.").color(theme::danger()));
                     } else if !rules_ok {
                         ui.label(RichText::new("Fix the exclusion marked in red first.").color(theme::danger()));
                     }
@@ -49,13 +52,21 @@ impl App {
 
     fn locations(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
+        // A folder dialog's last click can land on this window as it closes,
+        // pressing whichever button is under the pointer and opening a second,
+        // identical-looking dialog. Both buttons ignore clicks for a moment
+        // after a dialog closes.
+        let settling = self.picker_closed.is_some_and(|t| t.elapsed() < PICKER_SETTLE);
+        if settling {
+            ui.ctx().request_repaint_after(PICKER_SETTLE);
+        }
         ui.columns(2, |cols| {
             card(&mut cols[0], |ui| {
                 ui.label(caption("Source"));
                 ui.label(RichText::new(self.source_dir.display().to_string()).monospace().size(17.0).color(theme::ink()));
                 ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
-                if ui.button("Change source…").clicked()
-                    && let Some(p) = rfd::FileDialog::new().set_directory(&self.source_dir).pick_folder() {
+                if ui.add_enabled(!settling, egui::Button::new("Change source…")).clicked()
+                    && let Some(p) = pick_folder("Choose the SOURCE folder (the one whose subfolders get archived)", &self.source_dir, &mut self.picker_closed) {
                         self.source_dir = atticarc_core::settings::strip_verbatim(&p);
                         changed = true;
                     }
@@ -77,13 +88,16 @@ impl App {
                             .color(theme::danger()),
                     );
                 }
-                if ui.button("Change destination…").clicked()
-                    && let Some(p) = rfd::FileDialog::new().set_directory(nearest_existing(&self.out_dir())).pick_folder() {
+                if ui.add_enabled(!settling, egui::Button::new("Change destination…")).clicked()
+                    && let Some(p) = pick_folder("Choose the DESTINATION folder (where the archives go)", &nearest_existing(&self.out_dir()), &mut self.picker_closed) {
                         self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
                         changed = true;
                     }
             });
         });
+        if let Some(problem) = overlap(&self.source_dir, &self.out_dir()) {
+            ui.label(RichText::new(problem).color(theme::danger()));
+        }
         if changed {
             self.save();
             self.reload();
@@ -293,6 +307,39 @@ fn exclusions(ui: &mut egui::Ui, rules: &mut Vec<Rule>) {
     });
 }
 
+/// How long the folder buttons ignore clicks after a folder dialog closes.
+const PICKER_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A modal folder dialog with a title saying which folder it is for. Notes
+/// when it closed, so a stray click as it closes can be ignored too.
+fn pick_folder(title: &str, start: &std::path::Path, closed: &mut Option<std::time::Instant>) -> Option<std::path::PathBuf> {
+    let picked = crate::dialog::pick_folder(title, Some(start));
+    *closed = Some(std::time::Instant::now());
+    picked
+}
+
+/// Why `source` and `dest` can't be used together, if they can't: the same
+/// folder, or the source inside the destination. (A destination inside the
+/// source is fine: it is left out of the folder list.) Compared ignoring case
+/// and `\\?\`, as Windows does.
+fn overlap(source: &std::path::Path, dest: &std::path::Path) -> Option<String> {
+    let norm = |p: &std::path::Path| {
+        let s = atticarc_core::settings::strip_verbatim(p).to_string_lossy().replace('/', "\\").to_lowercase();
+        s.trim_end_matches('\\').to_string()
+    };
+    let (src, dst) = (norm(source), norm(dest));
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    if src == dst {
+        Some("The source and destination are the same folder. Change one of them.".into())
+    } else if src.starts_with(&format!("{dst}\\")) {
+        Some("The source is inside the destination folder. Choose a destination outside it.".into())
+    } else {
+        None
+    }
+}
+
 /// `path`, or its closest parent that exists, so a folder picker can open
 /// there even when the destination hasn't been created yet.
 fn nearest_existing(path: &std::path::Path) -> std::path::PathBuf {
@@ -338,5 +385,21 @@ fn size_text(s: Option<(u64, u64)>) -> String {
     match s {
         None => "…".into(),
         Some((b, f)) => format!("{} · {f} {}", human(b), if f == 1 { "file" } else { "files" }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overlap;
+    use std::path::Path;
+
+    #[test]
+    fn overlapping_source_and_destination_are_caught() {
+        assert!(overlap(Path::new(r"E:\Source"), Path::new(r"e:\source\")).is_some(), "same, ignoring case");
+        assert!(overlap(Path::new(r"\\?\E:\Source"), Path::new(r"E:\Source")).is_some(), "same, ignoring \\?\\");
+        assert!(overlap(Path::new(r"F:\Archives\Old"), Path::new(r"F:\Archives")).is_some(), "source inside destination");
+        assert!(overlap(Path::new(r"E:\Source"), Path::new(r"E:\Source\AtticARC archives")).is_none(), "destination inside source is fine");
+        assert!(overlap(Path::new(r"E:\Source"), Path::new(r"F:\Archives")).is_none());
+        assert!(overlap(Path::new(r"E:\Src"), Path::new(r"E:\Source")).is_none(), "a shared prefix isn't nesting");
     }
 }
