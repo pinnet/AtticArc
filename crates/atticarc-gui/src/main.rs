@@ -129,10 +129,11 @@ impl App {
     }
 
     fn save(&mut self) {
+        let out = self.out_dir();
         self.saved.source_dir = Some(self.source_dir.clone());
-        self.saved.out_dir = Some(self.out_dir());
         settings::remember(&mut self.saved.recent_sources, &self.source_dir);
-        settings::remember(&mut self.saved.recent_dests, &self.out_dir());
+        settings::remember(&mut self.saved.recent_dests, &out);
+        self.saved.out_dir = Some(out);
         self.saved.protected =
             self.protected_text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect();
         settings::store(&self.saved);
