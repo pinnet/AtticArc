@@ -7,6 +7,7 @@
 
 mod browse;
 mod catalogue;
+mod cleanup;
 mod dialog;
 mod duplicates;
 mod excluded;
@@ -54,13 +55,17 @@ fn main() -> eframe::Result {
 pub enum Screen {
     NewJob,
     Progress,
-    Catalogue,
     Duplicates,
     Excluded,
+    Cleanup,
+    Catalogue,
 }
 
 impl Screen {
-    const ALL: [Screen; 5] = [Screen::NewJob, Screen::Progress, Screen::Catalogue, Screen::Duplicates, Screen::Excluded];
+    /// The steps of the work, in the order they are done.
+    const WORKFLOW: [Screen; 5] = [Screen::NewJob, Screen::Progress, Screen::Duplicates, Screen::Excluded, Screen::Cleanup];
+    /// Separate from the work: looking things up in what has been archived.
+    const LOOK_UP: [Screen; 1] = [Screen::Catalogue];
 
     fn label(self) -> &'static str {
         match self {
@@ -69,6 +74,7 @@ impl Screen {
             Screen::Catalogue => "Catalogue",
             Screen::Duplicates => "Duplicates",
             Screen::Excluded => "Excluded",
+            Screen::Cleanup => "Clean up",
         }
     }
 }
@@ -85,6 +91,7 @@ pub struct App {
     catalogue: catalogue::State,
     duplicates: duplicates::State,
     excluded: excluded::State,
+    cleanup: cleanup::State,
 }
 
 impl App {
@@ -113,6 +120,7 @@ impl App {
             catalogue: catalogue::State::default(),
             duplicates: duplicates::State::default(),
             excluded: excluded::State::default(),
+            cleanup: cleanup::State::default(),
         };
         app.reload();
         app
@@ -146,29 +154,47 @@ impl App {
         self.catalogue.invalidate();
         self.duplicates.invalidate();
         self.excluded.invalidate();
+        self.cleanup.invalidate();
+    }
+
+    fn nav_button(&mut self, ui: &mut egui::Ui, s: Screen) {
+        let on = self.screen == s;
+        let colour = if on { Color32::WHITE } else { theme::sidebar_text() };
+        let busy = match s {
+            Screen::Progress => self.jobs.is_busy(),
+            Screen::Cleanup => self.cleanup.busy(),
+            _ => false,
+        };
+        let label = if busy { format!("{}  ●", s.label()) } else { s.label().to_string() };
+        let mut text = RichText::new(label).size(15.0).color(colour);
+        if on {
+            text = text.strong();
+        }
+        let button = egui::Button::new(text)
+            .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(6))
+            .min_size(egui::vec2(ui.available_width(), 40.0));
+        if ui.add(button).clicked() {
+            self.screen = s;
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(RichText::new("AtticARC").size(18.0).strong().color(theme::sidebar_text()));
         ui.add_space(16.0);
-        for s in Screen::ALL {
-            let on = self.screen == s;
-            let mut text = RichText::new(s.label()).size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() });
-            if on {
-                text = text.strong();
-            }
-            if s == Screen::Progress && self.jobs.is_busy() {
-                text = RichText::new(format!("{}  ●", s.label())).size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() });
-            }
-            let button = egui::Button::new(text)
-                .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(6))
-                .min_size(egui::vec2(ui.available_width(), 40.0));
-            if ui.add(button).clicked() {
-                self.screen = s;
-            }
+        for s in Screen::WORKFLOW {
+            self.nav_button(ui, s);
+        }
+        // The catalogue is apart from the steps of the work: it is for
+        // finding things in what has been archived.
+        ui.add_space(14.0);
+        ui.add(egui::Separator::default().spacing(10.0));
+        ui.label(RichText::new("Look up").size(12.5).color(theme::sidebar_text().gamma_multiply(0.7)));
+        ui.add_space(4.0);
+        for s in Screen::LOOK_UP {
+            self.nav_button(ui, s);
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let dark = self.saved.dark_mode;
@@ -195,11 +221,17 @@ impl eframe::App for App {
         if std::mem::take(&mut self.catalogue.changed) {
             self.duplicates.invalidate();
             self.excluded.invalidate();
+            self.cleanup.invalidate();
         }
         if finished_batch || std::mem::take(&mut self.jobs.deleted) {
             self.catalogue.invalidate();
             self.duplicates.invalidate();
             self.excluded.invalidate();
+            self.cleanup.invalidate();
+        }
+        if std::mem::take(&mut self.cleanup.changed) {
+            // Folders were deleted: the folder list and the other pages reload.
+            self.reload();
         }
         egui::Panel::left("nav")
             .resizable(false)
@@ -214,11 +246,12 @@ impl eframe::App for App {
                 Screen::Catalogue => self.catalogue(ui),
                 Screen::Duplicates => self.duplicates(ui),
                 Screen::Excluded => self.excluded(ui),
+                Screen::Cleanup => self.cleanup(ui),
             });
         let ctx = ui.ctx().clone();
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
-        if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() || self.duplicates.busy() {
+        if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() || self.duplicates.busy() || self.cleanup.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }

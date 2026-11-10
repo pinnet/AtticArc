@@ -90,6 +90,13 @@ Starts on the given source folder (or the last one used).
   change) moves it inside, verifies the new archive, and only then deletes the one beside it.
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
+- **Clean up**: the last step. Every archived folder whose source is still on disk, as a tree by parent
+  folder with tick boxes (nothing ticked to start; a parent's box ticks all its folders). **Delete N
+  ticked…** checks each one against its archive (files against the catalogue, archive decoded) and
+  deletes it; a folder that fails its check is left alone and the rest carry on. **Stop after this
+  folder** ends the run cleanly. Each result is listed, with any discarded files deleted with it.
+- The sidebar runs in the order of the work: New job, Progress, Duplicates, Excluded, Clean up. The
+  **Catalogue** sits apart below it, under *Look up*, since it is for finding things, not a step.
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
   date, sortable), or search every file in every archive by name or folder, all without unpacking.
   Select a file to see its original path, hashes and how many copies exist, and extract it.
