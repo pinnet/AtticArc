@@ -5,8 +5,8 @@
 //! its archive, shown with its full path and where its original is. On the
 //! left, the details of what is selected.
 //!
-//! Replace duplicates opens the list of every leaf, all ticked, to untick
-//! any that should stay as they are. From there a preview (a dry run)
+//! Replace duplicates opens the list of every leaf, none ticked: only the
+//! copies ticked there (or in a copy's details) are replaced. From there a preview (a dry run)
 //! checks every original against its hash and changes nothing, and Replace
 //! works through the archives oldest first, swapping each ticked copy for a
 //! small `.atticarcdep` reference file that points to its original. The
@@ -47,8 +47,9 @@ pub struct State {
     selected: Option<Sel>,
     /// Archives opened in the tree.
     expanded: BTreeSet<i64>,
-    /// Copies unticked in the list before a run, which stay as they are.
-    left_out: BTreeSet<Key>,
+    /// Copies ticked in the list to replace. Nothing is ticked until picked,
+    /// so a copy is only ever replaced by choice.
+    chosen: BTreeSet<Key>,
     /// Only copies of at least `min_mb` megabytes are replaced.
     min_on: bool,
     min_mb: f64,
@@ -91,7 +92,7 @@ impl State {
 
     /// The copies ticked to replace.
     fn ticked(&self) -> Vec<(&TreeArchive, &TreeLeaf)> {
-        self.leaves().filter(|(a, l)| self.big_enough(l) && !self.left_out.contains(&key(a, l))).collect()
+        self.leaves().filter(|(a, l)| self.big_enough(l) && self.chosen.contains(&key(a, l))).collect()
     }
 
     /// Whether a copy passes the size limit, if one is set.
@@ -196,7 +197,7 @@ impl App {
                 }
             }
             let keys: BTreeSet<Key> = st.leaves().map(|(a, l)| key(a, l)).collect();
-            st.left_out.retain(|k| keys.contains(k));
+            st.chosen.retain(|k| keys.contains(k));
             let ok = match st.selected {
                 Some(Sel::Leaf(id)) => st.find_leaf(id).is_some(),
                 Some(Sel::Archive(id)) => st.tree.iter().any(|a| a.id == id),
@@ -239,7 +240,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let idle = st.running.is_none() && !busy;
                 let go = egui::Button::new(RichText::new("Replace duplicates…").color(egui::Color32::WHITE)).fill(theme::danger_fill());
-                let tip = "Shows every copy to be replaced, to untick any first. Nothing changes until you press Replace there.";
+                let tip = "Lists every copy to tick the ones to replace; none are ticked to start. Nothing changes until you press Replace there.";
                 if ui.add_enabled(idle && n_leaves > 0, go).on_hover_text(tip).clicked() {
                     st.review = true;
                 }
@@ -393,18 +394,18 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                 Row::Leaf(i, j) => {
                     let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
                     let on = st.selected == Some(Sel::Leaf(l.entry_id));
-                    let left_out = st.left_out.contains(&key(a, l));
+                    let chosen = st.chosen.contains(&key(a, l));
                     let resp = row_frame(ui, stripe, on, 44.0, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                path_label(ui, &l.rel_path, left_out);
+                                path_label(ui, &l.rel_path, false);
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.label(RichText::new(human(l.size)).size(12.5).color(theme::muted()));
                                 });
                             });
                             let text = format!("original: {}.7z › {}", l.original_archive, l.original_path);
-                            let colour = if left_out { theme::muted() } else { theme::accent_text() };
+                            let colour = if chosen { theme::accent_text() } else { theme::muted() };
                             ui.add(egui::Label::new(RichText::new(text).size(12.5).color(colour)).truncate())
                                 .on_hover_text(format!("The original stays in {}.7z at\n{}", l.original_archive, l.original_path));
                         });
@@ -531,17 +532,17 @@ fn details(ui: &mut egui::Ui, st: &mut State) {
             grid(ui, "dup-leaf", rows);
             ui.add_space(10.0);
             let k = key(&a, &l);
-            let mut on = !st.left_out.contains(&k);
+            let mut on = st.chosen.contains(&k);
             let locked = st.running.is_some();
             if ui
                 .add_enabled(!locked, egui::Checkbox::new(&mut on, "Replace this copy"))
-                .on_hover_text("Untick to leave this copy as it is when the duplicates are replaced")
+                .on_hover_text("Tick to replace this copy with a reference file when the duplicates are replaced; unticked, it stays as it is")
                 .changed()
             {
                 if on {
-                    st.left_out.remove(&k);
+                    st.chosen.insert(k);
                 } else {
-                    st.left_out.insert(k);
+                    st.chosen.remove(&k);
                 }
             }
             if ui.button(format!("Show {}.7z", l.original_archive)).on_hover_text("Open the archive holding the original in the tree").clicked() {
@@ -578,7 +579,7 @@ fn details(ui: &mut egui::Ui, st: &mut State) {
                 "The archives on the right run from the oldest to the newest.",
                 "The first copy of a file, in the oldest archive, is the original. It always stays.",
                 "Every later copy is listed under its archive, with its path inside it and where its original is. Click one to see its details.",
-                "Replace duplicates lists every copy, all ticked; untick any to keep them. Preview checks every original and changes nothing.",
+                "Replace duplicates lists every copy with none ticked; tick the ones to replace (or Tick all). Preview checks every original and changes nothing.",
                 "Replace checks every original against its hash, then rewrites each archive, oldest first, putting a small .atticarcdep file where each copy was. It names the original's archive and path, and the Catalogue can follow it or put the file back.",
             ] {
                 ui.label(RichText::new(format!("•  {line}")).color(theme::ink()));
@@ -587,7 +588,7 @@ fn details(ui: &mut egui::Ui, st: &mut State) {
     }
 }
 
-/// The list before a run: every copy, all ticked unless unticked before,
+/// The list before a run: every copy, none ticked unless ticked before,
 /// grouped by archive oldest first, with a preview and the run itself.
 fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: &archive::Settings) {
     let mut close = false;
@@ -606,7 +607,7 @@ fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: 
         ui.heading("Replace duplicates with reference files");
         ui.label(RichText::new(
             "Each ticked copy is replaced inside its archive by a small .atticarcdep file naming the archive and path of its \
-             original, which stays. Untick any copy to leave it as it is.",
+             original, which stays. Nothing is ticked to start: tick each copy to replace, or Tick all.",
         ).color(theme::muted()));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -620,11 +621,11 @@ fn review(ctx: &egui::Context, st: &mut State, out: &std::path::Path, settings: 
         ui.horizontal(|ui| {
             let locked = previewing.is_some();
             if ui.add_enabled(!locked, egui::Button::new("Tick all")).clicked() {
-                st.left_out.clear();
+                let all: Vec<Key> = st.leaves().filter(|(_, l)| st.big_enough(l)).map(|(a, l)| key(a, l)).collect();
+                st.chosen.extend(all);
             }
             if ui.add_enabled(!locked, egui::Button::new("Untick all")).clicked() {
-                let all: Vec<Key> = st.leaves().map(|(a, l)| key(a, l)).collect();
-                st.left_out.extend(all);
+                st.chosen.clear();
             }
             ui.label(RichText::new(format!("{n} of {total} ticked · {} · {}", human(bytes), archives(n_archives))).strong());
         });
@@ -703,7 +704,7 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
                     Row::Archive(i) => {
                         let a = &st.tree[i];
                         let keys: Vec<Key> = a.leaves.iter().filter(|l| st.big_enough(l)).map(|l| key(a, l)).collect();
-                        let n_on = keys.iter().filter(|k| !st.left_out.contains(*k)).count();
+                        let n_on = keys.iter().filter(|k| st.chosen.contains(*k)).count();
                         let mut on = n_on == keys.len();
                         let cb = egui::Checkbox::without_text(&mut on).indeterminate(n_on > 0 && n_on < keys.len());
                         if ui.add_enabled(!locked, cb).on_hover_text("Tick or untick every copy in this archive").changed() {
@@ -715,7 +716,7 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
                     Row::Leaf(i, j) => {
                         let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
                         let k = key(a, l);
-                        let mut on = !st.left_out.contains(&k);
+                        let mut on = st.chosen.contains(&k);
                         ui.add_space(22.0);
                         if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
                             flip = Some((vec![k.clone()], on));
@@ -742,9 +743,9 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
     if let Some((keys, on)) = flip {
         for k in keys {
             if on {
-                st.left_out.remove(&k);
+                st.chosen.insert(k);
             } else {
-                st.left_out.insert(k);
+                st.chosen.remove(&k);
             }
         }
     }
