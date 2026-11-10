@@ -592,8 +592,15 @@ pub struct Rebuilt {
 /// Adds every .7z in `out_dir` that isn't in its catalogue yet, from the
 /// manifests the archives carry. Archives already catalogued are left alone.
 pub fn rebuild_catalog(out_dir: &Path) -> Result<Rebuilt> {
+    rebuild_catalog_with(out_dir, &Progress::default())
+}
+
+/// [`rebuild_catalog`], reporting on `progress`: one step per archive file,
+/// with the phase naming the file being read.
+pub fn rebuild_catalog_with(out_dir: &Path, progress: &Progress) -> Result<Rebuilt> {
     let mut out = Rebuilt::default();
     if crate::catalog::exists(out_dir) {
+        progress.set_phase("Looking for renamed archives", 0);
         // Archives renamed since they were catalogued are relinked, not added twice.
         out.relinked = relink_missing(out_dir)?.relinked;
     }
@@ -601,16 +608,20 @@ pub fn rebuild_catalog(out_dir: &Path) -> Result<Rebuilt> {
     if found.is_empty() {
         return Ok(out);
     }
+    progress.set_phase("Reading the manifests", found.len() as u64);
     let mut cat = Catalog::open(out_dir)?;
     // Fingerprints of the archives already catalogued, made when first needed.
     let mut known: Option<HashMap<String, String>> = None;
-    for path in found {
+    let total = found.len();
+    for (i, path) in found.into_iter().enumerate() {
+        let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        *progress.phase.lock().unwrap() = format!("Reading {file} ({} of {total})", i + 1);
+        progress.done.store(i as u64 + 1, Ordering::Relaxed);
         let key = crate::settings::strip_verbatim(&path).to_string_lossy().into_owned();
         if cat.has_archive_path(&key)? {
             out.already_there += 1;
             continue;
         }
-        let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let added = read_manifest(&path).and_then(|m| {
             if known.is_none() {
                 known = Some(catalogue_fingerprints(&cat)?);
