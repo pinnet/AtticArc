@@ -30,6 +30,14 @@ Usage:
   atticarc-cli search <words> [--out DIR] Search the catalogue in the output folder.
   atticarc-cli rebuild [--out DIR]       Add the archives in the output folder that the
                                   catalogue is missing, from their manifests.
+  atticarc-cli cleanup <destination>     List archived folders still on disk and their checks.
+        [--check]                  Check each one not yet passed: every file against the
+                                  catalogue and hashed, the archive decoded. Deletes nothing.
+                                  Each result is saved as it finishes, so it can be stopped
+                                  (Ctrl+C) and carried on later, here or in the GUI.
+        [--recheck]                Check every one again, passed or not.
+        [--delete] [--yes]         Delete the ones that passed, each only if unchanged since
+                                  its check. Asks first unless --yes.
   atticarc-cli soak --work DIR           Robustness test: archive, check, put back, de-duplicate
         [--hours H | --minutes M]  and rebuild in a loop (default 60 minutes), logging
         [--rounds N] [--gb G]      memory, handles and threads to a CSV in DIR. Uses G GB
@@ -74,6 +82,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("cleanup") => run_cleanup(&args[1..]),
         Some("soak") => match soak::parse_soak(&args[1..]) {
             Ok(a) => soak::run_soak(a),
             Err(msg) => {
@@ -432,4 +441,128 @@ fn human(bytes: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+/// `atticarc-cli cleanup`: Clean up without the window, sharing its saved
+/// checks with the GUI (see `atticarc_core::cleanup`).
+fn run_cleanup(args: &[String]) -> ExitCode {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use atticarc_core::cleanup;
+
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let Some(dest) = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from) else {
+        eprintln!("cleanup needs the destination folder (where the archives and catalogue are)\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !["--check", "--recheck", "--delete", "--yes"].contains(&a.as_str())) {
+        eprintln!("Unknown option '{bad}'\n\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let (check, recheck, delete, yes) = (flag("--check"), flag("--recheck"), flag("--delete"), flag("--yes"));
+    let saved = settings::load();
+    let settings_for = |c: &cleanup::Candidate| {
+        let mut s = saved.settings_for(c.source.parent().unwrap_or(&c.source));
+        s.out_dir = dest.clone();
+        s
+    };
+    let load = || cleanup::candidates(&dest, &Default::default());
+    let (mut items, missing) = match load() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Can't read the catalogue in {}: {e:#}", dest.display());
+            return ExitCode::from(1);
+        }
+    };
+    let status = |c: &cleanup::Candidate| match &c.check {
+        Some(k) if k.passed => {
+            let journal = if c.journal_checked() { ", change journal" } else { "" };
+            format!("passed {}{journal}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
+        }
+        Some(k) => format!("FAILED: {}", k.detail.lines().next().unwrap_or("")),
+        None => "not checked".to_string(),
+    };
+    println!("{} archived folders still on disk:", items.len());
+    for c in &items {
+        println!("  {:<60} {:>10}  {}", c.source.display(), human(c.bytes), status(c));
+    }
+    if !missing.is_empty() {
+        println!("{} more aren't where they were archived from (renamed? the GUI can look for them).", missing.len());
+    }
+    let mut failed = 0;
+
+    if check || recheck {
+        let todo: Vec<_> = items.iter().filter(|c| recheck || !c.passed()).cloned().collect();
+        println!();
+        for (n, c) in todo.iter().enumerate() {
+            let progress = Arc::new(Progress::default());
+            let done = Arc::new(AtomicBool::new(false));
+            let ticker = {
+                let (p, d, name) = (progress.clone(), done.clone(), c.source.display().to_string());
+                let (n, total) = (n + 1, todo.len());
+                std::thread::spawn(move || {
+                    while !d.load(Ordering::Relaxed) {
+                        eprint!("\r  Checking {n} of {total}: {name} — {:.0}%   ", p.fraction() * 100.0);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                })
+            };
+            let result = cleanup::check(c, &settings_for(c), &progress);
+            done.store(true, Ordering::Relaxed);
+            let _ = ticker.join();
+            eprint!("\r{:100}\r", "");
+            if result.passed {
+                println!("  passed  {}", c.source.display());
+            } else {
+                failed += 1;
+                println!("  FAILED  {}: {}", c.source.display(), result.detail.lines().next().unwrap_or(""));
+            }
+        }
+        items = match load() {
+            Ok((i, _)) => i,
+            Err(e) => {
+                eprintln!("Can't read the catalogue again: {e:#}");
+                return ExitCode::from(1);
+            }
+        };
+    }
+
+    if delete {
+        let ready: Vec<_> = items.iter().filter(|c| c.passed()).cloned().collect();
+        println!();
+        if ready.is_empty() {
+            println!("Nothing to delete: no folder has passed a check. Run with --check first.");
+            return if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) };
+        }
+        let bytes: u64 = ready.iter().map(|c| c.bytes).sum();
+        let discarded: usize = ready.iter().filter_map(|c| c.check.as_ref().map(|k| k.discarded)).sum();
+        println!("{} folders passed their check ({}) and can be deleted permanently:", ready.len(), human(bytes));
+        for c in &ready {
+            println!("  {}", c.source.display());
+        }
+        if discarded > 0 {
+            println!("{discarded} files a discard rule left out of their archives go with them, without being kept.");
+        }
+        if !yes {
+            print!("Delete them? Each is compared with its check first. [y/N] ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("Nothing deleted.");
+                return ExitCode::SUCCESS;
+            }
+        }
+        for c in &ready {
+            match cleanup::delete(c, &settings_for(c), &Arc::new(Progress::default())) {
+                Ok(()) => println!("  deleted {}", c.source.display()),
+                Err(e) => {
+                    failed += 1;
+                    println!("  LEFT    {}: {e:#}", c.source.display());
+                }
+            }
+        }
+    }
+    if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }

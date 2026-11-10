@@ -11,9 +11,11 @@
 //!    is deleted its snapshot is taken again; a folder that changed since
 //!    its check is left alone.
 //!
-//! Archived folders that are no longer where they were can be looked for
-//! among the folders beside them, by their files: a renamed folder is
-//! listed under its new name.
+//! Checks are saved in the catalogue (see `atticarc_core::cleanup`), so they
+//! survive a restart: a long run can be checked over several sessions and
+//! deleted later. Archived folders that are no longer where they were can
+//! be looked for among the folders beside them, by their files: a renamed
+//! folder is listed under its new name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -24,38 +26,10 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, RichText};
 
 use atticarc_core::archive::{self, Progress};
-use atticarc_core::catalog::{self, Catalog, path_key};
+use atticarc_core::catalog::{Catalog, SavedCheck, path_key};
+use atticarc_core::cleanup::{self as clean, Candidate, Missing};
 
 use crate::{App, card, heading, human, theme};
-
-/// An archived folder whose source is still on disk.
-#[derive(Clone, Debug)]
-struct Item {
-    archive_id: i64,
-    source: PathBuf,
-    /// The folder's name when it was archived, if it has been renamed since.
-    renamed_from: Option<String>,
-    archive_path: PathBuf,
-    archive_name: String,
-    bytes: u64,
-    archived: String,
-}
-
-/// An archived folder that isn't where it was, and isn't marked deleted.
-#[derive(Clone, Debug)]
-struct Gone {
-    archive_id: i64,
-    source: PathBuf,
-    archive_path: PathBuf,
-}
-
-/// A folder's check.
-#[derive(Clone, Debug)]
-enum Check {
-    /// Passed: its snapshot then, and how many discarded files go with it.
-    Passed { snapshot: String, discarded: usize },
-    Failed(String),
-}
 
 /// How a folder's delete went.
 #[derive(Clone, Debug)]
@@ -82,32 +56,37 @@ struct Running {
 }
 
 enum Msg {
-    Checked(i64, Check),
+    Checked(SavedCheck),
     Deleted(i64, Outcome),
     Done,
 }
 
-type Loaded = (Vec<Item>, Vec<Gone>);
+/// The archived folders on disk, those that aren't, and the saved ticks.
+type Loaded = (Vec<Candidate>, Vec<Missing>, Vec<i64>);
 
 #[derive(Default)]
 pub struct State {
     loaded: bool,
     loading: Option<Receiver<Result<Loaded, String>>>,
-    items: Vec<Item>,
+    items: Vec<Candidate>,
     /// Archived folders no longer where they were.
-    gone: Vec<Gone>,
+    gone: Vec<Missing>,
     /// Renamed folders found by "Look for renamed folders", by archive id.
     renamed: BTreeMap<i64, PathBuf>,
     searching: Option<Receiver<BTreeMap<i64, PathBuf>>>,
     /// What the last search found, to show.
     search_note: Option<String>,
     error: Option<String>,
-    /// Ticked folders, by archive id. Nothing is ticked to start.
+    /// Ticked folders, by archive id. Nothing is ticked to start; ticks are
+    /// saved in the catalogue, so they survive a restart.
     ticked: BTreeSet<i64>,
+    /// The ticks as last saved, to know when to save them again.
+    saved_ticks: BTreeSet<i64>,
     /// Parent folders folded shut in the tree.
     folded: BTreeSet<PathBuf>,
-    /// The latest check of each folder, by archive id.
-    checks: BTreeMap<i64, Check>,
+    /// The latest check of each folder, by archive id: read back from the
+    /// catalogue when the page loads, so checks survive a restart.
+    checks: BTreeMap<i64, SavedCheck>,
     confirm: bool,
     running: Option<Running>,
     /// What the last delete pass did, folder by folder.
@@ -127,24 +106,25 @@ impl State {
         self.running.is_some() || self.loading.is_some() || self.searching.is_some()
     }
 
-    fn ticked_items(&self) -> Vec<Item> {
+    fn ticked_items(&self) -> Vec<Candidate> {
         self.items.iter().filter(|i| self.ticked.contains(&i.archive_id)).cloned().collect()
     }
 
-    /// Ticked folders that passed their check, with their snapshot then.
-    fn ready(&self) -> Vec<(Item, String)> {
+    /// Ticked folders that passed their check, each with that check.
+    fn ready(&self) -> Vec<Candidate> {
         self.ticked_items()
             .into_iter()
-            .filter_map(|i| match self.checks.get(&i.archive_id) {
-                Some(Check::Passed { snapshot, .. }) => Some((i, snapshot.clone())),
-                _ => None,
+            .filter_map(|mut i| {
+                let c = self.checks.get(&i.archive_id).filter(|c| c.passed)?.clone();
+                i.check = Some(c);
+                Some(i)
             })
             .collect()
     }
 
     /// The items grouped by the folder holding them, in path order.
-    fn tree(&self) -> BTreeMap<PathBuf, Vec<Item>> {
-        let mut t: BTreeMap<PathBuf, Vec<Item>> = BTreeMap::new();
+    fn tree(&self) -> BTreeMap<PathBuf, Vec<Candidate>> {
+        let mut t: BTreeMap<PathBuf, Vec<Candidate>> = BTreeMap::new();
         for i in &self.items {
             let parent = i.source.parent().map(Path::to_path_buf).unwrap_or_default();
             t.entry(parent).or_default().push(i.clone());
@@ -159,9 +139,11 @@ impl State {
         Running { pass, progress: Arc::new(Progress::default()), current: Arc::new(Mutex::new(String::new())), rx, total, done: 0 }
     }
 
-    /// Pass 1: checks every ticked folder. Deletes nothing.
-    fn start_check(&mut self, settings: archive::Settings) {
-        let todo = self.ticked_items();
+    /// Pass 1: checks ticked folders: those not yet passed (so a run carries
+    /// on where it stopped), or with `all`, every one again. Deletes nothing.
+    fn start_check(&mut self, settings: archive::Settings, all: bool) {
+        let todo: Vec<Candidate> =
+            self.ticked_items().into_iter().filter(|i| all || !self.checks.get(&i.archive_id).is_some_and(|c| c.passed)).collect();
         if todo.is_empty() {
             return;
         }
@@ -178,7 +160,7 @@ impl State {
                     break;
                 }
                 *cur.lock().unwrap() = format!("{} ({} of {total})", short(&item.source), n + 1);
-                let _ = tx.send(Msg::Checked(item.archive_id, check_one(&item, &settings, &p)));
+                let _ = tx.send(Msg::Checked(clean::check(&item, &settings, &p)));
             }
             let _ = tx.send(Msg::Done);
         });
@@ -192,26 +174,19 @@ impl State {
         if todo.is_empty() {
             return;
         }
-        let discarded: BTreeMap<i64, usize> = self
-            .checks
-            .iter()
-            .filter_map(|(id, c)| match c {
-                Check::Passed { discarded, .. } => Some((*id, *discarded)),
-                Check::Failed(_) => None,
-            })
-            .collect();
         let (tx, rx) = channel();
         let run = Self::new_run(Pass::Delete, todo.len(), rx);
         let (p, cur) = (run.progress.clone(), run.current.clone());
         std::thread::spawn(move || {
             let total = todo.len();
-            for (n, (item, snapshot)) in todo.into_iter().enumerate() {
+            for (n, item) in todo.into_iter().enumerate() {
                 if p.cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 *cur.lock().unwrap() = format!("{} ({} of {total})", short(&item.source), n + 1);
-                let d = discarded.get(&item.archive_id).copied().unwrap_or(0);
-                let _ = tx.send(Msg::Deleted(item.archive_id, delete_one(&item, &snapshot, d, &settings, &p)));
+                let discarded = item.check.as_ref().map_or(0, |c| c.discarded);
+                let result = clean::delete(&item, &settings, &p).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Msg::Deleted(item.archive_id, Outcome { source: item.source.clone(), discarded, result }));
             }
             let _ = tx.send(Msg::Done);
         });
@@ -249,87 +224,12 @@ impl State {
     }
 }
 
-/// Pass 1 for one folder: the full check against the catalogue and archive,
-/// then a snapshot of the folder to compare with just before deleting.
-fn check_one(item: &Item, settings: &archive::Settings, progress: &Arc<Progress>) -> Check {
-    let res = (|| -> anyhow::Result<Check> {
-        if archive::is_protected(&item.source, settings) {
-            anyhow::bail!("it is protected");
-        }
-        let cat = Catalog::open_existing(&settings.out_dir)?;
-        let recorded = cat.entries(item.archive_id)?;
-        let check = archive::check_before_delete(&item.source, &item.archive_path, &recorded, settings.threads, progress)?;
-        let snapshot = archive::folder_snapshot(&item.source)?;
-        Ok(Check::Passed { snapshot, discarded: check.discarded.len() })
-    })();
-    res.unwrap_or_else(|e| Check::Failed(format!("{e:#}")))
-}
-
-/// Pass 2 for one folder: deleted only if its snapshot is unchanged since it
-/// passed its check, and it isn't protected.
-fn delete_one(item: &Item, snapshot: &str, discarded: usize, settings: &archive::Settings, progress: &Arc<Progress>) -> Outcome {
-    let started = catalog::now_utc();
-    let result = (|| -> anyhow::Result<()> {
-        if archive::is_protected(&item.source, settings) {
-            anyhow::bail!("it is protected");
-        }
-        progress.set_phase("Making sure the folder hasn't changed since its check", 0);
-        if archive::folder_snapshot(&item.source)? != snapshot {
-            anyhow::bail!("it has changed since it was checked. Check it again");
-        }
-        progress.set_phase("Deleting the folder", 0);
-        archive::delete_folder(&item.source)?;
-        Catalog::open_existing(&settings.out_dir)?.mark_source_deleted(item.archive_id, &catalog::now_utc())?;
-        Ok(())
-    })()
-    .map_err(|e| format!("{e:#}"));
-    if let Ok(cat) = Catalog::open_existing(&settings.out_dir) {
-        let outcome = if result.is_ok() { "deleted" } else { "failed" };
-        let detail = result.clone().err().unwrap_or_default();
-        let _ = cat.log_run(Some(item.archive_id), "delete", &item.source, &started, outcome, &detail);
-    }
-    Outcome { source: item.source.clone(), discarded, result }
-}
-
-/// Reads, in the background, every archive not marked deleted: those whose
-/// folder is on disk (or found renamed), and those whose folder isn't.
+/// Reads, in the background, the archived folders and their saved checks.
 fn load(out: PathBuf, renamed: BTreeMap<i64, PathBuf>) -> Receiver<Result<Loaded, String>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let res = (|| -> anyhow::Result<Loaded> {
-            if !catalog::exists(&out) {
-                return Ok((Vec::new(), Vec::new()));
-            }
-            let cat = Catalog::open_existing(&out)?;
-            let (mut items, mut gone) = (Vec::new(), Vec::new());
-            for a in cat.archives()? {
-                if a.source_deleted_utc.is_some() {
-                    continue;
-                }
-                let recorded = PathBuf::from(&a.source_path);
-                let archive_path = PathBuf::from(&a.archive_path);
-                let (source, renamed_from) = if recorded.is_dir() {
-                    (recorded, None)
-                } else if let Some(p) = renamed.get(&a.id).filter(|p| p.is_dir()) {
-                    (p.clone(), Some(short(&recorded)))
-                } else {
-                    gone.push(Gone { archive_id: a.id, source: recorded, archive_path });
-                    continue;
-                };
-                items.push(Item {
-                    archive_id: a.id,
-                    archive_name: archive_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                    archive_path,
-                    source,
-                    renamed_from,
-                    bytes: a.input_bytes,
-                    archived: a.created_utc.get(..10).unwrap_or(&a.created_utc).to_string(),
-                });
-            }
-            Ok((items, gone))
-        })()
-        .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(res);
+        let res = clean::candidates(&out, &renamed).and_then(|(c, m)| Ok((c, m, clean::ticked(&out)?)));
+        let _ = tx.send(res.map_err(|e| format!("{e:#}")));
     });
     rx
 }
@@ -351,8 +251,8 @@ impl App {
         }
         for m in msgs {
             match m {
-                Msg::Checked(id, c) => {
-                    st.checks.insert(id, c);
+                Msg::Checked(c) => {
+                    st.checks.insert(c.archive_id, c);
                     if let Some(r) = &mut st.running {
                         r.done += 1;
                     }
@@ -401,10 +301,13 @@ impl App {
         {
             st.loading = None;
             match res {
-                Ok((items, gone)) => {
+                Ok((items, gone, saved_ticks)) => {
                     let ids: BTreeSet<i64> = items.iter().map(|i| i.archive_id).collect();
-                    st.ticked.retain(|id| ids.contains(id));
-                    st.checks.retain(|id, _| ids.contains(id));
+                    // The saved ticks are the record: they survive a restart.
+                    st.ticked = saved_ticks.into_iter().filter(|id| ids.contains(id)).collect();
+                    st.saved_ticks = st.ticked.clone();
+                    // The catalogue's saved checks are the record: they survive a restart.
+                    st.checks = items.iter().filter_map(|i| i.check.clone().map(|c| (i.archive_id, c))).collect();
                     st.items = items;
                     st.gone = gone;
                 }
@@ -414,6 +317,15 @@ impl App {
                     st.error = Some(e);
                 }
             }
+        }
+
+        // Ticks changed last frame: save them, in the background.
+        if st.loading.is_none() && st.loaded && st.ticked != st.saved_ticks {
+            st.saved_ticks = st.ticked.clone();
+            let (dir, ids): (PathBuf, Vec<i64>) = (out.clone(), st.ticked.iter().copied().collect());
+            std::thread::spawn(move || {
+                let _ = clean::set_ticked(&dir, &ids);
+            });
         }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -455,8 +367,9 @@ impl App {
             let ticked = st.ticked_items();
             let ticked_bytes: u64 = ticked.iter().map(|i| i.bytes).sum();
             let unchecked = ticked.iter().filter(|i| !st.checks.contains_key(&i.archive_id)).count();
+            let to_check = ticked.iter().filter(|i| !st.checks.get(&i.archive_id).is_some_and(|c| c.passed)).count();
             let ready = st.ready().len();
-            let failed = ticked.iter().filter(|i| matches!(st.checks.get(&i.archive_id), Some(Check::Failed(_)))).count();
+            let failed = ticked.iter().filter(|i| st.checks.get(&i.archive_id).is_some_and(|c| !c.passed)).count();
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Tick all")).clicked() {
                     st.ticked = st.items.iter().map(|i| i.archive_id).collect();
@@ -476,12 +389,25 @@ impl App {
                 } else {
                     "Step 1: checks each ticked folder against the catalogue and its archive. Deletes nothing."
                 };
-                let label = if unchecked == ticked.len() { format!("1. Check {} ticked", folders(ticked.len())) } else { format!("1. Check {} ticked again", folders(ticked.len())) };
-                if ui.add_enabled(idle && !ticked.is_empty(), egui::Button::new(label)).on_hover_text(tip).clicked() {
-                    st.start_check(settings.clone());
+                let label = if to_check == ticked.len() {
+                    format!("1. Check {} ticked", folders(to_check))
+                } else {
+                    format!("1. Check the {} not yet passed", folders(to_check))
+                };
+                if ui.add_enabled(idle && to_check > 0, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                    st.start_check(settings.clone(), false);
+                }
+                let again = to_check < ticked.len();
+                if again
+                    && ui
+                        .add_enabled(idle, egui::Button::new("Check all ticked again"))
+                        .on_hover_text("Checks every ticked folder again, including those that already passed")
+                        .clicked()
+                {
+                    st.start_check(settings.clone(), true);
                 }
                 let go = egui::Button::new(RichText::new(format!("2. Delete {} that passed…", folders(ready))).color(egui::Color32::WHITE)).fill(theme::danger_fill());
-                let tip = "Step 2: deletes only ticked folders that passed their check, each only if it hasn't changed since";
+                let tip = "Step 2: deletes only ticked folders that passed their check, each only if it hasn't changed since. Checks are saved, so this can be done in a later session.";
                 if ui.add_enabled(idle && ready > 0, go).on_hover_text(tip).clicked() {
                     st.confirm = true;
                 }
@@ -637,16 +563,22 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                             }
                         });
                         ui.label(human(i.bytes));
-                        ui.label(RichText::new(format!("→ {} · archived {}", i.archive_name, i.archived)).color(theme::muted()))
+                        ui.label(RichText::new(format!("→ {} · archived {}", i.archive_name(), i.archived)).color(theme::muted()))
                             .on_hover_text(i.archive_path.display().to_string());
                         match st.checks.get(&i.archive_id) {
-                            Some(Check::Passed { discarded, .. }) => {
-                                let t = if *discarded > 0 { format!("✓ passed · {discarded} discarded files go with it") } else { "✓ passed".to_string() };
+                            Some(c) if c.passed => {
+                                let mut t = format!("✓ passed {}", when(&c.checked_utc));
+                                if c.snapshot.as_deref().is_some_and(archive::snapshot_used_journal) {
+                                    t.push_str(" · change journal");
+                                }
+                                if c.discarded > 0 {
+                                    t.push_str(&format!(" · {} discarded files go with it", c.discarded));
+                                }
                                 ui.colored_label(theme::ok(), t);
                             }
-                            Some(Check::Failed(e)) => {
-                                let first = e.lines().next().unwrap_or(e).to_string();
-                                ui.colored_label(theme::danger(), format!("✗ {first}")).on_hover_text(e);
+                            Some(c) => {
+                                let first = c.detail.lines().next().unwrap_or(&c.detail).to_string();
+                                ui.colored_label(theme::danger(), format!("✗ {first}")).on_hover_text(format!("Checked {}\n{}", when(&c.checked_utc), c.detail));
                             }
                             None => {
                                 let t = if st.ticked.contains(&i.archive_id) { "not checked yet" } else { "" };
@@ -664,14 +596,8 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
 
 fn confirm(ctx: &egui::Context, st: &mut State, settings: &archive::Settings) {
     let ready = st.ready();
-    let bytes: u64 = ready.iter().map(|(i, _)| i.bytes).sum();
-    let discarded: usize = ready
-        .iter()
-        .filter_map(|(i, _)| match st.checks.get(&i.archive_id) {
-            Some(Check::Passed { discarded, .. }) => Some(*discarded),
-            _ => None,
-        })
-        .sum();
+    let bytes: u64 = ready.iter().map(|i| i.bytes).sum();
+    let discarded: usize = ready.iter().filter_map(|i| i.check.as_ref().map(|c| c.discarded)).sum();
     let skipped = st.ticked_items().len().saturating_sub(ready.len());
     let mut go = false;
     let mut close = false;
@@ -694,7 +620,7 @@ fn confirm(ctx: &egui::Context, st: &mut State, settings: &archive::Settings) {
         );
         ui.add_space(6.0);
         egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-            for (i, _) in &ready {
+            for i in &ready {
                 ui.label(RichText::new(i.source.display().to_string()).monospace());
             }
         });
@@ -749,4 +675,12 @@ fn short(p: &Path) -> String {
 
 fn folders(n: usize) -> String {
     if n == 1 { "1 folder".into() } else { format!("{n} folders") }
+}
+
+/// When a check was made, for showing: "on 2026-11-10 at 21:40" (UTC as recorded).
+fn when(utc: &str) -> String {
+    match (utc.get(..10), utc.get(11..16)) {
+        (Some(d), Some(t)) => format!("on {d} at {t}"),
+        _ => utc.to_string(),
+    }
 }

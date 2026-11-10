@@ -159,6 +159,22 @@ CREATE INDEX IF NOT EXISTS deps_archive ON deps(archive_id);
 CREATE INDEX IF NOT EXISTS deps_original ON deps(original_archive, original_path);
 -- Earlier file names of archives renamed outside AtticARC, so reference
 -- files that name an original's archive by its old name still resolve.
+-- Clean up's checks of archived folders, kept so a check survives a restart:
+-- the folder checked, whether it passed (with a snapshot of it then, to
+-- compare with just before deleting) or why not, and when.
+CREATE TABLE IF NOT EXISTS cleanup_checks (
+    archive_id  INTEGER PRIMARY KEY REFERENCES archives(id),
+    source_path TEXT NOT NULL,
+    passed      INTEGER NOT NULL,
+    snapshot    TEXT,
+    discarded   INTEGER NOT NULL DEFAULT 0,
+    detail      TEXT NOT NULL DEFAULT '',
+    checked_utc TEXT NOT NULL
+);
+-- Folders ticked on the Clean up page, so the ticks survive a restart.
+CREATE TABLE IF NOT EXISTS cleanup_ticked (
+    archive_id INTEGER PRIMARY KEY REFERENCES archives(id)
+);
 CREATE TABLE IF NOT EXISTS archive_aliases (
     old_name   TEXT NOT NULL,
     archive_id INTEGER NOT NULL REFERENCES archives(id)
@@ -725,7 +741,57 @@ impl Catalog {
             "UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1",
             params![archive_id, when_utc],
         )?;
+        self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![archive_id])?;
+        self.conn.execute("DELETE FROM cleanup_ticked WHERE archive_id = ?1", params![archive_id])?;
         Ok(())
+    }
+
+    /// The folders ticked on the Clean up page, by archive id.
+    pub fn cleanup_ticked(&self) -> Result<Vec<i64>> {
+        let mut q = self.conn.prepare("SELECT archive_id FROM cleanup_ticked ORDER BY archive_id")?;
+        let ids = q.query_map([], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces the ticked folders with `ids`.
+    pub fn set_cleanup_ticked(&mut self, ids: &[i64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM cleanup_ticked", [])?;
+        for id in ids {
+            tx.execute("INSERT OR IGNORE INTO cleanup_ticked (archive_id) VALUES (?1)", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a Clean up check of an archived folder, replacing any earlier one.
+    pub fn save_cleanup_check(&self, c: &SavedCheck) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cleanup_checks
+                (archive_id, source_path, passed, snapshot, discarded, detail, checked_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![c.archive_id, c.source_path, c.passed, c.snapshot, c.discarded as i64, c.detail, c.checked_utc],
+        )?;
+        Ok(())
+    }
+
+    /// Every Clean up check recorded, for folders not yet deleted.
+    pub fn cleanup_checks(&self) -> Result<Vec<SavedCheck>> {
+        let mut q = self.conn.prepare(
+            "SELECT archive_id, source_path, passed, snapshot, discarded, detail, checked_utc FROM cleanup_checks",
+        )?;
+        let rows = q.query_map([], |r| {
+            Ok(SavedCheck {
+                archive_id: r.get(0)?,
+                source_path: r.get(1)?,
+                passed: r.get(2)?,
+                snapshot: r.get(3)?,
+                discarded: r.get::<_, i64>(4)? as usize,
+                detail: r.get(5)?,
+                checked_utc: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn log_run(
@@ -753,7 +819,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archive_aliases; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archive_aliases; DELETE FROM cleanup_checks; DELETE FROM cleanup_ticked; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)
@@ -1105,4 +1171,20 @@ pub fn fingerprint(created_utc: &str, entries: &[EntryRecord]) -> String {
         h.update(b"\n");
     }
     h.finalize().to_hex().to_string()
+}
+
+/// A Clean up check of an archived folder, as recorded in the catalogue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedCheck {
+    pub archive_id: i64,
+    /// The folder that was checked (it may have been renamed since archiving).
+    pub source_path: String,
+    pub passed: bool,
+    /// For a folder that passed: its snapshot then, from `archive::folder_snapshot`.
+    pub snapshot: Option<String>,
+    /// Files a discard rule left out of the archive, deleted with the folder.
+    pub discarded: usize,
+    /// Why it failed; empty if it passed.
+    pub detail: String,
+    pub checked_utc: String,
 }
