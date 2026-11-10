@@ -30,6 +30,8 @@ pub struct State {
     note: Option<String>,
     extracting: Option<Receiver<Result<PathBuf, String>>>,
     rebuilding: Option<Receiver<Result<archive::Rebuilt, String>>>,
+    /// How far a rebuild has got, for its spinner and bar.
+    rebuild_progress: Option<Arc<archive::Progress>>,
     rebuild_note: Option<String>,
     /// The archive open in the browser, which is the one picked in the
     /// archive filter while there is no search.
@@ -87,11 +89,14 @@ impl State {
     fn rebuild(&mut self, out: &std::path::Path) {
         let (tx, rx) = channel();
         let out = out.to_path_buf();
+        let progress = Arc::new(archive::Progress::default());
+        let p = progress.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(archive::rebuild_catalog(&out).map_err(|e| format!("{e:#}")));
+            let _ = tx.send(archive::rebuild_catalog_with(&out, &p).map_err(|e| format!("{e:#}")));
         });
         self.rebuilding = Some(rx);
-        self.rebuild_note = Some("Reading the manifests inside the archives…".into());
+        self.rebuild_progress = Some(progress);
+        self.rebuild_note = None;
     }
 }
 
@@ -146,6 +151,7 @@ impl App {
                     Err(e) => format!("Rebuild failed: {e}"),
                 });
                 st.rebuilding = None;
+                st.rebuild_progress = None;
                 st.cleared = true;
                 st.invalidate();
             }
@@ -267,6 +273,7 @@ impl App {
                 if ui.add_enabled(!busy && st.rebuilding.is_none(), rebuild).clicked() {
                     st.rebuild(&out);
                 }
+                rebuild_progress(ui, st);
                 for n in [&st.note, &st.rebuild_note].into_iter().flatten() {
                     ui.label(RichText::new(n).color(theme::muted()));
                 }
@@ -300,6 +307,7 @@ impl App {
                 }
             });
         });
+        rebuild_progress(ui, st);
         if let Some(n) = &st.rebuild_note {
             ui.label(RichText::new(n).color(theme::muted()));
         }
@@ -757,4 +765,17 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, out: &Path, setting
     if let Some(n) = &st.note {
         ui.label(RichText::new(n).color(theme::muted()));
     }
+}
+
+/// A rebuild in progress: a spinner, what is being read and a bar.
+fn rebuild_progress(ui: &mut egui::Ui, st: &State) {
+    let Some(p) = &st.rebuild_progress else { return };
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(RichText::new(format!("Rebuilding the catalogue: {}", p.phase.lock().unwrap())).color(theme::muted()));
+    });
+    if p.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        ui.add(egui::ProgressBar::new(p.fraction()).desired_height(8.0).fill(theme::accent()));
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
 }
