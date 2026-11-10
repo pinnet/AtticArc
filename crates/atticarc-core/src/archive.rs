@@ -582,39 +582,141 @@ pub struct Rebuilt {
     pub already_there: u64,
     /// Archives that couldn't be added, with the reason.
     pub failed: Vec<String>,
+    /// Archives found under a new name and relinked: (old name, new name).
+    pub relinked: Vec<(String, String)>,
+    /// Files that are copies of an archive already in the catalogue under
+    /// another name, so were not added twice.
+    pub copies: Vec<String>,
 }
 
 /// Adds every .7z in `out_dir` that isn't in its catalogue yet, from the
 /// manifests the archives carry. Archives already catalogued are left alone.
 pub fn rebuild_catalog(out_dir: &Path) -> Result<Rebuilt> {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(out_dir)
-        .with_context(|| format!("can't read {}", out_dir.display()))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("7z")))
-        .collect();
-    found.sort();
     let mut out = Rebuilt::default();
+    if crate::catalog::exists(out_dir) {
+        // Archives renamed since they were catalogued are relinked, not added twice.
+        out.relinked = relink_missing(out_dir)?.relinked;
+    }
+    let found = archive_files(out_dir)?;
     if found.is_empty() {
         return Ok(out);
     }
     let mut cat = Catalog::open(out_dir)?;
+    // Fingerprints of the archives already catalogued, made when first needed.
+    let mut known: Option<HashMap<String, String>> = None;
     for path in found {
         let key = crate::settings::strip_verbatim(&path).to_string_lossy().into_owned();
         if cat.has_archive_path(&key)? {
             out.already_there += 1;
             continue;
         }
+        let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let added = read_manifest(&path).and_then(|m| {
+            if known.is_none() {
+                known = Some(catalogue_fingerprints(&cat)?);
+            }
+            let fp = crate::catalog::fingerprint(&m.archive.created_utc, &m.entries);
+            if let Some(of) = known.as_ref().and_then(|k| k.get(&fp)) {
+                return Ok(Some(of.clone()));
+            }
             let id = cat.insert_archive(&m.archive, &m.entries)?;
-            cat.insert_excluded(id, &m.excluded)
+            cat.insert_excluded(id, &m.excluded)?;
+            Ok(None)
         });
         match added {
-            Ok(_) => out.added += 1,
-            Err(e) => out.failed.push(format!("{}: {e:#}", path.file_name().unwrap_or_default().to_string_lossy())),
+            Ok(None) => out.added += 1,
+            Ok(Some(of)) => out.copies.push(format!("{file} is a copy of {of}")),
+            Err(e) => out.failed.push(format!("{file}: {e:#}")),
         }
     }
     Ok(out)
+}
+
+/// The `.7z` files directly in `dir`, sorted.
+fn archive_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("can't read {}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("7z")))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// Fingerprint → archive file name, for every archive in the catalogue.
+fn catalogue_fingerprints(cat: &Catalog) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for a in cat.archives()? {
+        let fp = crate::catalog::fingerprint(&a.created_utc, &cat.entries(a.id)?);
+        let name = Path::new(&a.archive_path).file_name().unwrap_or_default().to_string_lossy().into_owned();
+        map.insert(fp, name);
+    }
+    Ok(map)
+}
+
+/// What [`relink_missing`] did.
+#[derive(Debug, Default)]
+pub struct Relinked {
+    /// Archives found under a new name: (old file name, new file name).
+    pub relinked: Vec<(String, String)>,
+    /// Archives whose file is missing and wasn't found under another name.
+    pub missing: Vec<i64>,
+}
+
+/// Finds catalogued archives whose file is gone from `out_dir`, and looks
+/// for them among the `.7z` files there that the catalogue doesn't know,
+/// by [`crate::catalog::fingerprint`]: so renaming an archive in Explorer doesn't
+/// lose it. A match is relinked, keeping its old name as an alias so
+/// reference files naming it still resolve. Only the small manifests of
+/// unknown files are read, and only when something is missing.
+pub fn relink_missing(out_dir: &Path) -> Result<Relinked> {
+    let mut out = Relinked::default();
+    let mut cat = Catalog::open_existing(out_dir)?;
+    let missing: Vec<_> = cat.archives()?.into_iter().filter(|a| !Path::new(&a.archive_path).is_file()).collect();
+    if missing.is_empty() {
+        return Ok(out);
+    }
+    let mut unknown: HashMap<String, PathBuf> = HashMap::new();
+    // If the folder can't be listed, nothing is relinked and the archives stay missing.
+    for path in archive_files(out_dir).unwrap_or_default() {
+        let key = crate::settings::strip_verbatim(&path).to_string_lossy().into_owned();
+        if cat.has_archive_path(&key)? {
+            continue;
+        }
+        if let Ok(m) = read_manifest(&path) {
+            unknown.insert(crate::catalog::fingerprint(&m.archive.created_utc, &m.entries), path);
+        }
+    }
+    for a in missing {
+        let fp = crate::catalog::fingerprint(&a.created_utc, &cat.entries(a.id)?);
+        match unknown.remove(&fp) {
+            Some(path) => {
+                let new = crate::settings::strip_verbatim(&path).to_string_lossy().into_owned();
+                cat.relink(a.id, &new)?;
+                let name = |p: &str| Path::new(p).file_name().unwrap_or_default().to_string_lossy().into_owned();
+                out.relinked.push((name(&a.archive_path), name(&new)));
+            }
+            None => out.missing.push(a.id),
+        }
+    }
+    Ok(out)
+}
+
+/// The archive file named `name` in `out_dir`, the way a reference file
+/// names its original's archive. If it was renamed and relinked since,
+/// its current path from the catalogue.
+fn original_archive_file(out_dir: &Path, name: &str) -> PathBuf {
+    let plain = out_dir.join(name);
+    if plain.is_file() {
+        return plain;
+    }
+    Catalog::open_existing(out_dir)
+        .and_then(|c| c.path_for_alias(name))
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+        .unwrap_or(plain)
 }
 
 fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
@@ -1159,7 +1261,7 @@ pub fn put_back_replaced(archive: &Path, rels: &[String], settings: &Settings, p
 /// Follows a reference file: extracts the original it points to into
 /// `dest_dir`, under the replaced file's name, and checks its hash.
 pub fn extract_original(out_dir: &Path, dep: &Replaced, dest_dir: &Path, threads: u32) -> Result<PathBuf> {
-    let from = out_dir.join(&dep.original_archive);
+    let from = original_archive_file(out_dir, &dep.original_archive);
     if !from.is_file() {
         bail!("{} holds the original but isn't there", from.display());
     }
@@ -1336,7 +1438,7 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
         let mut wanted: BTreeMap<PathBuf, Vec<(String, PathBuf)>> = BTreeMap::new();
         for rel in ch.put_back {
             let d = ex.deps.iter().find(|d| &d.entry.rel_path == rel).unwrap();
-            let from = out_dir.join(&d.original_archive);
+            let from = original_archive_file(out_dir, &d.original_archive);
             if !from.is_file() {
                 bail!("{} holds the original of {rel} but isn't there", from.display());
             }
@@ -1822,6 +1924,45 @@ mod tests {
         assert_eq!(b.archive_bytes, a.archive_bytes);
         let r = rebuild_catalog(&out).unwrap();
         assert_eq!((r.added, r.already_there), (0, 1));
+    }
+
+    #[test]
+    fn a_renamed_archive_is_relinked_not_added_twice() {
+        let (_tmp, src, out) = run(true);
+        let (a, before) = recorded(&out, &src);
+        let old = a.archive_path.file_name().unwrap().to_string_lossy().into_owned();
+        let renamed = out.join("Renamed in Explorer.7z");
+        std::fs::rename(&a.archive_path, &renamed).unwrap();
+        let now = crate::settings::strip_verbatim(&renamed);
+
+        let r = relink_missing(&out).unwrap();
+        assert_eq!(r.relinked, vec![(old.clone(), "Renamed in Explorer.7z".to_string())]);
+        assert!(r.missing.is_empty());
+        let cat = Catalog::open_existing(&out).unwrap();
+        let all = cat.archives().unwrap();
+        assert_eq!(all.len(), 1, "relinked, not added again");
+        assert_eq!(PathBuf::from(&all[0].archive_path), now);
+        // Reference files naming the old file name still find it.
+        assert_eq!(cat.path_for_alias(&old).unwrap().map(PathBuf::from), Some(now.clone()));
+        assert_eq!(original_archive_file(&out, &old), now);
+        let (_, after) = recorded(&out, &src);
+        assert_eq!(after, before);
+
+        // A copy under a third name is reported, not catalogued twice.
+        std::fs::copy(&renamed, out.join("Copy.7z")).unwrap();
+        let r = rebuild_catalog(&out).unwrap();
+        assert_eq!((r.added, r.already_there, r.copies.len()), (0, 1, 1), "{r:?}");
+        assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_missing_archive_with_no_match_stays_missing() {
+        let (_tmp, src, out) = run(true);
+        let (a, _) = recorded(&out, &src);
+        std::fs::remove_file(&a.archive_path).unwrap();
+        let r = relink_missing(&out).unwrap();
+        assert!(r.relinked.is_empty());
+        assert_eq!(r.missing.len(), 1);
     }
 
     #[test]

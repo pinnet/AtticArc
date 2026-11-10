@@ -157,6 +157,13 @@ CREATE TABLE IF NOT EXISTS deps (
 );
 CREATE INDEX IF NOT EXISTS deps_archive ON deps(archive_id);
 CREATE INDEX IF NOT EXISTS deps_original ON deps(original_archive, original_path);
+-- Earlier file names of archives renamed outside AtticARC, so reference
+-- files that name an original's archive by its old name still resolve.
+CREATE TABLE IF NOT EXISTS archive_aliases (
+    old_name   TEXT NOT NULL,
+    archive_id INTEGER NOT NULL REFERENCES archives(id)
+);
+CREATE INDEX IF NOT EXISTS archive_aliases_name ON archive_aliases(old_name);
 "#;
 
 /// One file or folder as recorded in the catalog and the manifest.
@@ -334,6 +341,30 @@ impl Catalog {
     pub fn has_archive_path(&self, path: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM archives WHERE archive_path = ?1", params![path], |r| r.get(0))?;
         Ok(n > 0)
+    }
+
+    /// Points archive `id` at `new_path`, after its file was renamed or moved
+    /// outside AtticARC, and remembers its old file name as an alias.
+    pub fn relink(&mut self, id: i64, new_path: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let old: String = tx.query_row("SELECT archive_path FROM archives WHERE id = ?1", params![id], |r| r.get(0))?;
+        let old_name = Path::new(&old).file_name().unwrap_or_default().to_string_lossy().into_owned();
+        tx.execute("UPDATE archives SET archive_path = ?1 WHERE id = ?2", params![new_path, id])?;
+        if !old_name.is_empty() {
+            tx.execute("INSERT INTO archive_aliases (old_name, archive_id) VALUES (?1, ?2)", params![old_name, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The current path of the archive once called `old_name` (a file name),
+    /// if it was renamed and relinked.
+    pub fn path_for_alias(&self, old_name: &str) -> Result<Option<String>> {
+        let mut q = self.conn.prepare(
+            "SELECT a.archive_path FROM archive_aliases x JOIN archives a ON a.id = x.archive_id
+             WHERE x.old_name = ?1 COLLATE NOCASE ORDER BY x.rowid DESC LIMIT 1",
+        )?;
+        Ok(q.query_row(params![old_name], |r| r.get(0)).optional()?)
     }
 
     pub fn entries(&self, archive_id: i64) -> Result<Vec<EntryRecord>> {
@@ -722,7 +753,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archive_aliases; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)
@@ -1053,4 +1084,25 @@ pub fn now_utc() -> String {
 /// Local wall-clock time as `HH:MM`, for logs shown to people.
 pub fn local_hhmm() -> String {
     chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// An archive's identity, independent of its file name: a BLAKE3 hash of
+/// its creation time and every entry's path, kind, size and hash. The
+/// catalogue and the manifest inside the archive give the same value, so a
+/// renamed archive can be matched to its record without hashing the file.
+pub fn fingerprint(created_utc: &str, entries: &[EntryRecord]) -> String {
+    let mut rows: Vec<&EntryRecord> = entries.iter().collect();
+    rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let mut h = blake3::Hasher::new();
+    h.update(created_utc.as_bytes());
+    h.update(b"\n");
+    for e in rows {
+        h.update(e.rel_path.as_bytes());
+        h.update(if e.is_dir { b"\0d\0" } else { b"\0f\0" });
+        h.update(e.size.to_string().as_bytes());
+        h.update(b"\0");
+        h.update(e.blake3.as_deref().unwrap_or("").as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().to_hex().to_string()
 }

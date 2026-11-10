@@ -176,6 +176,8 @@ impl App {
             let dir = out.clone();
             std::thread::spawn(move || {
                 let res = if catalog::exists(&dir) {
+                    // Archives renamed in Explorer are found again first, so they aren't taken for missing originals.
+                    let _ = archive::relink_missing(&dir);
                     Catalog::open_existing(&dir).and_then(|c| c.dedupe_tree()).map_err(|e| format!("{e:#}"))
                 } else {
                     Ok(Vec::new())

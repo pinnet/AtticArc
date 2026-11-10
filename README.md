@@ -150,6 +150,17 @@ space keeping one copy of each would free; `--csv FILE` writes every confirmed f
 `group,size,blake3,path`. Files that can't be read, or changed since the scan, are reported and
 left out rather than stopping the run. Nothing is changed on disk.
 
+### Renamed archives
+
+An archive is known by what it holds, not its file name: a fingerprint of its creation time and every
+file's path, size and BLAKE3 hash, which the catalogue and the manifest inside the archive both give.
+If an archive is renamed in Explorer, the Catalogue and Duplicates pages find it again under its new
+name when they load (reading only the small manifests of `.7z` files the catalogue doesn't know),
+update the catalogue, and keep the old name so reference files that name it still work.
+**Rebuild from archives** relinks renamed archives instead of adding them twice, and reports a copy of
+an archive under another name instead of cataloguing it again. An archive whose file can't be found
+at all is marked as missing.
+
 ### Free space
 
 Before a folder is archived, its destination must have room for the archive (and the set-aside
