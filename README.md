@@ -1,17 +1,54 @@
 # AtticARC
 
-Archive, catalogue and de-duplicate large folder collections, to free up disk space without losing anything that matters.
+Archive, catalogue and de-duplicate large folder collections, to free up disk space without losing
+anything that matters.
 
-Private successor to `pinnet/compressed-subfolders-7z`, rewritten in Rust. The archive,
-catalogue and verified-delete engine comes from foldarc, which is now part of AtticARC.
+AtticARC packs each folder into its own ordinary `.7z` archive (readable with plain 7-Zip), checks
+every file in the archive against hashes taken while compressing, and records everything in a
+searchable catalogue that travels with the archives. Only then, after a second full check, does it
+delete the original folder. It finds duplicate files across archives and, if you choose, replaces
+later copies with small reference files pointing at the original.
 
-## What it will do
+Windows is the main target (a GUI and a command-line tool); the code is plain Rust and builds on
+other platforms too.
 
-1. **Scan** a source folder, recording path, size and date (fast, no file reads).
-2. **Hash** only files whose size matches another, to confirm duplicates.
-3. **Archive** each top-level folder to its own `.7z` on the destination drive, then verify it.
-4. **Catalogue** everything in a SQLite file kept on the destination drive, so the catalogue travels with the archives.
-5. **Review duplicates** in a GUI and remove copies only after confirming the list. Every removal is logged with the path of the kept copy.
+## Features
+
+- **Verified archives**: every file hashed (BLAKE3 and SHA-256) as it is compressed; each archive
+  decoded and checked before it is catalogued.
+- **Searchable catalogue** (SQLite) beside the archives, rebuildable from the archives alone: each
+  carries its own manifest.
+- **Safe clean-up**: originals are deleted in two passes: check every ticked folder (every file
+  hashed, the archive decoded), then delete only those that passed and haven't changed since.
+- **Duplicates**: found across all archives by hash; replacing them is opt-in, with a dry run.
+- **Exclusions**: leave junk out (discard) or keep files apart (set aside) by rule.
+- **Free-space check**: a folder that can't fit is refused before anything is written.
+- **Rename-proof**: archives and archived folders renamed in Explorer are found again by what they
+  hold.
+
+## Install
+
+Download `atticarc.exe` (the GUI) and `atticarc-cli.exe` from the
+[latest release](https://github.com/pinnet/AtticArc/releases/latest). No installer; run them from
+anywhere.
+
+Or build from source with Rust (stable, edition 2024):
+
+```
+cargo build --release
+```
+
+The programs are in `target/release/`. `cargo test` runs the tests.
+
+## Status
+
+**0.9.0** is the first release: the full workflow, tested on live data (56 folders, 416,320 files).
+Until 1.0, the formats your data lives in (the archive manifest, the catalogue database and the
+`.atticarcdep` reference files) may still change. See [CHANGELOG.md](CHANGELOG.md).
+
+## Licence
+
+MIT: see [LICENSE](LICENSE).
 
 ## Decisions so far
 
