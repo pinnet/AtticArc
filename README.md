@@ -91,10 +91,15 @@ Starts on the given source folder (or the last one used).
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Clean up**: the last step. Every archived folder whose source is still on disk, as a tree by parent
-  folder with tick boxes (nothing ticked to start; a parent's box ticks all its folders). **Delete N
-  ticked…** checks each one against its archive (files against the catalogue, archive decoded) and
-  deletes it; a folder that fails its check is left alone and the rest carry on. **Stop after this
-  folder** ends the run cleanly. Each result is listed, with any discarded files deleted with it.
+  folder with tick boxes (nothing ticked to start; a parent's box ticks all its folders). Deleting is
+  two separate passes, so nothing is deleted until every ticked folder has been checked:
+  **1. Check** compares each ticked folder with the catalogue and its archive (every file hashed, the
+  archive decoded) and shows the result on each folder, deleting nothing; **2. Delete … that passed**
+  deletes only ticked folders that passed, after a yes, and just before each one compares it with a
+  snapshot taken at its check: a folder changed since then is left alone. **Stop after this folder**
+  ends either pass cleanly. Archived folders no longer where they were are listed apart, with
+  **Look for renamed folders**, which finds a folder holding exactly their files among those beside
+  them and lists it under its new name (checked like any other before deleting).
 - The sidebar runs in the order of the work: New job, Progress, Duplicates, Excluded, Clean up. The
   **Catalogue** sits apart below it, under *Look up*, since it is for finding things, not a step.
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
