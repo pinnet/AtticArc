@@ -171,6 +171,10 @@ CREATE TABLE IF NOT EXISTS cleanup_checks (
     detail      TEXT NOT NULL DEFAULT '',
     checked_utc TEXT NOT NULL
 );
+-- Folders ticked on the Clean up page, so the ticks survive a restart.
+CREATE TABLE IF NOT EXISTS cleanup_ticked (
+    archive_id INTEGER PRIMARY KEY REFERENCES archives(id)
+);
 CREATE TABLE IF NOT EXISTS archive_aliases (
     old_name   TEXT NOT NULL,
     archive_id INTEGER NOT NULL REFERENCES archives(id)
@@ -738,6 +742,25 @@ impl Catalog {
             params![archive_id, when_utc],
         )?;
         self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![archive_id])?;
+        self.conn.execute("DELETE FROM cleanup_ticked WHERE archive_id = ?1", params![archive_id])?;
+        Ok(())
+    }
+
+    /// The folders ticked on the Clean up page, by archive id.
+    pub fn cleanup_ticked(&self) -> Result<Vec<i64>> {
+        let mut q = self.conn.prepare("SELECT archive_id FROM cleanup_ticked ORDER BY archive_id")?;
+        let ids = q.query_map([], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces the ticked folders with `ids`.
+    pub fn set_cleanup_ticked(&mut self, ids: &[i64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM cleanup_ticked", [])?;
+        for id in ids {
+            tx.execute("INSERT OR IGNORE INTO cleanup_ticked (archive_id) VALUES (?1)", params![id])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -796,7 +819,7 @@ impl Catalog {
         let n: i64 = tx.query_row("SELECT COUNT(*) FROM archives", [], |r| r.get(0))?;
         tx.execute_batch(
             "INSERT INTO entries_fts(entries_fts) VALUES('delete-all');
-             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archive_aliases; DELETE FROM cleanup_checks; DELETE FROM archives;",
+             DELETE FROM entries; DELETE FROM runs; DELETE FROM excluded; DELETE FROM deps; DELETE FROM archive_aliases; DELETE FROM cleanup_checks; DELETE FROM cleanup_ticked; DELETE FROM archives;",
         )?;
         tx.commit()?;
         Ok(n as u64)

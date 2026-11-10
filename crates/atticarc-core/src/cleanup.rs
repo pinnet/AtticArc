@@ -9,7 +9,11 @@
 //!    long run can be done over several sessions.
 //! 2. [`delete`] deletes a folder only if its saved check passed, and only if
 //!    a fresh [`archive::folder_snapshot`] still matches the one taken at the
-//!    check; otherwise the folder is left alone.
+//!    check; otherwise the folder is left alone. On NTFS the snapshot holds
+//!    each file's change journal number, so any write since the check is
+//!    caught, even one whose timestamps were set back.
+//!
+//! The folders ticked are saved too, so a run carries on across sessions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +49,12 @@ impl Candidate {
     pub fn passed(&self) -> bool {
         self.check.as_ref().is_some_and(|c| c.passed)
     }
+
+    /// Whether its saved check also covered the NTFS change journal, so even
+    /// an edit with its timestamps set back would be caught before deleting.
+    pub fn journal_checked(&self) -> bool {
+        self.check.as_ref().and_then(|c| c.snapshot.as_deref()).is_some_and(archive::snapshot_used_journal)
+    }
 }
 
 /// An archived folder that isn't where it was, and isn't marked deleted.
@@ -53,6 +63,19 @@ pub struct Missing {
     pub archive_id: i64,
     pub source: PathBuf,
     pub archive_path: PathBuf,
+}
+
+/// The folders ticked on the Clean up page, saved so they survive a restart.
+pub fn ticked(out_dir: &Path) -> Result<Vec<i64>> {
+    if !catalog::exists(out_dir) {
+        return Ok(Vec::new());
+    }
+    Catalog::open_existing(out_dir)?.cleanup_ticked()
+}
+
+/// Saves the ticked folders.
+pub fn set_ticked(out_dir: &Path, ids: &[i64]) -> Result<()> {
+    Catalog::open_existing(out_dir)?.set_cleanup_ticked(ids)
 }
 
 /// Every archive in `out_dir`'s catalogue not marked deleted: those whose
@@ -207,6 +230,17 @@ mod tests {
         let err = delete(&only(&out), &settings(&out), &Arc::new(Progress::default())).unwrap_err().to_string();
         assert!(err.contains("changed since it was checked"), "{err}");
         assert!(src.join("a.txt").exists());
+    }
+
+    #[test]
+    fn ticks_are_saved_and_dropped_once_deleted() {
+        let (_tmp, _src, out) = setup();
+        let c = only(&out);
+        set_ticked(&out, &[c.archive_id]).unwrap();
+        assert_eq!(ticked(&out).unwrap(), vec![c.archive_id]);
+        check(&c, &settings(&out), &Arc::new(Progress::default()));
+        delete(&only(&out), &settings(&out), &Arc::new(Progress::default())).unwrap();
+        assert!(ticked(&out).unwrap().is_empty());
     }
 
     #[test]

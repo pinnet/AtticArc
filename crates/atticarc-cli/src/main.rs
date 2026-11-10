@@ -476,7 +476,10 @@ fn run_cleanup(args: &[String]) -> ExitCode {
         }
     };
     let status = |c: &cleanup::Candidate| match &c.check {
-        Some(k) if k.passed => format!("passed {}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc)),
+        Some(k) if k.passed => {
+            let journal = if c.journal_checked() { ", change journal" } else { "" };
+            format!("passed {}{journal}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
+        }
         Some(k) => format!("FAILED: {}", k.detail.lines().next().unwrap_or("")),
         None => "not checked".to_string(),
     };

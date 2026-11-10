@@ -18,5 +18,6 @@ pub mod catalog;
 pub mod cleanup;
 pub mod disk;
 pub mod exclude;
+pub mod journal;
 pub mod scan;
 pub mod settings;

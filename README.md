@@ -137,8 +137,12 @@ Starts on the given source folder (or the last one used).
   ends either pass cleanly. Archived folders no longer where they were are listed apart, with
   **Look for renamed folders**, which finds a folder holding exactly their files among those beside
   them and lists it under its new name (checked like any other before deleting).
-  Checks are saved in the catalogue, so they survive a restart (or a window that froze): a long
-  run can be checked over several sessions and deleted later. The same steps run without the window
+  Checks and ticks are saved in the catalogue, so they survive a restart (or a window that froze):
+  **1. Check** carries on with the ticked folders not yet passed (**Check all ticked again** redoes
+  them all), and a long run can be checked over several sessions and deleted later. On NTFS, the
+  snapshot holds every file's change journal number, so any write since the check is caught, even
+  one whose timestamps were set back; it needs no administrator rights, and on drives without a
+  journal (exFAT) timestamps are used. Folders checked with the journal show "change journal". The same steps run without the window
   with `atticarc-cli cleanup <destination> [--check] [--delete]`.
 - The sidebar runs in the order of the work: New job, Progress, Duplicates, Excluded, Clean up. The
   **Catalogue** sits apart below it, under *Look up*, since it is for finding things, not a step.
