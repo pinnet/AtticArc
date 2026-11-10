@@ -50,7 +50,11 @@ pub struct State {
     /// Background reads of the catalogue, so a slow or sleeping disk never
     /// freezes the window: the archive list, a search (with the query and
     /// filter it is for) and an archive's contents for the browser.
-    loading_archives: Option<Receiver<Result<Vec<ArchiveSummary>, String>>>,
+    loading_archives: Option<Receiver<Result<(Vec<ArchiveSummary>, archive::Relinked), String>>>,
+    /// Archives whose file is gone and wasn't found under another name.
+    missing: std::collections::BTreeSet<i64>,
+    /// Archives found renamed and relinked when the catalogue was read.
+    relink_note: Option<String>,
     searching: Option<((String, Option<i64>), Receiver<Result<Vec<FoundFile>, String>>)>,
     browsing: Option<(i64, Receiver<Result<Browse, String>>)>,
 }
@@ -127,6 +131,13 @@ impl App {
                 st.rebuild_note = Some(match res {
                     Ok(r) => {
                         let mut n = format!("Rebuilt from the archives: {} added, {} already in the catalogue.", r.added, r.already_there);
+                        if !r.relinked.is_empty() {
+                            let list: Vec<String> = r.relinked.iter().map(|(o, n)| format!("{o} → {n}")).collect();
+                            n.push_str(&format!(" Relinked after a rename: {}.", list.join(", ")));
+                        }
+                        if !r.copies.is_empty() {
+                            n.push_str(&format!(" Not added, as copies: {}.", r.copies.join("; ")));
+                        }
                         if !r.failed.is_empty() {
                             n.push_str(&format!(" {} couldn't be read:\n{}", r.failed.len(), r.failed.join("\n")));
                         }
@@ -145,9 +156,12 @@ impl App {
             let dir = out.clone();
             std::thread::spawn(move || {
                 let res = if catalog::exists(&dir) {
-                    Catalog::open_existing(&dir).and_then(|c| c.archives()).map_err(|e| format!("{e:#}"))
+                    // Archives renamed in Explorer are found again by what they hold.
+                    archive::relink_missing(&dir)
+                        .and_then(|r| Ok((Catalog::open_existing(&dir)?.archives()?, r)))
+                        .map_err(|e| format!("{e:#}"))
                 } else {
-                    Ok(Vec::new())
+                    Ok((Vec::new(), archive::Relinked::default()))
                 };
                 let _ = tx.send(res);
             });
@@ -157,7 +171,14 @@ impl App {
             && let Ok(res) = rx.try_recv()
         {
             match res {
-                Ok(a) => st.archives = a,
+                Ok((a, r)) => {
+                    st.archives = a;
+                    st.missing = r.missing.into_iter().collect();
+                    if !r.relinked.is_empty() {
+                        let list: Vec<String> = r.relinked.iter().map(|(o, n)| format!("{o} → {n}")).collect();
+                        st.relink_note = Some(format!("Found renamed archives and updated the catalogue: {}", list.join(", ")));
+                    }
+                }
                 Err(e) => {
                     st.archives.clear();
                     st.error = Some(e);
@@ -209,6 +230,18 @@ impl App {
         ui.add_space(10.0);
         if let Some(e) = &st.error {
             ui.colored_label(theme::danger(), e);
+        }
+        if let Some(n) = &st.relink_note {
+            ui.colored_label(theme::ok(), n);
+        }
+        if !st.missing.is_empty() {
+            ui.colored_label(
+                theme::warn(),
+                format!(
+                    "{} archive file(s) can't be found in this folder, even under another name. They can still be browsed and searched, but not opened.",
+                    st.missing.len()
+                ),
+            );
         }
         if st.loading() {
             ui.horizontal(|ui| {
@@ -650,6 +683,9 @@ fn archive_list(ui: &mut egui::Ui, st: &mut State) {
                     let mut t = when.to_string();
                     if a.source_deleted_utc.is_some() {
                         t.push_str(" · source deleted");
+                    }
+                    if st.missing.contains(&a.id) {
+                        t.push_str(" · ⚠ archive file missing");
                     }
                     ui.label(t);
                     ui.end_row();
