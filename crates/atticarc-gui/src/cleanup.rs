@@ -393,7 +393,7 @@ fn confirm(ctx: &egui::Context, st: &mut State, settings: &archive::Settings) {
     let bytes: u64 = ticked.iter().map(|i| i.bytes).sum();
     let mut go = false;
     let mut close = false;
-    egui::Modal::new(egui::Id::new("cleanup-confirm")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("cleanup-confirm")).show(ctx, |ui| {
         ui.set_max_width(560.0);
         ui.heading(format!("Delete {}?", folders(ticked.len())));
         ui.label(format!("{} of original folders will be deleted, permanently: they don't go to the Recycle Bin.", human(bytes)));
