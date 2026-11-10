@@ -58,6 +58,9 @@ pub struct State {
     preview: Option<(BTreeSet<Key>, Result<ReplaceReport, String>)>,
     /// What the last run did, and whether it worked.
     note: Option<(bool, String)>,
+    /// The tree being read from the catalogue in the background, so a slow
+    /// or sleeping disk never freezes the window.
+    loading: Option<Receiver<Result<Vec<TreeArchive>, String>>>,
 }
 
 struct Running {
@@ -74,7 +77,12 @@ impl State {
     }
 
     pub fn busy(&self) -> bool {
-        self.running.is_some()
+        self.running.is_some() || self.loading.is_some()
+    }
+
+    /// The copies shown: those passing the size limit, if one is set.
+    fn shown(&self) -> impl Iterator<Item = (&TreeArchive, &TreeLeaf)> {
+        self.leaves().filter(|(_, l)| self.big_enough(l))
     }
 
     fn leaves(&self) -> impl Iterator<Item = (&TreeArchive, &TreeLeaf)> {
@@ -161,14 +169,30 @@ impl App {
         if st.min_mb == 0.0 && !st.min_on {
             st.min_mb = 200.0;
         }
-        if !st.loaded {
+        if !st.loaded && st.loading.is_none() {
             st.loaded = true;
             st.error = None;
-            st.tree.clear();
-            if catalog::exists(&out) {
-                match Catalog::open_existing(&out).and_then(|c| c.dedupe_tree()) {
-                    Ok(t) => st.tree = t,
-                    Err(e) => st.error = Some(format!("{e:#}")),
+            let (tx, rx) = channel();
+            let dir = out.clone();
+            std::thread::spawn(move || {
+                let res = if catalog::exists(&dir) {
+                    Catalog::open_existing(&dir).and_then(|c| c.dedupe_tree()).map_err(|e| format!("{e:#}"))
+                } else {
+                    Ok(Vec::new())
+                };
+                let _ = tx.send(res);
+            });
+            st.loading = Some(rx);
+        }
+        if let Some(rx) = &st.loading
+            && let Ok(res) = rx.try_recv()
+        {
+            st.loading = None;
+            match res {
+                Ok(t) => st.tree = t,
+                Err(e) => {
+                    st.tree.clear();
+                    st.error = Some(e);
                 }
             }
             let keys: BTreeSet<Key> = st.leaves().map(|(a, l)| key(a, l)).collect();
@@ -182,8 +206,13 @@ impl App {
                 st.selected = None;
             }
         }
-        let n_leaves = st.leaves().count();
-        let reclaimable: u64 = st.leaves().map(|(_, l)| l.size).sum();
+        if st.loading.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // Counts follow the size limit, so changing it updates the page at once.
+        let n_leaves = st.shown().count();
+        let reclaimable: u64 = st.shown().map(|(_, l)| l.size).sum();
+        let (n_small, small_bytes) = st.too_small();
         let replaced: u64 = st.tree.iter().map(|a| a.replaced).sum();
         let running = st.running.as_ref().filter(|r| !r.dry_run).map(|r| r.progress.clone());
 
@@ -214,13 +243,33 @@ impl App {
                 if ui.add_enabled(idle && n_leaves > 0, go).on_hover_text(tip).clicked() {
                     st.review = true;
                 }
-                if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
+                if ui.add_enabled(idle && st.loading.is_none(), egui::Button::new("Refresh")).clicked() {
                     st.loaded = false;
                 }
                 ui.add_space(12.0);
                 ui.add_enabled_ui(idle, |ui| size_limit(ui, st));
             });
         });
+        if st.min_on && n_small > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{} ({}) smaller than {} MB hidden by the size limit.",
+                    copies(n_small),
+                    human(small_bytes),
+                    st.min_mb
+                ))
+                .color(theme::muted()),
+            );
+        }
+        if st.loading.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("Reading the catalogue… (a disk that was asleep can take a few seconds to spin up)")
+                        .color(theme::muted()),
+                );
+            });
+        }
         ui.add_space(8.0);
         if let Some(p) = &running {
             ui.horizontal(|ui| {
@@ -244,9 +293,11 @@ impl App {
             ui.colored_label(theme::danger(), e);
         }
         if st.tree.is_empty() {
-            card(ui, |ui| {
-                ui.label("No archives in the catalogue.");
-            });
+            if st.loading.is_none() {
+                card(ui, |ui| {
+                    ui.label("No archives in the catalogue.");
+                });
+            }
             return;
         }
 
@@ -292,7 +343,7 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                 st.expanded.clear();
             }
             if ui.button("Open all").clicked() {
-                st.expanded = st.tree.iter().filter(|a| !a.leaves.is_empty()).map(|a| a.id).collect();
+                st.expanded = st.tree.iter().filter(|a| a.leaves.iter().any(|l| st.big_enough(l))).map(|a| a.id).collect();
             }
         });
     });
@@ -301,7 +352,7 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
     for (i, a) in st.tree.iter().enumerate() {
         rows.push(Row::Archive(i));
         if st.expanded.contains(&a.id) {
-            rows.extend((0..a.leaves.len()).map(|j| Row::Leaf(i, j)));
+            rows.extend(a.leaves.iter().enumerate().filter(|(_, l)| st.big_enough(l)).map(|(j, _)| Row::Leaf(i, j)));
         }
     }
     let mut toggle = None;
@@ -314,16 +365,17 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                 Row::Archive(i) => {
                     let a = &st.tree[i];
                     let on = st.selected == Some(Sel::Archive(a.id));
+                    let visible = a.leaves.iter().any(|l| st.big_enough(l));
                     let resp = row_frame(ui, stripe, on, 0.0, |ui| {
                         let open = st.expanded.contains(&a.id);
-                        let arrow = if a.leaves.is_empty() { " " } else if open { "⏷" } else { "⏵" };
+                        let arrow = if !visible { " " } else if open { "⏷" } else { "⏵" };
                         ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(arrow).color(theme::muted())).selectable(false));
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("{}.7z", a.name)).strong().color(theme::ink()));
                                 ui.label(RichText::new(date(&a.created_utc)).size(12.5).color(theme::muted()));
                             });
-                            ui.label(RichText::new(archive_summary(a)).size(12.5).color(if a.leaves.is_empty() {
+                            ui.label(RichText::new(archive_summary(a, st)).size(12.5).color(if !visible {
                                 theme::muted()
                             } else {
                                 theme::warn()
@@ -333,7 +385,7 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                     // Clicking an archive selects it and opens or closes it.
                     if resp.clicked() {
                         select = Some(Sel::Archive(a.id));
-                        if !a.leaves.is_empty() {
+                        if visible {
                             toggle = Some(a.id);
                         }
                     }
@@ -341,7 +393,7 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                 Row::Leaf(i, j) => {
                     let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
                     let on = st.selected == Some(Sel::Leaf(l.entry_id));
-                    let left_out = st.left_out.contains(&key(a, l)) || !st.big_enough(l);
+                    let left_out = st.left_out.contains(&key(a, l));
                     let resp = row_frame(ui, stripe, on, 44.0, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
@@ -421,16 +473,19 @@ fn path_label(ui: &mut egui::Ui, rel: &str, struck: bool) {
     ui.add(egui::Label::new(job)).on_hover_text(tip);
 }
 
-fn archive_summary(a: &TreeArchive) -> String {
+/// An archive's line in the tree; duplicates count only copies passing the size limit.
+fn archive_summary(a: &TreeArchive, st: &State) -> String {
     if a.set_aside {
         return "set-aside files · managed on the Excluded page".into();
     }
     let mut parts = Vec::new();
-    if a.leaves.is_empty() {
-        parts.push("no duplicates".to_string());
+    let shown: Vec<&TreeLeaf> = a.leaves.iter().filter(|l| st.big_enough(l)).collect();
+    if shown.is_empty() {
+        let hidden = a.leaves.len();
+        parts.push(if hidden == 0 { "no duplicates".to_string() } else { format!("no duplicates over the size limit ({hidden} smaller)") });
     } else {
-        let bytes: u64 = a.leaves.iter().map(|l| l.size).sum();
-        parts.push(format!("{} · {}", copies(a.leaves.len()), human(bytes)));
+        let bytes: u64 = shown.iter().map(|l| l.size).sum();
+        parts.push(format!("{} · {}", copies(shown.len()), human(bytes)));
     }
     if a.originals > 0 {
         parts.push(format!("{} kept here", if a.originals == 1 { "1 original".into() } else { format!("{} originals", a.originals) }));
