@@ -12,6 +12,7 @@ mod dialog;
 mod duplicates;
 mod excluded;
 mod jobs;
+mod log_file;
 mod new_job;
 mod progress;
 mod theme;
@@ -40,12 +41,35 @@ fn main() -> eframe::Result {
     let glow = settings::load().compatible_graphics
         || flag("--compatible-graphics")
         || std::env::var("ATTICARC_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("glow"));
+    log_file::start();
+    // DirectX 12 on Windows rather than whatever the driver offers first (often
+    // Vulkan): it copes better with displays sleeping, waking and changing mode.
+    // WGPU_BACKEND set by hand still wins.
+    #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        // SAFETY: no other thread has started yet.
+        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+    }
+    log::info!(
+        "AtticARC {} starting; renderer {}, WGPU_BACKEND={}",
+        env!("CARGO_PKG_VERSION"),
+        if glow { "OpenGL (compatible graphics)" } else { "wgpu" },
+        std::env::var("WGPU_BACKEND").unwrap_or_default()
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AtticARC")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 480.0]),
         renderer: if glow { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu },
+        // Don't wait for vsync: with the default, the renderer blocks waiting
+        // for the display to take a frame, and a display asleep or changing
+        // mode can leave it waiting for ever, freezing the window. AtticARC
+        // only redraws when something changes, so this costs nothing.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
@@ -188,6 +212,9 @@ impl App {
             ((v.native_pixels_per_point, v.monitor_size), v.inner_rect)
         });
         let changed = self.last_display.is_some_and(|before| before != now);
+        if changed {
+            log::info!("display changed from {:?} to {now:?}; redrawing at the new size", self.last_display);
+        }
         self.last_display = Some(now);
         if (asked || changed)
             && let Some(r) = inner
