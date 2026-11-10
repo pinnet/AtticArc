@@ -39,4 +39,4 @@ files, every archive verified, and the catalogue rebuilt identically from the ar
 - `atticarc-cli soak` stress test (passed 4 hours with no leaks); `atticarc-cli scan --hash`
   confirms duplicate candidates by BLAKE3 and can write a CSV.
 
-Pull requests #1 to #21.
+Released under the MIT licence. Pull requests #1 to #22.
