@@ -47,6 +47,12 @@ pub struct State {
     goto: Option<(i64, String)>,
     /// Set when an archive was rewritten, so other pages reload.
     pub changed: bool,
+    /// Background reads of the catalogue, so a slow or sleeping disk never
+    /// freezes the window: the archive list, a search (with the query and
+    /// filter it is for) and an archive's contents for the browser.
+    loading_archives: Option<Receiver<Result<Vec<ArchiveSummary>, String>>>,
+    searching: Option<((String, Option<i64>), Receiver<Result<Vec<FoundFile>, String>>)>,
+    browsing: Option<(i64, Receiver<Result<Browse, String>>)>,
 }
 
 impl State {
@@ -64,7 +70,12 @@ impl State {
     }
 
     pub fn busy(&self) -> bool {
-        self.extracting.is_some() || self.rebuilding.is_some() || self.putting_back.is_some()
+        self.extracting.is_some() || self.rebuilding.is_some() || self.putting_back.is_some() || self.loading()
+    }
+
+    /// Whether the catalogue is being read in the background.
+    fn loading(&self) -> bool {
+        self.loading_archives.is_some() || self.searching.is_some() || self.browsing.is_some()
     }
 
     /// Adds the archives in `out` that the catalogue is missing, from the
@@ -130,29 +141,65 @@ impl App {
         if !st.loaded {
             st.loaded = true;
             st.error = None;
-            st.archives.clear();
-            if catalog::exists(&out) {
-                match Catalog::open_existing(&out).and_then(|c| c.archives()) {
-                    Ok(a) => st.archives = a,
-                    Err(e) => st.error = Some(format!("{e:#}")),
+            let (tx, rx) = channel();
+            let dir = out.clone();
+            std::thread::spawn(move || {
+                let res = if catalog::exists(&dir) {
+                    Catalog::open_existing(&dir).and_then(|c| c.archives()).map_err(|e| format!("{e:#}"))
+                } else {
+                    Ok(Vec::new())
+                };
+                let _ = tx.send(res);
+            });
+            st.loading_archives = Some(rx);
+        }
+        if let Some(rx) = &st.loading_archives
+            && let Ok(res) = rx.try_recv()
+        {
+            match res {
+                Ok(a) => st.archives = a,
+                Err(e) => {
+                    st.archives.clear();
+                    st.error = Some(e);
                 }
             }
+            st.loading_archives = None;
         }
+
         let want = (st.query.trim().to_string(), st.archive_filter);
-        if !want.0.is_empty() && st.searched.as_ref() != Some(&want) {
-            st.selected = None;
-            st.results = Catalog::open_existing(&out)
-                .and_then(|c| c.search(&want.0, want.1, MAX_RESULTS))
-                .unwrap_or_else(|e| {
-                    st.error = Some(format!("{e:#}"));
+        if let Some((key, rx)) = &st.searching
+            && let Ok(res) = rx.try_recv()
+        {
+            // Only the answer to the search still wanted is shown.
+            if *key == want {
+                st.selected = None;
+                st.results = res.unwrap_or_else(|e| {
+                    st.error = Some(e);
                     Vec::new()
                 });
-            st.selected = (!st.results.is_empty()).then_some(0);
-            st.searched = Some(want);
+                st.selected = (!st.results.is_empty()).then_some(0);
+                st.searched = Some(want.clone());
+            }
+            st.searching = None;
+        }
+        let in_flight = st.searching.as_ref().map(|s| &s.0) == Some(&want);
+        if !want.0.is_empty() && st.searched.as_ref() != Some(&want) && !in_flight && st.searching.is_none() {
+            let (tx, rx) = channel();
+            let (dir, key) = (out.clone(), want.clone());
+            std::thread::spawn(move || {
+                let res = Catalog::open_existing(&dir)
+                    .and_then(|c| c.search(&key.0, key.1, MAX_RESULTS))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(res);
+            });
+            st.searching = Some((want.clone(), rx));
         }
 
         if st.query.trim().is_empty() {
             load_browse(st, &out);
+        }
+        if st.loading() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         title(ui, st);
         ui.label(
@@ -162,6 +209,22 @@ impl App {
         ui.add_space(10.0);
         if let Some(e) = &st.error {
             ui.colored_label(theme::danger(), e);
+        }
+        if st.loading() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                let what = if st.loading_archives.is_some() {
+                    "Reading the catalogue… (a disk that was asleep can take a few seconds to spin up)"
+                } else if st.browsing.is_some() {
+                    "Opening the archive's contents…"
+                } else {
+                    "Searching…"
+                };
+                ui.label(RichText::new(what).color(theme::muted()));
+            });
+        }
+        if st.loading_archives.is_some() && st.archives.is_empty() {
+            return;
         }
         if st.archives.is_empty() {
             card(ui, |ui| {
@@ -293,27 +356,46 @@ fn confirm_clear(ctx: &egui::Context, st: &mut State, out: &std::path::Path) {
 /// Opens the archive picked in the archive list in the browser, if it isn't
 /// open already.
 fn load_browse(st: &mut State, out: &std::path::Path) {
+    if let Some((id, rx)) = &st.browsing
+        && let Ok(res) = rx.try_recv()
+    {
+        let id = *id;
+        st.browsing = None;
+        // Only shown if that archive is still the one picked.
+        if st.archive_filter == Some(id) {
+            match res {
+                Ok(mut b) => {
+                    if let Some((_, rel)) = st.goto.take().filter(|g| g.0 == id) {
+                        b.select_path(&rel);
+                    }
+                    st.browse = Some(b);
+                }
+                Err(e) => {
+                    let name = st.archives.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_default();
+                    st.error = Some(format!("Couldn't open {name}: {e}"));
+                    st.archive_filter = None;
+                }
+            }
+        }
+    }
     let Some(id) = st.archive_filter else { return };
-    if st.browse.as_ref().map(|b| b.archive_id) == Some(id) {
+    if st.browse.as_ref().map(|b| b.archive_id) == Some(id) || st.browsing.as_ref().map(|b| b.0) == Some(id) {
         return;
     }
     st.browse = None;
-    let Some(name) = st.archives.iter().find(|a| a.id == id).map(|a| a.name.clone()) else {
-        st.archive_filter = None;
-        return;
-    };
-    match Catalog::open_existing(out).and_then(|c| Browse::load(&c, id)) {
-        Ok(mut b) => {
-            if let Some((_, rel)) = st.goto.take().filter(|g| g.0 == id) {
-                b.select_path(&rel);
-            }
-            st.browse = Some(b)
-        }
-        Err(e) => {
-            st.error = Some(format!("Couldn't open {name}: {e:#}"));
+    if !st.archives.iter().any(|a| a.id == id) {
+        if st.loading_archives.is_none() {
             st.archive_filter = None;
         }
+        return;
     }
+    let (tx, rx) = channel();
+    let dir = out.to_path_buf();
+    std::thread::spawn(move || {
+        let res = Catalog::open_existing(&dir).and_then(|c| Browse::load(&c, id)).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(res);
+    });
+    st.browsing = Some((id, rx));
 }
 
 /// The page title in the heading style, followed while browsing by the

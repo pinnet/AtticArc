@@ -784,11 +784,12 @@ impl Catalog {
     pub fn contents(&self, archive_id: i64) -> Result<ArchiveContents> {
         let mut q = self.conn.prepare(
             "SELECT e.id, a.id, a.name, COALESCE(a.source_display, a.source_path), e.rel_path, e.size, e.modified_utc, e.blake3, e.sha256,
-                    COALESCE(c.n, 1), e.kind
+                    CASE WHEN e.kind = 'file' AND e.blake3 IS NOT NULL
+                         THEN (SELECT COUNT(*) FROM entries d
+                               WHERE d.blake3 = e.blake3 AND d.size = e.size AND d.kind = 'file')
+                         ELSE 1 END,
+                    e.kind
              FROM entries e JOIN archives a ON a.id = e.archive_id
-             LEFT JOIN (SELECT blake3, size, COUNT(*) AS n FROM entries
-                        WHERE kind = 'file' AND blake3 IS NOT NULL GROUP BY blake3, size) c
-                    ON c.blake3 = e.blake3 AND c.size = e.size
              WHERE e.archive_id = ?1
              ORDER BY e.rel_path",
         )?;
