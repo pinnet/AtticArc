@@ -11,6 +11,21 @@ before the next.
 - [ ] Attach the Windows programs, from `D:\Dev\WIP\AtticArc` after `cargo build --release`:
       `gh release upload v0.9.0 target\release\atticarc.exe target\release\atticarc-cli.exe`
 
+## 0.5 Pin down the logic first (before refactoring)
+
+The logic was settled by testing on live data (PRs #1 to #25). Before restructuring anything,
+write down what "correct" means, so the refactor can be proved not to change it:
+
+- [ ] `docs/behaviour.md`: every rule the code keeps, one line each, e.g. "a folder is deleted only
+      if its saved check passed and its snapshot is unchanged"; "nothing is ticked to start"; "a
+      folder that doesn't fit is refused before anything is written"; "an archive is matched by
+      content, not name"; "checks and ticks survive a restart".
+- [ ] A test for each rule that doesn't have one yet (most do: archive, verify, free space,
+      rebuild, rename, relink, duplicates, clean up, snapshots, journal).
+- [ ] An end-to-end test of the whole workflow on a generated folder tree: archive → duplicates
+      → excluded → clean up (check, restart, delete) → rebuild the catalogue → compare.
+- [ ] Then refactor (section 1): every step must leave all of these passing.
+
 ## 1. Refactor before 1.0
 
 Goal: code that reads naturally ("fluent"), with named constants, written design rules, and
@@ -68,6 +83,28 @@ documentation. No change in behaviour: the existing tests prove each step.
       files. These are what 1.0 freezes.
 - [ ] `docs/guide/`: a short page per screen (New job, Progress, Duplicates, Excluded, Clean up,
       Catalogue).
+
+## 1.8 Other operating systems (after the refactor)
+
+The core is plain Rust and mostly portable; the Windows-only parts sit behind a small platform
+layer after the refactor, one implementation per system:
+
+| Piece | Windows (now) | macOS | Linux |
+|---|---|---|---|
+| Free space | `GetDiskFreeSpaceExW` | `statvfs` | `statvfs` |
+| Change detection in snapshots | NTFS change journal numbers | file status change time (`ctime`) | `ctime` |
+| Renderer | wgpu on DirectX 12, no vsync; OpenGL fallback | wgpu on Metal | wgpu on Vulkan; OpenGL fallback |
+| Folder dialogs, modal | `rfd` with the window as parent | same | same |
+| Settings and log | `%APPDATA%\atticarc` | `~/Library/Application Support/atticarc` | `~/.config/atticarc` |
+| Delete permission, locked files | Windows rules | Unix permissions | Unix permissions |
+
+- On macOS and Linux, `ctime` changes with every write or metadata change and, unlike the
+  modified time, can't be set back by ordinary tools, so it protects a snapshot as well as the
+  NTFS journal does.
+- [ ] Platform layer: `platform::{free_bytes, change_marker(file), config_dir}`.
+- [ ] CI matrix (Windows, macOS, Linux) building and testing every PR.
+- [ ] Release builds per system attached to each GitHub release (`.exe`; a macOS app bundle for
+      the M1 MacBook; a Linux binary).
 
 ## 2. Features still open
 
