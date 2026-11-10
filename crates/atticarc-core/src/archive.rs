@@ -1824,6 +1824,90 @@ fn hash_folder_against(now: &Scan, rec: &BTreeMap<&str, &EntryRecord>, progress:
 
 /// Deletes `source` for good. Read-only files are made writable first,
 /// because Windows refuses to delete them otherwise.
+/// A quick fingerprint of a folder as it is now, from its file list alone
+/// (paths, sizes and modified times, no contents): taken when a folder
+/// passes its check, and again just before it is deleted, so a folder
+/// changed in between is caught without hashing it twice.
+pub fn folder_snapshot(source: &Path) -> Result<String> {
+    let s = scan(source)?;
+    let mut rows: Vec<String> = s
+        .files
+        .iter()
+        .map(|f| format!("{}\0{}\0{:?}", f.rel, f.size, f.modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())))
+        .collect();
+    rows.extend(s.skipped_links.iter().map(|l| format!("link\0{l}")));
+    rows.sort();
+    let mut h = blake3::Hasher::new();
+    for r in rows {
+        h.update(r.as_bytes());
+        h.update(b"\n");
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+/// Looks for an archived source folder that was renamed: among the folders
+/// beside where it was, one holding exactly the files recorded for it
+/// (every path and size, including those the exclusions left out). `skip`
+/// leaves out folders known for other reasons, such as other archives'
+/// sources. Only metadata is read. `None` if nothing matches, or if more
+/// than one folder does.
+pub fn find_renamed_source(missing: &Path, archive: &Path, recorded: &[EntryRecord], skip: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    RenameFinder::default().find(missing, archive, recorded, skip)
+}
+
+/// [`find_renamed_source`] for many folders: each parent folder's
+/// subfolders are listed and scanned once, however many folders are looked
+/// for in it.
+#[derive(Default)]
+pub struct RenameFinder {
+    /// Parent folder → its subfolders, each with its files' paths and sizes.
+    seen: HashMap<PathBuf, Vec<(PathBuf, BTreeMap<String, u64>)>>,
+}
+
+impl RenameFinder {
+    pub fn find(&mut self, missing: &Path, archive: &Path, recorded: &[EntryRecord], skip: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+        let parent = missing.parent()?;
+        let ex = read_manifest(archive).map(|m| m.excluded).unwrap_or_default();
+        let want: BTreeMap<&str, u64> = recorded
+            .iter()
+            .chain(&ex.set_aside)
+            .chain(&ex.discarded)
+            .chain(&ex.duplicates)
+            .chain(ex.deps.iter().map(|d| &d.entry))
+            .filter(|e| !e.is_dir)
+            .map(|e| (e.rel_path.as_str(), e.size))
+            .collect();
+        if want.is_empty() {
+            return None;
+        }
+        let subfolders = self.seen.entry(parent.to_path_buf()).or_insert_with(|| {
+            let Ok(rd) = std::fs::read_dir(parent) else { return Vec::new() };
+            rd.flatten()
+                .map(|d| d.path())
+                .filter(|p| p.is_dir())
+                .filter_map(|p| {
+                    let s = scan(&p).ok()?;
+                    let files = s.files.into_iter().map(|f| (f.rel, f.size)).collect();
+                    Some((p, files))
+                })
+                .collect()
+        });
+        let mut found = None;
+        for (p, files) in subfolders.iter() {
+            if skip(p.as_path()) || files.len() != want.len() {
+                continue;
+            }
+            if files.iter().all(|(rel, size)| want.get(rel.as_str()) == Some(size)) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(p.clone());
+            }
+        }
+        found
+    }
+}
+
 pub fn delete_folder(source: &Path) -> Result<()> {
     for item in walkdir::WalkDir::new(source).follow_links(false).into_iter().flatten() {
         if let Ok(meta) = item.path().symlink_metadata() {
@@ -1964,6 +2048,32 @@ mod tests {
         let r = rebuild_catalog(&out).unwrap();
         assert_eq!((r.added, r.already_there, r.copies.len()), (0, 1, 1), "{r:?}");
         assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_source_folder_is_found_by_its_files() {
+        let (_tmp, src, out) = run(true);
+        let (a, entries) = recorded(&out, &src);
+        let renamed = src.with_file_name("renamed source");
+        std::fs::rename(&src, &renamed).unwrap();
+        let none = |_: &Path| false;
+        assert_eq!(find_renamed_source(&src, &a.archive_path, &entries, &none), Some(renamed.clone()));
+        // Skipped folders aren't matched.
+        let skip = |p: &Path| p == renamed.as_path();
+        assert_eq!(find_renamed_source(&src, &a.archive_path, &entries, &skip), None);
+        // A changed file means no match.
+        let f = walkdir::WalkDir::new(&renamed).into_iter().flatten().find(|e| e.file_type().is_file()).unwrap();
+        std::fs::write(f.path(), b"something else entirely, of another size").unwrap();
+        assert_eq!(find_renamed_source(&src, &a.archive_path, &entries, &none), None);
+    }
+
+    #[test]
+    fn a_folder_snapshot_changes_when_the_folder_does() {
+        let (_tmp, src, _out) = run(true);
+        let before = folder_snapshot(&src).unwrap();
+        assert_eq!(folder_snapshot(&src).unwrap(), before);
+        std::fs::write(src.join("new file.txt"), b"hello").unwrap();
+        assert_ne!(folder_snapshot(&src).unwrap(), before);
     }
 
     #[test]
