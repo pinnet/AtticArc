@@ -65,6 +65,7 @@ Starts on the given source folder (or the last one used).
   bottom. Folders that already have a verified archive are listed under **Already archived** with an
   **X** that starts the check-then-delete flow. While the folder is being deleted, a window with a
   spinner and the time so far stays up until it's done.
+- **Progress**: the folder list, with the log below it. **A−** / **A+** set the log's text size (remembered).
 - **New job → Exclusions**: rules for files to leave out of the main archive, each ticked on or off.
   A *wildcard* without `/` matches file names anywhere (`*.lnk`, `Thumbs.db`); `*` stays within a
   folder, `**` crosses folders. A *regex* matches anywhere in the path inside the folder. Case is

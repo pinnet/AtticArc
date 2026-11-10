@@ -29,7 +29,13 @@ pub struct Saved {
     pub recent_sources: Vec<PathBuf>,
     /// Destination folders used before, most recent first.
     pub recent_dests: Vec<PathBuf>,
+    /// Text size of the GUI's log, in points ([`LOG_TEXT_MIN`] to [`LOG_TEXT_MAX`]).
+    pub log_text_size: f32,
 }
+
+/// Smallest and largest log text size the GUI allows, in points.
+pub const LOG_TEXT_MIN: f32 = 9.0;
+pub const LOG_TEXT_MAX: f32 = 24.0;
 
 /// How many recent source and destination folders are remembered.
 pub const RECENT_MAX: usize = 8;
@@ -88,6 +94,7 @@ impl Default for Saved {
             dark_mode: false,
             recent_sources: Vec::new(),
             recent_dests: Vec::new(),
+            log_text_size: 13.0,
         }
     }
 }
