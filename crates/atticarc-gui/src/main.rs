@@ -67,7 +67,11 @@ fn main() -> eframe::Result {
         // mode can leave it waiting for ever, freezing the window. AtticARC
         // only redraws when something changes, so this costs nothing.
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            // egui-wgpu 0.37 moved the present mode into `surface`.
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+            },
             ..Default::default()
         },
         ..Default::default()
