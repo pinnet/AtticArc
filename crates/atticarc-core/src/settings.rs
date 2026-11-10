@@ -31,6 +31,10 @@ pub struct Saved {
     pub recent_dests: Vec<PathBuf>,
     /// Text size of the GUI's log, in points ([`LOG_TEXT_MIN`] to [`LOG_TEXT_MAX`]).
     pub log_text_size: f32,
+    /// Draw the GUI with OpenGL instead of the default (Direct3D/Vulkan through
+    /// wgpu), which some setups handle better when displays sleep and wake.
+    /// Takes effect at the next start.
+    pub compatible_graphics: bool,
 }
 
 /// Smallest and largest log text size the GUI allows, in points.
@@ -95,6 +99,7 @@ impl Default for Saved {
             recent_sources: Vec::new(),
             recent_dests: Vec::new(),
             log_text_size: 13.0,
+            compatible_graphics: false,
         }
     }
 }
