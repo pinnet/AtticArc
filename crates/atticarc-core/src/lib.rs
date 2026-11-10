@@ -15,6 +15,7 @@
 
 pub mod archive;
 pub mod catalog;
+pub mod cleanup;
 pub mod disk;
 pub mod exclude;
 pub mod scan;

@@ -137,6 +137,9 @@ Starts on the given source folder (or the last one used).
   ends either pass cleanly. Archived folders no longer where they were are listed apart, with
   **Look for renamed folders**, which finds a folder holding exactly their files among those beside
   them and lists it under its new name (checked like any other before deleting).
+  Checks are saved in the catalogue, so they survive a restart (or a window that froze): a long
+  run can be checked over several sessions and deleted later. The same steps run without the window
+  with `atticarc-cli cleanup <destination> [--check] [--delete]`.
 - The sidebar runs in the order of the work: New job, Progress, Duplicates, Excluded, Clean up. The
   **Catalogue** sits apart below it, under *Look up*, since it is for finding things, not a step.
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
