@@ -199,6 +199,25 @@ space keeping one copy of each would free; `--csv FILE` writes every confirmed f
 `group,size,blake3,path`. Files that can't be read, or changed since the scan, are reported and
 left out rather than stopping the run. Nothing is changed on disk.
 
+### Displays waking with another resolution or scale
+
+With two monitors at different resolutions or scaling, Windows can briefly change a window's
+scale when the displays sleep and wake, and the window may come back drawn at the wrong size or
+stop responding. Work in the background (archiving, checking, deleting) carries on regardless.
+
+- The renderer doesn't wait for vsync, so it can't be left waiting for ever for a display that is
+  asleep or changing mode (the likely cause of the freeze), and on Windows it uses DirectX 12, which
+  copes with display changes better (set `WGPU_BACKEND` to choose another).
+- AtticARC notices when the display it is on changes and redraws itself at the new size and scale.
+- **Refresh window (F5)** in the sidebar does the same on demand.
+- If the window still freezes, tick **Compatible graphics** (bottom of the sidebar) and restart:
+  AtticARC then draws with OpenGL instead of the default renderer. The same can be chosen for one
+  run with `atticarc --compatible-graphics` or `ATTICARC_RENDERER=glow`.
+- A log is kept at `%APPDATA%\atticarc\atticarc.log`: the renderer and graphics card used, display
+  changes and renderer warnings. Send it along with a report if the window ever freezes.
+- If the window is frozen now: Win+Shift+←/→ (move it to the other monitor), Win+↓ then Win+↑,
+  or Win+D twice, all make Windows send it a fresh size.
+
 ### Renamed archives
 
 An archive is known by what it holds, not its file name: a fingerprint of its creation time and every

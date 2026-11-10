@@ -12,6 +12,7 @@ mod dialog;
 mod duplicates;
 mod excluded;
 mod jobs;
+mod log_file;
 mod new_job;
 mod progress;
 mod theme;
@@ -32,12 +33,43 @@ use atticarc_core::settings;
 use jobs::Jobs;
 
 fn main() -> eframe::Result {
-    let source_dir = std::env::args_os().nth(1).map(PathBuf::from);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let source_dir = args.iter().find(|a| !a.to_string_lossy().starts_with("--")).map(PathBuf::from);
+    // OpenGL if asked for (setting, --compatible-graphics, or ATTICARC_RENDERER=glow):
+    // some setups recover better from displays sleeping and waking with it.
+    let glow = settings::load().compatible_graphics
+        || flag("--compatible-graphics")
+        || std::env::var("ATTICARC_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("glow"));
+    log_file::start();
+    // DirectX 12 on Windows rather than whatever the driver offers first (often
+    // Vulkan): it copes better with displays sleeping, waking and changing mode.
+    // WGPU_BACKEND set by hand still wins.
+    #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        // SAFETY: no other thread has started yet.
+        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+    }
+    log::info!(
+        "AtticARC {} starting; renderer {}, WGPU_BACKEND={}",
+        env!("CARGO_PKG_VERSION"),
+        if glow { "OpenGL (compatible graphics)" } else { "wgpu" },
+        std::env::var("WGPU_BACKEND").unwrap_or_default()
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AtticARC")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 480.0]),
+        renderer: if glow { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu },
+        // Don't wait for vsync: with the default, the renderer blocks waiting
+        // for the display to take a frame, and a display asleep or changing
+        // mode can leave it waiting for ever, freezing the window. AtticARC
+        // only redraws when something changes, so this costs nothing.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
@@ -92,6 +124,12 @@ pub struct App {
     duplicates: duplicates::State,
     excluded: excluded::State,
     cleanup: cleanup::State,
+    /// The display the window was last drawn for: its scale and monitor size.
+    /// When it changes (a display waking with another resolution), the
+    /// window is resized to make it redraw at the new scale.
+    last_display: Option<(Option<f32>, Option<egui::Vec2>)>,
+    /// The size to go back to after a nudge, the frame after.
+    unnudge: Option<egui::Vec2>,
 }
 
 impl App {
@@ -121,6 +159,8 @@ impl App {
             duplicates: duplicates::State::default(),
             excluded: excluded::State::default(),
             cleanup: cleanup::State::default(),
+            last_display: None,
+            unnudge: None,
         };
         app.reload();
         app
@@ -155,6 +195,35 @@ impl App {
         self.duplicates.invalidate();
         self.excluded.invalidate();
         self.cleanup.invalidate();
+    }
+
+    /// Makes the window redraw at the right size and scale: when the display
+    /// it is on changes (such as a monitor waking with another resolution or
+    /// scale), or when asked (F5, or Refresh window). The window is nudged a
+    /// pixel larger and back, which makes Windows and the renderer start
+    /// afresh with the current scale.
+    fn heal_window(&mut self, ctx: &egui::Context, asked: bool) {
+        if let Some(size) = self.unnudge.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.request_repaint();
+        }
+        let (now, inner) = ctx.input(|i| {
+            let v = i.viewport();
+            ((v.native_pixels_per_point, v.monitor_size), v.inner_rect)
+        });
+        let changed = self.last_display.is_some_and(|before| before != now);
+        if changed {
+            log::info!("display changed from {:?} to {now:?}; redrawing at the new size", self.last_display);
+        }
+        self.last_display = Some(now);
+        if (asked || changed)
+            && let Some(r) = inner
+        {
+            let size = r.size();
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size + egui::vec2(1.0, 1.0)));
+            self.unnudge = Some(size);
+            ctx.request_repaint();
+        }
     }
 
     fn nav_button(&mut self, ui: &mut egui::Ui, s: Screen) {
@@ -197,6 +266,26 @@ impl App {
             self.nav_button(ui, s);
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let mut compat = self.saved.compatible_graphics;
+            let tip = "Draw with OpenGL instead of the default. Try it if the window freezes or draws at the wrong size \
+                       after a display sleeps and wakes. Takes effect when AtticARC next starts.";
+            if ui
+                .checkbox(&mut compat, RichText::new("Compatible graphics").size(12.5).color(theme::sidebar_text()))
+                .on_hover_text(tip)
+                .changed()
+            {
+                self.saved.compatible_graphics = compat;
+                settings::store(&self.saved);
+            }
+            let refresh = egui::Button::new(RichText::new("Refresh window (F5)").size(13.0).color(theme::sidebar_text()))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
+                .corner_radius(CornerRadius::same(6))
+                .min_size(egui::vec2(ui.available_width(), 32.0));
+            if ui.add(refresh).on_hover_text("Redraws the window at the right size, if it looks wrong after a display wakes").clicked() {
+                self.heal_window(&ui.ctx().clone(), true);
+            }
+            ui.add_space(6.0);
             let dark = self.saved.dark_mode;
             let label = if dark { "Light mode" } else { "Dark mode" };
             let button = egui::Button::new(RichText::new(label).size(15.0).color(theme::sidebar_text()))
@@ -216,6 +305,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         dialog::set_parent(frame);
+        let ctx = ui.ctx().clone();
+        let asked = ctx.input(|i| i.key_pressed(egui::Key::F5));
+        self.heal_window(&ctx, asked);
         let out = self.out_dir();
         let finished_batch = self.jobs.handle_messages(&out);
         if std::mem::take(&mut self.catalogue.changed) {
@@ -248,7 +340,6 @@ impl eframe::App for App {
                 Screen::Excluded => self.excluded(ui),
                 Screen::Cleanup => self.cleanup(ui),
             });
-        let ctx = ui.ctx().clone();
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
         if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() || self.duplicates.busy() || self.cleanup.busy() {
