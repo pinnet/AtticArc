@@ -5,6 +5,8 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui::{self, RichText};
 
+use atticarc_core::settings::{self, LOG_TEXT_MAX, LOG_TEXT_MIN};
+
 use crate::jobs::RowState;
 use crate::new_job::state_label;
 use crate::{App, Screen, card, duration, heading, human, theme};
@@ -76,43 +78,61 @@ impl App {
             });
             ui.add_space(12.0);
 
-            ui.columns(2, |c| {
-                card(&mut c[0], |ui| {
-                    ui.label(RichText::new("Folders").strong().size(16.0));
-                    ui.separator();
-                    let paths: Vec<_> = self.jobs.batch.as_ref().unwrap().folders.iter().map(|f| f.0.clone()).collect();
-                    egui::Grid::new("progress-folders").num_columns(3).spacing([16.0, 8.0]).striped(true).show(ui, |ui| {
-                        for p in paths {
-                            let Some(r) = self.jobs.rows.iter().find(|r| r.path == p) else { continue };
-                            ui.label(RichText::new(&r.name).monospace());
-                            ui.label(r.size.map(|s| human(s.0)).unwrap_or_default());
-                            if r.state == RowState::Working {
-                                let b = self.jobs.batch.as_ref().unwrap();
-                                let text = format!("{} {:.0}%", b.progress.phase.lock().unwrap(), b.progress.fraction() * 100.0);
-                                crate::pill(ui, &text, egui::Color32::WHITE, theme::accent());
-                            } else if r.state == RowState::Idle {
-                                ui.label(RichText::new("Not started").color(theme::muted()));
-                            } else {
-                                state_label(ui, &r.state, true);
-                            }
-                            ui.end_row();
+            // Folders, then the log below it, both full width: side by side,
+            // long status lines in the folder list ran under the log.
+            card(ui, |ui| {
+                ui.label(RichText::new("Folders").strong().size(16.0));
+                ui.separator();
+                let paths: Vec<_> = self.jobs.batch.as_ref().unwrap().folders.iter().map(|f| f.0.clone()).collect();
+                egui::Grid::new("progress-folders").num_columns(3).spacing([16.0, 8.0]).striped(true).show(ui, |ui| {
+                    for p in paths {
+                        let Some(r) = self.jobs.rows.iter().find(|r| r.path == p) else { continue };
+                        ui.label(RichText::new(&r.name).monospace());
+                        ui.label(r.size.map(|s| human(s.0)).unwrap_or_default());
+                        if r.state == RowState::Working {
+                            let b = self.jobs.batch.as_ref().unwrap();
+                            let text = format!("{} {:.0}%", b.progress.phase.lock().unwrap(), b.progress.fraction() * 100.0);
+                            crate::pill(ui, &text, egui::Color32::WHITE, theme::accent());
+                        } else if r.state == RowState::Idle {
+                            ui.label(RichText::new("Not started").color(theme::muted()));
+                        } else {
+                            state_label(ui, &r.state, true);
                         }
-                    });
+                        ui.end_row();
+                    }
                 });
-                egui::Frame::NONE
-                    .fill(theme::sidebar())
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::same(16))
-                    .show(&mut c[1], |ui| {
-                        ui.set_width(ui.available_width());
+            });
+            ui.add_space(12.0);
+
+            let mut size = self.saved.log_text_size.clamp(LOG_TEXT_MIN, LOG_TEXT_MAX);
+            egui::Frame::NONE
+                .fill(theme::sidebar())
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
                         ui.label(RichText::new("Log").strong().size(16.0).color(egui::Color32::WHITE));
-                        egui::ScrollArea::vertical().max_height(360.0).stick_to_bottom(true).show(ui, |ui| {
-                            for l in &self.jobs.log {
-                                ui.label(RichText::new(l).monospace().color(theme::sidebar_text()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled(size < LOG_TEXT_MAX, egui::Button::new("A+")).on_hover_text("Larger log text").clicked() {
+                                size = (size + 1.0).min(LOG_TEXT_MAX);
+                            }
+                            ui.label(RichText::new(format!("{size:.0} pt")).color(theme::sidebar_text()));
+                            if ui.add_enabled(size > LOG_TEXT_MIN, egui::Button::new("A−")).on_hover_text("Smaller log text").clicked() {
+                                size = (size - 1.0).max(LOG_TEXT_MIN);
                             }
                         });
                     });
-            });
+                    egui::ScrollArea::vertical().max_height(360.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                        for l in &self.jobs.log {
+                            ui.label(RichText::new(l).monospace().size(size).color(theme::sidebar_text()));
+                        }
+                    });
+                });
+            if size != self.saved.log_text_size {
+                self.saved.log_text_size = size;
+                settings::store(&self.saved);
+            }
         });
     }
 }
