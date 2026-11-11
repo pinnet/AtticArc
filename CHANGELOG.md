@@ -4,7 +4,7 @@ AtticARC uses [Semantic Versioning](https://semver.org). Until 1.0, the formats 
 (the archive layout and its manifest, the catalogue database, `.atticarcdep` reference files) may
 still change; 1.0 will mark them stable.
 
-## 0.9.0 (2026-11-10): first MVP
+## 0.9.0 (2026-11-11): first MVP
 
 Archives folders to verified 7-Zip archives with a searchable catalogue, finds and replaces
 duplicates, and cleans up the archived folders safely. Tested on live data: 56 folders, 416,320
@@ -26,6 +26,10 @@ files, every archive verified, and the catalogue rebuilt identically from the ar
 - **Clean up**: archived folders still on disk, as a tree with tick boxes. Two passes: check every
   ticked folder (files hashed, archive decoded, nothing deleted), then delete only those that
   passed, each only if unchanged since its check. Finds folders renamed since they were archived.
+  Checks and ticks are saved, so a check can stop and carry on in a later session, and deleting
+  can wait for another day. On NTFS, "unchanged" uses the change journal, which catches a change
+  even if its timestamps are set back. The run stays in view while it works, and **Show log**
+  lists each folder and how it went (also written to `atticarc.log`).
 
 ### Look up
 - **Catalogue**: search every file in every archive, browse an archive's contents, extract files,
@@ -36,7 +40,12 @@ files, every archive verified, and the catalogue rebuilt identically from the ar
 ### Robustness
 - Archives are known by what they hold, not their file name: one renamed in Explorer is found
   again and relinked, and reference files naming its old name still resolve.
+- The window recovers after displays sleep or change mode (no waiting on vsync, DirectX 12 on
+  Windows); **Refresh window (F5)** and a **Compatible graphics** (OpenGL) setting as fallbacks.
+  A log file at `%APPDATA%\atticarc\atticarc.log` records the renderer and any warnings.
+- A page left mid-read no longer holds the others' buttons disabled.
+- `atticarc-cli cleanup` does the same two passes from the command line.
 - `atticarc-cli soak` stress test (passed 4 hours with no leaks); `atticarc-cli scan --hash`
   confirms duplicate candidates by BLAKE3 and can write a CSV.
 
-Released under the MIT licence. Pull requests #1 to #22.
+Released under the MIT licence. Pull requests #1 to #27.
