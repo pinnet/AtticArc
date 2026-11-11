@@ -76,7 +76,14 @@ impl State {
     }
 
     pub fn busy(&self) -> bool {
-        self.extracting.is_some() || self.rebuilding.is_some() || self.putting_back.is_some() || self.loading()
+        self.working() || self.loading()
+    }
+
+    /// Whether the catalogue page is changing anything: extracting, rebuilding
+    /// or putting back. Reading doesn't count: a read is collected only while
+    /// the page is shown, so one left behind would block other pages for ever.
+    pub fn working(&self) -> bool {
+        self.extracting.is_some() || self.rebuilding.is_some() || self.putting_back.is_some()
     }
 
     /// Whether the catalogue is being read in the background.
@@ -106,7 +113,7 @@ impl App {
         if std::mem::take(&mut self.catalogue.cleared) {
             self.reload();
         }
-        let busy = self.jobs.is_busy() || self.duplicates.busy();
+        let busy = self.jobs.is_busy() || self.duplicates.working();
         let settings = self.settings();
         let st = &mut self.catalogue;
         if let Some((_, rx)) = &st.putting_back

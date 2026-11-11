@@ -257,7 +257,22 @@ impl App {
     pub fn cleanup(&mut self, ui: &mut egui::Ui) {
         let out = self.out_dir();
         let settings = self.settings();
-        let others_busy = self.jobs.is_busy() || self.duplicates.busy() || self.excluded.busy() || self.catalogue.busy();
+        // Only work that changes things elsewhere holds Clean up back, and the
+        // page says which.
+        let mut waiting = Vec::new();
+        if self.jobs.is_busy() {
+            waiting.push("the archive job");
+        }
+        if self.duplicates.working() {
+            waiting.push("replacing duplicates");
+        }
+        if self.excluded.busy() {
+            waiting.push("the Excluded page");
+        }
+        if self.catalogue.working() {
+            waiting.push("the Catalogue page (extracting or rebuilding)");
+        }
+        let others_busy = !waiting.is_empty();
         let st = &mut self.cleanup;
 
         // A run in progress: collect what it reports.
@@ -414,7 +429,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let tip = if others_busy {
-                    "Wait for the job that is running to finish"
+                    "Wait for what is running elsewhere to finish"
                 } else {
                     "Step 1: checks each ticked folder against the catalogue and its archive. Deletes nothing."
                 };
@@ -451,6 +466,11 @@ impl App {
                     ui.label(RichText::new(status.join(" · ")).color(theme::muted()));
                 }
             });
+            if others_busy {
+                ui.colored_label(theme::warn(), format!("Waiting for {} to finish before checking or deleting.", waiting.join(", ")));
+            } else if st.searching.is_some() {
+                ui.colored_label(theme::warn(), "Waiting for the search for renamed folders to finish.");
+            }
             ui.add_space(8.0);
             tree(ui, st, idle);
         });
