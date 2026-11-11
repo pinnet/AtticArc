@@ -39,9 +39,26 @@ impl log::Log for FileLog {
     }
 }
 
+/// Where the log file is.
+pub fn path() -> std::path::PathBuf {
+    settings::settings_file().with_file_name("atticarc.log")
+}
+
+/// Opens the log file in the system's text viewer.
+pub fn open() {
+    log::Log::flush(log::logger());
+    let p = path();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("notepad").arg(&p).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-t").arg(&p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+}
+
 /// Starts logging to the file. Does nothing if it can't be opened.
 pub fn start() {
-    let path = settings::settings_file().with_file_name("atticarc.log");
+    let path = path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

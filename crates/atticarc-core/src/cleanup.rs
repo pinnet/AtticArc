@@ -130,7 +130,8 @@ pub fn check(c: &Candidate, settings: &Settings, progress: &Arc<Progress>) -> Sa
         let cat = Catalog::open_existing(&settings.out_dir)?;
         let recorded = cat.entries(c.archive_id)?;
         let check = archive::check_before_delete(&c.source, &c.archive_path, &recorded, settings.threads, progress)?;
-        let snapshot = archive::folder_snapshot(&c.source)?;
+        progress.set_phase("Taking a snapshot of the folder", 0);
+        let snapshot = archive::folder_snapshot_with(&c.source, progress)?;
         Ok((snapshot, check.discarded.len()))
     })();
     let saved = SavedCheck {
@@ -161,11 +162,11 @@ pub fn delete(c: &Candidate, settings: &Settings, progress: &Arc<Progress>) -> R
             bail!("it is protected");
         }
         progress.set_phase("Making sure the folder hasn't changed since its check", 0);
-        if archive::folder_snapshot(&c.source)? != snapshot {
+        if archive::folder_snapshot_with(&c.source, progress)? != snapshot {
             bail!("it has changed since it was checked. Check it again");
         }
         progress.set_phase("Deleting the folder", 0);
-        archive::delete_folder(&c.source)?;
+        archive::delete_folder_with(&c.source, progress)?;
         Catalog::open_existing(&settings.out_dir)?.mark_source_deleted(c.archive_id, &catalog::now_utc())?;
         Ok(())
     })();

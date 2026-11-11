@@ -20,16 +20,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, RichText};
 
 use atticarc_core::archive::{self, Progress};
-use atticarc_core::catalog::{Catalog, SavedCheck, path_key};
+use atticarc_core::catalog::{self, Catalog, SavedCheck, path_key};
 use atticarc_core::cleanup::{self as clean, Candidate, Missing};
 
-use crate::{App, card, heading, human, theme};
+use crate::{App, card, heading, human, log_file, theme};
 
 /// How a folder's delete went.
 #[derive(Clone, Debug)]
@@ -56,6 +56,8 @@ struct Running {
 }
 
 enum Msg {
+    /// A line for the log.
+    Log(String),
     Checked(SavedCheck),
     Deleted(i64, Outcome),
     Done,
@@ -91,6 +93,9 @@ pub struct State {
     running: Option<Running>,
     /// What the last delete pass did, folder by folder.
     outcomes: Vec<Outcome>,
+    /// What the runs this session did, line by line, for the log window.
+    log: Vec<String>,
+    show_log: bool,
     /// Set when folders were deleted, so other pages reload.
     pub changed: bool,
 }
@@ -155,13 +160,19 @@ impl State {
         let (p, cur) = (run.progress.clone(), run.current.clone());
         std::thread::spawn(move || {
             let total = todo.len();
+            say(&tx, format!("Checking {} (nothing is deleted)", folders(total)));
             for (n, item) in todo.into_iter().enumerate() {
                 if p.cancel.load(Ordering::Relaxed) {
+                    say(&tx, "Stopped, as asked".to_string());
                     break;
                 }
                 *cur.lock().unwrap() = format!("{} ({} of {total})", short(&item.source), n + 1);
-                let _ = tx.send(Msg::Checked(clean::check(&item, &settings, &p)));
+                say(&tx, format!("{} of {total}: checking {}", n + 1, item.source.display()));
+                let c = clean::check(&item, &settings, &p);
+                say(&tx, if c.passed { "   ✓ passed".to_string() } else { format!("   ✗ failed: {}", c.detail) });
+                let _ = tx.send(Msg::Checked(c));
             }
+            say(&tx, "Check finished".to_string());
             let _ = tx.send(Msg::Done);
         });
         self.running = Some(run);
@@ -179,15 +190,23 @@ impl State {
         let (p, cur) = (run.progress.clone(), run.current.clone());
         std::thread::spawn(move || {
             let total = todo.len();
+            say(&tx, format!("Deleting {}", folders(total)));
             for (n, item) in todo.into_iter().enumerate() {
                 if p.cancel.load(Ordering::Relaxed) {
+                    say(&tx, "Stopped, as asked".to_string());
                     break;
                 }
                 *cur.lock().unwrap() = format!("{} ({} of {total})", short(&item.source), n + 1);
+                say(&tx, format!("{} of {total}: {} ({})", n + 1, item.source.display(), human(item.bytes)));
                 let discarded = item.check.as_ref().map_or(0, |c| c.discarded);
                 let result = clean::delete(&item, &settings, &p).map_err(|e| format!("{e:#}"));
+                say(&tx, match &result {
+                    Ok(()) => "   ✓ deleted".to_string(),
+                    Err(e) => format!("   ✗ left alone: {e}"),
+                });
                 let _ = tx.send(Msg::Deleted(item.archive_id, Outcome { source: item.source.clone(), discarded, result }));
             }
+            say(&tx, "Delete finished".to_string());
             let _ = tx.send(Msg::Done);
         });
         self.outcomes.clear();
@@ -238,7 +257,22 @@ impl App {
     pub fn cleanup(&mut self, ui: &mut egui::Ui) {
         let out = self.out_dir();
         let settings = self.settings();
-        let others_busy = self.jobs.is_busy() || self.duplicates.busy() || self.excluded.busy() || self.catalogue.busy();
+        // Only work that changes things elsewhere holds Clean up back, and the
+        // page says which.
+        let mut waiting = Vec::new();
+        if self.jobs.is_busy() {
+            waiting.push("the archive job");
+        }
+        if self.duplicates.working() {
+            waiting.push("replacing duplicates");
+        }
+        if self.excluded.busy() {
+            waiting.push("the Excluded page");
+        }
+        if self.catalogue.working() {
+            waiting.push("the Catalogue page (extracting or rebuilding)");
+        }
+        let others_busy = !waiting.is_empty();
         let st = &mut self.cleanup;
 
         // A run in progress: collect what it reports.
@@ -251,6 +285,7 @@ impl App {
         }
         for m in msgs {
             match m {
+                Msg::Log(line) => st.log.push(line),
                 Msg::Checked(c) => {
                     st.checks.insert(c.archive_id, c);
                     if let Some(r) = &mut st.running {
@@ -328,6 +363,19 @@ impl App {
             });
         }
 
+        // The run in progress stays in view above the list, however far down
+        // it is scrolled.
+        if let Some(run) = &st.running {
+            running(ui, run, &mut st.show_log);
+            ui.add_space(8.0);
+        } else if !st.log.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.button("Show log").clicked() {
+                    st.show_log = true;
+                }
+            });
+        }
+
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             heading(
                 ui,
@@ -343,10 +391,6 @@ impl App {
                     ui.spinner();
                     ui.label(RichText::new("Reading the catalogue… (a disk that was asleep can take a few seconds to spin up)").color(theme::muted()));
                 });
-            }
-            if let Some(run) = &st.running {
-                running(ui, run);
-                ui.add_space(10.0);
             }
             if !st.outcomes.is_empty() {
                 outcomes(ui, &st.outcomes, st.running.is_none());
@@ -385,7 +429,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let tip = if others_busy {
-                    "Wait for the job that is running to finish"
+                    "Wait for what is running elsewhere to finish"
                 } else {
                     "Step 1: checks each ticked folder against the catalogue and its archive. Deletes nothing."
                 };
@@ -422,12 +466,20 @@ impl App {
                     ui.label(RichText::new(status.join(" · ")).color(theme::muted()));
                 }
             });
+            if others_busy {
+                ui.colored_label(theme::warn(), format!("Waiting for {} to finish before checking or deleting.", waiting.join(", ")));
+            } else if st.searching.is_some() {
+                ui.colored_label(theme::warn(), "Waiting for the search for renamed folders to finish.");
+            }
             ui.add_space(8.0);
             tree(ui, st, idle);
         });
 
         if st.confirm {
             confirm(ui.ctx(), st, &settings);
+        }
+        if st.show_log {
+            log_window(ui.ctx(), st);
         }
         if st.busy() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
@@ -436,7 +488,7 @@ impl App {
 }
 
 /// The run in progress: which pass, which folder, and how far.
-fn running(ui: &mut egui::Ui, run: &Running) {
+fn running(ui: &mut egui::Ui, run: &Running, show_log: &mut bool) {
     card(ui, |ui| {
         let what = match run.pass {
             Pass::Check => "Checking (nothing is deleted)",
@@ -446,7 +498,10 @@ fn running(ui: &mut egui::Ui, run: &Running) {
             ui.spinner();
             ui.label(RichText::new(format!("{what}: {}", run.current.lock().unwrap())).strong());
         });
-        ui.label(RichText::new(run.progress.phase.lock().unwrap().clone()).color(theme::muted()));
+        let phase = run.progress.phase.lock().unwrap().clone();
+        let (d, t) = (run.progress.done.load(Ordering::Relaxed), run.progress.total.load(Ordering::Relaxed));
+        let phase = if t > 0 { format!("{phase}: {d} of {t}") } else { format!("{phase}…") };
+        ui.label(RichText::new(phase).color(theme::muted()));
         ui.add(egui::ProgressBar::new(run.progress.fraction()).desired_height(8.0).fill(theme::accent()));
         ui.add(
             egui::ProgressBar::new(run.done as f32 / run.total.max(1) as f32)
@@ -456,9 +511,14 @@ fn running(ui: &mut egui::Ui, run: &Running) {
         );
         let stopping = run.progress.cancel.load(Ordering::Relaxed);
         let label = if stopping { "Stopping after this folder…" } else { "Stop after this folder" };
-        if ui.add_enabled(!stopping, egui::Button::new(label)).clicked() {
-            run.progress.cancel.store(true, Ordering::Relaxed);
-        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!stopping, egui::Button::new(label)).clicked() {
+                run.progress.cancel.store(true, Ordering::Relaxed);
+            }
+            if ui.button("Show log").clicked() {
+                *show_log = true;
+            }
+        });
     });
 }
 
@@ -666,6 +726,50 @@ fn outcomes(ui: &mut egui::Ui, list: &[Outcome], finished: bool) {
             }
         }
     });
+}
+
+/// Sends a line for the log window, and writes it to the log file.
+fn say(tx: &Sender<Msg>, line: String) {
+    log::info!(target: "atticarc::cleanup", "{line}");
+    let _ = tx.send(Msg::Log(format!("{}  {line}", catalog::local_hhmmss())));
+}
+
+/// The log of this session's checks and deletes, newest at the bottom.
+fn log_window(ctx: &egui::Context, st: &mut State) {
+    let mut open = true;
+    egui::Window::new("Clean up log").open(&mut open).default_size([640.0, 420.0]).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(st.log.join("\n"));
+            }
+            if ui.button("Open the log file").on_hover_text(log_file::path().display().to_string()).clicked() {
+                log_file::open();
+            }
+            if let Some(run) = &st.running {
+                ui.spinner();
+                ui.label(RichText::new(run.current.lock().unwrap().clone()).color(theme::muted()));
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+            if st.log.is_empty() {
+                ui.label(RichText::new("Nothing has been checked or deleted yet this session.").color(theme::muted()));
+            }
+            for line in &st.log {
+                let colour = if line.contains('✗') {
+                    theme::danger()
+                } else if line.contains('✓') {
+                    theme::ok()
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.label(RichText::new(line).monospace().color(colour));
+            }
+        });
+    });
+    if !open {
+        st.show_log = false;
+    }
 }
 
 /// A folder's own name.

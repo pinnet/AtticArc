@@ -1147,6 +1147,11 @@ pub fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Local wall-clock time as `HH:MM:SS`, for logs shown to people.
+pub fn local_hhmmss() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
 /// Local wall-clock time as `HH:MM`, for logs shown to people.
 pub fn local_hhmm() -> String {
     chrono::Local::now().format("%H:%M").to_string()

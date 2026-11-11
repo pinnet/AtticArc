@@ -81,6 +81,12 @@ impl State {
         self.running.is_some() || self.loading.is_some()
     }
 
+    /// Whether duplicates are being replaced. Reading the list doesn't count
+    /// (see `catalogue::State::working`).
+    pub fn working(&self) -> bool {
+        self.running.is_some()
+    }
+
     /// The copies shown: those passing the size limit, if one is set.
     fn shown(&self) -> impl Iterator<Item = (&TreeArchive, &TreeLeaf)> {
         self.leaves().filter(|(_, l)| self.big_enough(l))
@@ -139,7 +145,7 @@ impl App {
     pub fn duplicates(&mut self, ui: &mut egui::Ui) {
         let out = self.out_dir();
         let settings = self.settings();
-        let busy = self.jobs.is_busy() || self.catalogue.busy();
+        let busy = self.jobs.is_busy() || self.catalogue.working();
         let st = &mut self.duplicates;
         let mut changed = false;
         if let Some(run) = &st.running

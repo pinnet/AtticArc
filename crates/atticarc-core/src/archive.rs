@@ -1831,7 +1831,14 @@ fn hash_folder_against(now: &Scan, rec: &BTreeMap<&str, &EntryRecord>, progress:
 /// again just before it is deleted, so a folder changed in between is
 /// caught. Starts `usn:` if the journal numbers were used, `meta:` if not.
 pub fn folder_snapshot(source: &Path) -> Result<String> {
+    folder_snapshot_with(source, &Progress::default())
+}
+
+/// [`folder_snapshot`], counting files in `progress` as it goes.
+pub fn folder_snapshot_with(source: &Path, progress: &Progress) -> Result<String> {
     let s = scan(source)?;
+    progress.total.store(s.files.len() as u64, Ordering::Relaxed);
+    progress.done.store(0, Ordering::Relaxed);
     // A volume without a journal answers no file; stop asking after a few.
     let mut journal = true;
     let mut misses = 0;
@@ -1846,6 +1853,7 @@ pub fn folder_snapshot(source: &Path) -> Result<String> {
         }
         let modified = f.modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
         rows.push(format!("{}\0{}\0{:?}\0{:?}", f.rel, f.size, modified, usn));
+        progress.done.fetch_add(1, Ordering::Relaxed);
     }
     let used_journal = journal && !s.files.is_empty() && misses == 0;
     rows.extend(s.skipped_links.iter().map(|l| format!("link\0{l}")));
@@ -1927,6 +1935,13 @@ impl RenameFinder {
 }
 
 pub fn delete_folder(source: &Path) -> Result<()> {
+    delete_folder_with(source, &Progress::default())
+}
+
+/// [`delete_folder`], counting files in `progress` as they go: the files
+/// first, one by one, then what is left (folders and links) in one go.
+pub fn delete_folder_with(source: &Path, progress: &Progress) -> Result<()> {
+    let mut files = Vec::new();
     for item in walkdir::WalkDir::new(source).follow_links(false).into_iter().flatten() {
         if let Ok(meta) = item.path().symlink_metadata() {
             let mut perms = meta.permissions();
@@ -1935,7 +1950,16 @@ pub fn delete_folder(source: &Path) -> Result<()> {
                 perms.set_readonly(false);
                 let _ = std::fs::set_permissions(item.path(), perms);
             }
+            if meta.file_type().is_file() {
+                files.push(item.into_path());
+            }
         }
+    }
+    progress.total.store(files.len() as u64, Ordering::Relaxed);
+    progress.done.store(0, Ordering::Relaxed);
+    for f in &files {
+        std::fs::remove_file(f).with_context(|| format!("can't delete {}", f.display()))?;
+        progress.done.fetch_add(1, Ordering::Relaxed);
     }
     std::fs::remove_dir_all(source).with_context(|| format!("can't delete {}", source.display()))
 }
