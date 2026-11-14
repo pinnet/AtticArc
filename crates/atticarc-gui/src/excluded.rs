@@ -5,8 +5,8 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, channel};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText};
 
@@ -293,17 +293,24 @@ impl App {
                         };
                         ui.horizontal(|ui| {
                             let back = ui
-                                .add_enabled(idle && !keep.is_empty(), egui::Button::new(if keep.is_empty() {
-                                    "Put ticked files back in the archive".to_string()
-                                } else {
-                                    format!("Put {} back in the archive", files(keep.len()))
-                                }))
+                                .add_enabled(
+                                    idle && !keep.is_empty(),
+                                    egui::Button::new(if keep.is_empty() {
+                                        "Put ticked files back in the archive".to_string()
+                                    } else {
+                                        format!("Put {} back in the archive", files(keep.len()))
+                                    }),
+                                )
                                 .on_hover_text("Rewrites the archive with these files added, verifies it, then replaces the old one");
                             if back.clicked() {
                                 request = Some(req(false));
                             }
                             if !f.set_aside.is_empty() {
-                                let label = if keep.is_empty() { "Discard the set-aside files…".to_string() } else { "Put ticked back, discard the rest…".to_string() };
+                                let label = if keep.is_empty() {
+                                    "Discard the set-aside files…".to_string()
+                                } else {
+                                    "Put ticked back, discard the rest…".to_string()
+                                };
                                 let b = egui::Button::new(RichText::new(label).color(theme::danger()));
                                 if ui.add_enabled(idle && rest > 0, b).clicked() {
                                     request = Some(req(true));

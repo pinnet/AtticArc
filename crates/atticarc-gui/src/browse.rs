@@ -87,16 +87,9 @@ impl Browse {
     }
 
     fn relist(&mut self) {
-        let mut dirs: Vec<Item> = self
-            .folders
-            .keys()
-            .filter(|k| !k.is_empty() && parent(k) == self.dir)
-            .map(|k| Item::Folder(k.clone()))
-            .collect();
-        let mut files: Vec<Item> = (0..self.files.len())
-            .filter(|&i| parent(&self.files[i].rel_path) == self.dir)
-            .map(Item::File)
-            .collect();
+        let mut dirs: Vec<Item> =
+            self.folders.keys().filter(|k| !k.is_empty() && parent(k) == self.dir).map(|k| Item::Folder(k.clone())).collect();
+        let mut files: Vec<Item> = (0..self.files.len()).filter(|&i| parent(&self.files[i].rel_path) == self.dir).map(Item::File).collect();
         let key = |it: &Item| -> (u64, String) {
             let (name, size, modified) = match it {
                 Item::Folder(p) => (leaf(p).to_string(), self.folders[p].0, String::new()),
@@ -143,17 +136,14 @@ impl Browse {
         let subfolders = self.listing.iter().filter(|i| matches!(i, Item::Folder(_))).count();
         let mut up = false;
         ui.horizontal(|ui| {
-            up = ui
-                .add_enabled(!self.dir.is_empty(), egui::Button::new("⬆ Up"))
-                .on_hover_text("Open the parent folder")
-                .clicked();
+            up = ui.add_enabled(!self.dir.is_empty(), egui::Button::new("⬆ Up")).on_hover_text("Open the parent folder").clicked();
             ui.label(
-            RichText::new(format!(
-                "{subfolders} folders · {} files here · {} in all, {count} files",
-                self.listing.len() - subfolders,
-                human(size)
-            ))
-            .color(theme::muted()),
+                RichText::new(format!(
+                    "{subfolders} folders · {} files here · {} in all, {count} files",
+                    self.listing.len() - subfolders,
+                    human(size)
+                ))
+                .color(theme::muted()),
             );
         });
         if up {
@@ -169,10 +159,9 @@ impl Browse {
         let mut resort = None;
         ui.horizontal(|ui| {
             let w = widths(ui);
-            for (i, (label, by)) in
-                [("Name", SortBy::Name), ("Type", SortBy::Type), ("Size", SortBy::Size), ("Modified", SortBy::Modified)]
-                    .into_iter()
-                    .enumerate()
+            for (i, (label, by)) in [("Name", SortBy::Name), ("Type", SortBy::Type), ("Size", SortBy::Size), ("Modified", SortBy::Modified)]
+                .into_iter()
+                .enumerate()
             {
                 let arrow = if self.sort == by { if self.descending { " ▼" } else { " ▲" } } else { "" };
                 let text = RichText::new(format!("{label}{arrow}")).color(theme::muted());
@@ -192,55 +181,50 @@ impl Browse {
 
         let mut go = None;
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 10.0;
-        egui::ScrollArea::vertical().id_salt("browse").auto_shrink([false, false]).show_rows(
-            ui,
-            row_h,
-            self.listing.len(),
-            |ui, range| {
-                let w = widths(ui);
-                for item in &self.listing[range] {
-                    ui.horizontal(|ui| {
-                        let (name, kind, size, modified, on) = match item {
-                            Item::Folder(p) => {
-                                let (s, n) = self.folders[p];
-                                let size = format!("{} · {n}", human(s));
-                                (format!("🗀  {}", leaf(p)), "Folder".to_string(), size, String::new(), false)
-                            }
-                            Item::File(i) => {
-                                let f = &self.files[*i];
-                                let name = leaf(&f.rel_path);
-                                let modified = f.modified_utc.as_deref().map(short_time).unwrap_or_default();
-                                // A reference file shows as the file it stands in for.
-                                let shown = match name.strip_suffix(&format!(".{}", atticarc_core::archive::DEP_EXT)) {
-                                    Some(stem) => format!("🔗  {stem}"),
-                                    None => format!("🗋  {name}"),
-                                };
-                                (shown, file_type(name), human(f.size), modified, self.selected == Some(*i))
-                            }
-                        };
-                        let resp = cell(ui, w[0], row_h - 4.0, false, |ui| {
-                            // The empty right text pushes the name to the left edge.
-                            let b = egui::Button::selectable(on, RichText::new(name).monospace()).right_text("").truncate();
-                            ui.add(b.min_size(egui::vec2(ui.available_width(), 0.0)))
-                        });
-                        if resp.clicked() {
-                            match item {
-                                Item::Folder(p) => go = Some(p.clone()),
-                                Item::File(i) => self.selected = Some(*i),
-                            }
+        egui::ScrollArea::vertical().id_salt("browse").auto_shrink([false, false]).show_rows(ui, row_h, self.listing.len(), |ui, range| {
+            let w = widths(ui);
+            for item in &self.listing[range] {
+                ui.horizontal(|ui| {
+                    let (name, kind, size, modified, on) = match item {
+                        Item::Folder(p) => {
+                            let (s, n) = self.folders[p];
+                            let size = format!("{} · {n}", human(s));
+                            (format!("🗀  {}", leaf(p)), "Folder".to_string(), size, String::new(), false)
                         }
-                        for (i, text) in [(1, kind), (2, size), (3, modified)] {
-                            cell(ui, w[i], row_h - 4.0, i == 2, |ui| {
-                                ui.add(egui::Label::new(RichText::new(text).color(theme::muted())).truncate())
-                            });
+                        Item::File(i) => {
+                            let f = &self.files[*i];
+                            let name = leaf(&f.rel_path);
+                            let modified = f.modified_utc.as_deref().map(short_time).unwrap_or_default();
+                            // A reference file shows as the file it stands in for.
+                            let shown = match name.strip_suffix(&format!(".{}", atticarc_core::archive::DEP_EXT)) {
+                                Some(stem) => format!("🔗  {stem}"),
+                                None => format!("🗋  {name}"),
+                            };
+                            (shown, file_type(name), human(f.size), modified, self.selected == Some(*i))
                         }
+                    };
+                    let resp = cell(ui, w[0], row_h - 4.0, false, |ui| {
+                        // The empty right text pushes the name to the left edge.
+                        let b = egui::Button::selectable(on, RichText::new(name).monospace()).right_text("").truncate();
+                        ui.add(b.min_size(egui::vec2(ui.available_width(), 0.0)))
                     });
-                }
-                if self.listing.is_empty() {
-                    ui.label(RichText::new("This folder is empty.").color(theme::muted()));
-                }
-            },
-        );
+                    if resp.clicked() {
+                        match item {
+                            Item::Folder(p) => go = Some(p.clone()),
+                            Item::File(i) => self.selected = Some(*i),
+                        }
+                    }
+                    for (i, text) in [(1, kind), (2, size), (3, modified)] {
+                        cell(ui, w[i], row_h - 4.0, i == 2, |ui| {
+                            ui.add(egui::Label::new(RichText::new(text).color(theme::muted())).truncate())
+                        });
+                    }
+                });
+            }
+            if self.listing.is_empty() {
+                ui.label(RichText::new("This folder is empty.").color(theme::muted()));
+            }
+        });
         if let Some(d) = go {
             self.open(d);
         }
@@ -250,11 +234,7 @@ impl Browse {
 /// One table cell of a fixed size, its contents left aligned, or right
 /// aligned for numbers.
 fn cell<R>(ui: &mut egui::Ui, width: f32, height: f32, right: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let layout = if right {
-        egui::Layout::right_to_left(egui::Align::Center)
-    } else {
-        egui::Layout::left_to_right(egui::Align::Center)
-    };
+    let layout = if right { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) };
     ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
         ui.set_min_size(egui::vec2(width, height));
         add(ui)

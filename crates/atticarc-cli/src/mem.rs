@@ -120,12 +120,7 @@ mod imp {
             }
             let id = pid.unwrap_or_else(|| GetCurrentProcessId());
             let threads = processes_with_threads().into_iter().find(|p| p.0 == id).map_or(0, |p| p.2);
-            Some(Sample {
-                resident: c.WorkingSetSize as u64,
-                private: c.PrivateUsage as u64,
-                handles: handles as u64,
-                threads,
-            })
+            Some(Sample { resident: c.WorkingSetSize as u64, private: c.PrivateUsage as u64, handles: handles as u64, threads })
         }
     }
 

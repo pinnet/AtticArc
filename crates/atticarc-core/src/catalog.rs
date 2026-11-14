@@ -51,11 +51,8 @@ fn hide(path: &Path) {
         return;
     }
     // attrib doesn't understand \\?\ paths.
-    let _ = std::process::Command::new("attrib")
-        .arg("+h")
-        .arg(crate::settings::strip_verbatim(path))
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+    let _ =
+        std::process::Command::new("attrib").arg("+h").arg(crate::settings::strip_verbatim(path)).creation_flags(CREATE_NO_WINDOW).status();
 }
 
 #[cfg(not(windows))]
@@ -184,11 +181,10 @@ CREATE INDEX IF NOT EXISTS archive_aliases_name ON archive_aliases(old_name);
 
 /// Adds `column` to `table` if it isn't there yet.
 fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
-    let has: bool = conn.query_row(
-        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-        params![column],
-        |r| r.get::<_, i64>(0).map(|n| n > 0),
-    )?;
+    let has: bool =
+        conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| {
+            r.get::<_, i64>(0).map(|n| n > 0)
+        })?;
     if !has {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
     }
@@ -316,13 +312,7 @@ impl Catalog {
 
     /// Replaces what is recorded for archive `id` after it was rewritten:
     /// its sizes and counts, its entries and what was left out of it.
-    pub fn replace_contents(
-        &mut self,
-        id: i64,
-        a: &ArchiveRecord,
-        entries: &[EntryRecord],
-        ex: &crate::archive::Excluded,
-    ) -> Result<()> {
+    pub fn replace_contents(&mut self, id: i64, a: &ArchiveRecord, entries: &[EntryRecord], ex: &crate::archive::Excluded) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE archives SET input_bytes = ?2, archive_bytes = ?3, file_count = ?4, dir_count = ?5 WHERE id = ?1",
@@ -436,9 +426,8 @@ impl Catalog {
     pub fn insert_excluded(&mut self, archive_id: i64, ex: &crate::archive::Excluded) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut q = tx.prepare(
-                "INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
+            let mut q =
+                tx.prepare("INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)")?;
             // The archive beside (older archives), or the one inside.
             let aside = ex.set_aside_archive.as_deref().or(ex.set_aside_inside.as_ref().map(|_| crate::archive::EXCLUDED_ENTRY));
             for e in &ex.set_aside {
@@ -495,9 +484,8 @@ impl Catalog {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
-        let mut files = self.conn.prepare(
-            "SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path",
-        )?;
+        let mut files =
+            self.conn.prepare("SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path")?;
         for f in &mut out {
             let rows = files.query_map(params![f.archive.archive_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
@@ -678,8 +666,10 @@ impl Catalog {
         };
         // The oldest copy is the original.
         let first: i64 = self.conn.query_row(
-            &format!("SELECT e2.id FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
-              WHERE e2.blake3 = ?1 AND e2.size = ?2 AND {COPY} ORDER BY a2.created_utc, a2.id, e2.rel_path LIMIT 1"),
+            &format!(
+                "SELECT e2.id FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
+              WHERE e2.blake3 = ?1 AND e2.size = ?2 AND {COPY} ORDER BY a2.created_utc, a2.id, e2.rel_path LIMIT 1"
+            ),
             params![blake3, size],
             |r| r.get(0),
         )?;
@@ -766,10 +756,7 @@ impl Catalog {
     }
 
     pub fn mark_source_deleted(&self, archive_id: i64, when_utc: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1",
-            params![archive_id, when_utc],
-        )?;
+        self.conn.execute("UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1", params![archive_id, when_utc])?;
         self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![archive_id])?;
         self.conn.execute("DELETE FROM cleanup_ticked WHERE archive_id = ?1", params![archive_id])?;
         Ok(())
@@ -832,11 +819,7 @@ impl Catalog {
     pub fn decoded_utc(&self, archive_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT COALESCE(decoded_utc, created_utc) FROM archives WHERE id = ?1",
-                params![archive_id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COALESCE(decoded_utc, created_utc) FROM archives WHERE id = ?1", params![archive_id], |r| r.get(0))
             .optional()?)
     }
 
@@ -939,11 +922,8 @@ impl Catalog {
     /// `holi 2014` finds `Holiday-Cornwall/2014/IMG_1.jpg`.
     /// `archive_id` limits the search to one archive.
     pub fn search(&self, text: &str, archive_id: Option<i64>, limit: usize) -> Result<Vec<FoundFile>> {
-        let words: Vec<String> = text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("\"{w}\"*"))
-            .collect();
+        let words: Vec<String> =
+            text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| format!("\"{w}\"*")).collect();
         if words.is_empty() {
             return Ok(Vec::new());
         }
@@ -1002,9 +982,7 @@ impl Catalog {
                  ORDER BY e.size * (n - 1) DESC
                  LIMIT ?1",
             )?;
-            let rows = q.query_map(params![limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })?;
+            let rows = q.query_map(params![limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
             for row in rows {
                 let (blake3, size) = row?;
                 groups.push(DuplicateGroup { blake3, size, copies: Vec::new() });
@@ -1119,11 +1097,7 @@ fn insert_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64, entries: &[En
     let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
     for e in entries {
         let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
-        let ext = if e.is_dir {
-            String::new()
-        } else {
-            name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
-        };
+        let ext = if e.is_dir { String::new() } else { name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default() };
         ins.execute(params![
             archive_id,
             e.rel_path,

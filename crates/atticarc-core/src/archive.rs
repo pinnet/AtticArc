@@ -17,10 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use sevenz_turbo::encoder_options::Lzma2Options;
-use sevenz_turbo::{
-    ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password,
-    SourceReader,
-};
+use sevenz_turbo::{ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password, SourceReader};
 use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
@@ -128,10 +125,50 @@ const MAX_BLOCK: u64 = 4 * 1024 * 1024 * 1024;
 /// Extensions of formats that are already compressed. In store mode these
 /// are copied into the archive without compressing them again.
 const STORE_EXTS: &[&str] = &[
-    "7z", "zip", "rar", "gz", "tgz", "bz2", "xz", "zst", "lz4", "cab", "whl", "jar", "apk", "nupkg",
-    "docx", "xlsx", "pptx", "odt", "epub", "jpg", "jpeg", "png", "gif", "webp", "heic", "avif", "mp3",
-    "aac", "m4a", "ogg", "opus", "flac", "mp4", "m4v", "mkv", "mov", "avi", "webm", "wmv", "safetensors",
-    "gguf", "pdf", "msi", "dmg",
+    "7z",
+    "zip",
+    "rar",
+    "gz",
+    "tgz",
+    "bz2",
+    "xz",
+    "zst",
+    "lz4",
+    "cab",
+    "whl",
+    "jar",
+    "apk",
+    "nupkg",
+    "docx",
+    "xlsx",
+    "pptx",
+    "odt",
+    "epub",
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "heic",
+    "avif",
+    "mp3",
+    "aac",
+    "m4a",
+    "ogg",
+    "opus",
+    "flac",
+    "mp4",
+    "m4v",
+    "mkv",
+    "mov",
+    "avi",
+    "webm",
+    "wmv",
+    "safetensors",
+    "gguf",
+    "pdf",
+    "msi",
+    "dmg",
 ];
 
 #[derive(Clone, Debug)]
@@ -222,11 +259,7 @@ impl Progress {
     }
 
     fn check_cancel(&self) -> io::Result<()> {
-        if self.cancel.load(Ordering::Relaxed) {
-            Err(io::Error::other("cancelled"))
-        } else {
-            Ok(())
-        }
+        if self.cancel.load(Ordering::Relaxed) { Err(io::Error::other("cancelled")) } else { Ok(()) }
     }
 }
 
@@ -362,8 +395,7 @@ impl Read for HashReader {
             if self.finished {
                 return Ok(0);
             }
-            let f = File::open(&self.path)
-                .map_err(|e| io::Error::new(e.kind(), format!("can't open {}: {e}", self.path.display())))?;
+            let f = File::open(&self.path).map_err(|e| io::Error::new(e.kind(), format!("can't open {}: {e}", self.path.display())))?;
             self.progress.set_file("compressing", &self.rel, self.size);
             self.file = Some(f);
         }
@@ -451,7 +483,9 @@ pub fn archive_again(source: &Path, settings: &Settings, progress: &Arc<Progress
         let stem = old.archive_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let day = chrono::Local::now().format("%Y-%m-%d");
         let to = std::iter::once(dir.join(format!("{stem}.7z")))
-            .chain((1..).map(|n| dir.join(if n == 1 { format!("{stem} (superseded {day}).7z") } else { format!("{stem} (superseded {day}, {n}).7z") })))
+            .chain((1..).map(|n| {
+                dir.join(if n == 1 { format!("{stem} (superseded {day}).7z") } else { format!("{stem} (superseded {day}, {n}).7z") })
+            }))
             .find(|p| !p.exists())
             .expect("a free name");
         std::fs::rename(&old.archive_path, &to)
@@ -459,7 +493,14 @@ pub fn archive_again(source: &Path, settings: &Settings, progress: &Arc<Progress
         let to_key = crate::settings::strip_verbatim(&to).to_string_lossy().into_owned();
         let mut cat = Catalog::open_existing(&settings.out_dir)?;
         cat.supersede(old.archive_id, &to_key)?;
-        let _ = cat.log_run(Some(old.archive_id), "supersede", &canonical, &now_utc(), "moved", &format!("replaced by {}", o.record.archive_path));
+        let _ = cat.log_run(
+            Some(old.archive_id),
+            "supersede",
+            &canonical,
+            &now_utc(),
+            "moved",
+            &format!("replaced by {}", o.record.archive_path),
+        );
         Ok(to)
     })();
     match moved {
@@ -493,11 +534,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     if out_dir.starts_with(&source) {
         bail!("the output folder is inside {}; choose another output folder", source.display());
     }
-    let name = source
-        .file_name()
-        .ok_or_else(|| anyhow!("can't archive a drive root"))?
-        .to_string_lossy()
-        .into_owned();
+    let name = source.file_name().ok_or_else(|| anyhow!("can't archive a drive root"))?.to_string_lossy().into_owned();
     let final_path = unique_archive_path(&out_dir, &name);
     // "Name (2)" when "Name" is taken: the archive's own name from here on.
     let name = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(name);
@@ -546,11 +583,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
 
     // The set-aside files, as a scan of their own for the inner archive,
     // written beside the main archive's partial file until it goes inside.
-    let aside_scan = Scan {
-        total_bytes: scan.set_aside.iter().map(|f| f.size).sum(),
-        files: scan.set_aside.clone(),
-        ..Scan::default()
-    };
+    let aside_scan = Scan { total_bytes: scan.set_aside.iter().map(|f| f.size).sum(), files: scan.set_aside.clone(), ..Scan::default() };
     let aside_partial = (!aside_scan.files.is_empty()).then(|| PathBuf::from(format!("{}.excluded.partial", final_path.display())));
     let aside_record = record_for(format!("{name} (excluded)"), format!("{}|excluded", path_key(&source)), &aside_scan);
 
@@ -606,8 +639,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     };
 
     let mut cat = Catalog::open(&out_dir)?;
-    std::fs::rename(&partial, &final_path)
-        .with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
+    std::fs::rename(&partial, &final_path).with_context(|| format!("can't rename {} to {}", partial.display(), final_path.display()))?;
     record.archive_path = crate::settings::strip_verbatim(&final_path).to_string_lossy().into_owned();
     record.archive_bytes = archive_bytes;
 
@@ -626,8 +658,11 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     }
     if !excluded.deps.is_empty() {
         let bytes: u64 = excluded.deps.iter().map(|d| d.entry.size).sum();
-        detail.push(format!("stored once ({} identical copies, {bytes} bytes): {}", excluded.deps.len(),
-            excluded.deps.iter().map(|d| format!("{} = {}", d.entry.rel_path, d.original_path)).collect::<Vec<_>>().join(", ")));
+        detail.push(format!(
+            "stored once ({} identical copies, {bytes} bytes): {}",
+            excluded.deps.len(),
+            excluded.deps.iter().map(|d| format!("{} = {}", d.entry.rel_path, d.original_path)).collect::<Vec<_>>().join(", ")
+        ));
     }
     let detail = detail.join("; ");
     cat.log_run(Some(archive_id), "archive", &source, &started, "verified", &detail)?;
@@ -668,7 +703,13 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
 /// the first, written in `dir`, goes in at `<copy>.atticarcdep`. Only files
 /// sharing a size with another are read. Returns the copies replaced, as
 /// the manifest records them; the folder on disk is not touched.
-fn store_identical_once(scan: &mut Scan, dir: &Path, archive_file: &str, store_mode: bool, progress: &Arc<Progress>) -> Result<Vec<Replaced>> {
+fn store_identical_once(
+    scan: &mut Scan,
+    dir: &Path,
+    archive_file: &str,
+    store_mode: bool,
+    progress: &Arc<Progress>,
+) -> Result<Vec<Replaced>> {
     let mut by_size: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for (i, f) in scan.files.iter().enumerate() {
         if f.size >= IDENTICAL_MIN_BYTES {
@@ -738,11 +779,7 @@ fn store_identical_once(scan: &mut Scan, dir: &Path, archive_file: &str, store_m
 /// changes one or the other.
 pub fn archive_fingerprint(archive: &Path) -> Result<(u64, i64)> {
     let meta = std::fs::metadata(archive).with_context(|| format!("can't read {}", archive.display()))?;
-    let modified = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
     Ok((meta.len(), modified))
 }
 
@@ -791,7 +828,13 @@ pub fn scrub_archive(archive: &Path, recorded: &[EntryRecord], threads: u32, pro
 /// check covers it byte for byte.
 fn inner_record(path: &Path) -> Result<EntryRecord> {
     let meta = std::fs::metadata(path).with_context(|| format!("can't read {}", path.display()))?;
-    let f = ScannedFile { abs: path.to_path_buf(), rel: EXCLUDED_ENTRY.into(), size: meta.len(), modified: meta.modified().ok(), created: None };
+    let f = ScannedFile {
+        abs: path.to_path_buf(),
+        rel: EXCLUDED_ENTRY.into(),
+        size: meta.len(),
+        modified: meta.modified().ok(),
+        created: None,
+    };
     let mut rec = hash_record(&f, &Arc::new(Progress::default()))?;
     rec.method = "copy".into();
     Ok(rec)
@@ -1011,12 +1054,7 @@ fn original_archive_file(out_dir: &Path, name: &str) -> PathBuf {
     if plain.is_file() {
         return plain;
     }
-    Catalog::open_existing(out_dir)
-        .and_then(|c| c.path_for_alias(name))
-        .ok()
-        .flatten()
-        .map(PathBuf::from)
-        .unwrap_or(plain)
+    Catalog::open_existing(out_dir).and_then(|c| c.path_for_alias(name)).ok().flatten().map(PathBuf::from).unwrap_or(plain)
 }
 
 /// `name.7z`, or if that's taken `name (2).7z`, `name (3).7z` and so on: a
@@ -1028,10 +1066,7 @@ fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
     if !taken(&plain) {
         return plain;
     }
-    (2u32..)
-        .map(|n| out_dir.join(format!("{name} ({n}).7z")))
-        .find(|p| !taken(p))
-        .expect("a free name")
+    (2u32..).map(|n| out_dir.join(format!("{name} ({n}).7z"))).find(|p| !taken(p)).expect("a free name")
 }
 
 /// Writes the archive, with the manifest describing `record` and the files
@@ -1060,10 +1095,7 @@ fn write_archive(
     let is_store = |f: &ScannedFile| settings.store_mode && STORE_EXTS.contains(&ext_of(&f.rel).as_str());
     let (store, pack): (Vec<usize>, Vec<usize>) = (0..scan.files.len()).partition(|&i| is_store(&scan.files[i]));
 
-    let groups = [
-        (pack, lzma2_config(settings.level, settings.threads)),
-        (store, EncoderConfiguration::new(EncoderMethod::COPY)),
-    ];
+    let groups = [(pack, lzma2_config(settings.level, settings.threads)), (store, EncoderConfiguration::new(EncoderMethod::COPY))];
     for (indices, method) in groups {
         if indices.is_empty() {
             continue;
@@ -1093,11 +1125,10 @@ fn write_archive(
         let mut block_bytes = 0;
         for i in indices {
             let size = scan.files[i].size;
-            if (size >= MAX_BLOCK || block_bytes + size >= MAX_BLOCK)
-                && !entries.is_empty() {
-                    w.push_archive_entries_send(std::mem::take(&mut entries), std::mem::take(&mut readers))?;
-                    block_bytes = 0;
-                }
+            if (size >= MAX_BLOCK || block_bytes + size >= MAX_BLOCK) && !entries.is_empty() {
+                w.push_archive_entries_send(std::mem::take(&mut entries), std::mem::take(&mut readers))?;
+                block_bytes = 0;
+            }
             if size >= MAX_BLOCK {
                 w.push_archive_entry_send(entry_for(i), Some(reader_for(i)))?;
                 continue;
@@ -1116,11 +1147,7 @@ fn write_archive(
             r.method = "dep".into();
         }
     }
-    let manifest = serde_json::to_vec_pretty(&Manifest {
-        archive: record.clone(),
-        entries: records.clone(),
-        excluded: excluded.clone(),
-    })?;
+    let manifest = serde_json::to_vec_pretty(&Manifest { archive: record.clone(), entries: records.clone(), excluded: excluded.clone() })?;
     // Marked as a folder and hidden, so it stays out of the way when the
     // archive is extracted on Windows too.
     const HIDDEN: u32 = 0x2;
@@ -1214,8 +1241,7 @@ fn verify_archive_saving(
     progress: &Arc<Progress>,
     save_inner: Option<&Path>,
 ) -> Result<u64> {
-    let want: HashMap<&str, &EntryRecord> =
-        expected.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e)).collect();
+    let want: HashMap<&str, &EntryRecord> = expected.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e)).collect();
     let mut seen: HashMap<String, ()> = HashMap::new();
     let mut problems: Vec<String> = Vec::new();
     let mut reader = ArchiveReader::open(archive, Password::empty())
@@ -1269,9 +1295,11 @@ fn verify_archive_saving(
             seen.insert(name, ());
             Ok(true)
         })
-        .map_err(|e| {
-            if progress.cancel.load(Ordering::Relaxed) { anyhow!("cancelled") } else { anyhow!("archive can't be decoded: {e}") }
-        })?;
+        .map_err(
+            |e| {
+                if progress.cancel.load(Ordering::Relaxed) { anyhow!("cancelled") } else { anyhow!("archive can't be decoded: {e}") }
+            },
+        )?;
     for (name, e) in &want {
         if !seen.contains_key(*name) && e.size > 0 {
             problems.push(format!("{name} is missing from the archive"));
@@ -1440,10 +1468,7 @@ pub fn remove_duplicates(out_dir: &Path, entry_ids: &[i64], settings: &Settings,
         if cat.is_dep_original(&f.archive_path, &f.rel_path)? {
             bail!("{} is the original that reference files point to, so it can't be removed", f.rel_path);
         }
-        let kept = cat
-            .copies_of(hash, f.size)?
-            .into_iter()
-            .any(|(other, path)| !entry_ids.contains(&other) && path.is_file());
+        let kept = cat.copies_of(hash, f.size)?.into_iter().any(|(other, path)| !entry_ids.contains(&other) && path.is_file());
         if !kept {
             bail!("{} would have no copy left in any archive; untick one of its copies", f.rel_path);
         }
@@ -1496,12 +1521,20 @@ pub fn replace_duplicates(
     let now = now_utc();
     let mut leaves = Vec::new();
     for id in entry_ids {
-        leaves.push(cat.dedupe_leaf(*id)?.ok_or_else(|| anyhow!("a file picked is no longer a duplicate in the catalogue; refresh and try again"))?);
+        leaves.push(
+            cat.dedupe_leaf(*id)?
+                .ok_or_else(|| anyhow!("a file picked is no longer a duplicate in the catalogue; refresh and try again"))?,
+        );
     }
-    leaves.sort_by(|a, b| (&a.archive_created, a.archive_id, &a.entry.rel_path).cmp(&(&b.archive_created, b.archive_id, &b.entry.rel_path)));
+    leaves
+        .sort_by(|a, b| (&a.archive_created, a.archive_id, &a.entry.rel_path).cmp(&(&b.archive_created, b.archive_id, &b.entry.rel_path)));
     for leaf in leaves {
         if !leaf.original_archive_path.is_file() {
-            bail!("{} holds the original of {} but isn't there; nothing was changed", leaf.original_archive_path.display(), leaf.entry.rel_path);
+            bail!(
+                "{} holds the original of {} but isn't there; nothing was changed",
+                leaf.original_archive_path.display(),
+                leaf.entry.rel_path
+            );
         }
         if !leaf.archive_path.is_file() {
             bail!("{} isn't there; nothing was changed", leaf.archive_path.display());
@@ -1614,7 +1647,11 @@ fn hash_entries(archive: &Path, rels: &[String], threads: u32, progress: &Arc<Pr
             Ok(out.len() < want.len())
         })
         .map_err(|e| {
-            if progress.cancel.load(Ordering::Relaxed) { anyhow!("cancelled") } else { anyhow!("{} can't be decoded: {e}", archive.display()) }
+            if progress.cancel.load(Ordering::Relaxed) {
+                anyhow!("cancelled")
+            } else {
+                anyhow!("{} can't be decoded: {e}", archive.display())
+            }
         })?;
     Ok(out)
 }
@@ -1695,9 +1732,8 @@ fn rewrite(archive: &Path, ch: &Changes<'_>, settings: &Settings, progress: &Arc
         // compresses.
         let aside: u64 = ex.set_aside.iter().map(|e| e.size).sum();
         let unpacked = m.archive.input_bytes.saturating_add(aside);
-        let needed = unpacked
-            .saturating_add(crate::disk::archive_worst_case(unpacked))
-            .saturating_add(crate::disk::archive_worst_case(aside));
+        let needed =
+            unpacked.saturating_add(crate::disk::archive_worst_case(unpacked)).saturating_add(crate::disk::archive_worst_case(aside));
         crate::disk::ensure_free(out_dir, needed, &format!("rewriting {}", m.archive.name))?;
         progress.set_phase("Unpacking the archive", m.archive.input_bytes);
         // This unpacks the inner archive of set-aside files too, still packed.
@@ -2190,8 +2226,11 @@ pub fn find_renamed_source(missing: &Path, archive: &Path, recorded: &[EntryReco
 #[derive(Default)]
 pub struct RenameFinder {
     /// Parent folder → its subfolders, each with its files' paths and sizes.
-    seen: HashMap<PathBuf, Vec<(PathBuf, BTreeMap<String, u64>)>>,
+    seen: HashMap<PathBuf, Vec<Subfolder>>,
 }
+
+/// A subfolder and its files' paths and sizes.
+type Subfolder = (PathBuf, BTreeMap<String, u64>);
 
 impl RenameFinder {
     pub fn find(&mut self, missing: &Path, archive: &Path, recorded: &[EntryRecord], skip: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
@@ -2273,7 +2312,15 @@ mod tests {
     use std::io::Write;
 
     fn settings(out: &Path, store: bool) -> Settings {
-        Settings { out_dir: out.to_path_buf(), level: 5, store_mode: store, threads: 4, protected: vec![], exclusions: vec![], identical_once: false }
+        Settings {
+            out_dir: out.to_path_buf(),
+            level: 5,
+            store_mode: store,
+            threads: 4,
+            protected: vec![],
+            exclusions: vec![],
+            identical_once: false,
+        }
     }
 
     /// A tree with the awkward cases: Unicode names, an empty folder, an
@@ -2429,8 +2476,7 @@ mod tests {
         assert!(second.archive_path.ends_with("My Folder (2).7z"));
         assert_eq!(entries.iter().filter(|e| !e.is_dir).count(), 1);
         let cat = Catalog::open(&out).unwrap();
-        verify_archive(&first.archive_path, &cat.entries(first.archive_id).unwrap(), 2, &Arc::new(Progress::default()))
-            .unwrap();
+        verify_archive(&first.archive_path, &cat.entries(first.archive_id).unwrap(), 2, &Arc::new(Progress::default())).unwrap();
         // A third time: "(3)".
         std::fs::write(src.join("more.txt"), b"and more").unwrap();
         let o = archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
@@ -2646,7 +2692,8 @@ mod tests {
             file_count: sc.files.len() as u64,
             dir_count: sc.dirs.len() as u64,
         };
-        let aside_scan = Scan { total_bytes: scan.set_aside.iter().map(|f| f.size).sum(), files: scan.set_aside.clone(), ..Scan::default() };
+        let aside_scan =
+            Scan { total_bytes: scan.set_aside.iter().map(|f| f.size).sum(), files: scan.set_aside.clone(), ..Scan::default() };
         let mut aside_rec = record("src (excluded)", format!("{}|excluded", path_key(src)), &aside_scan);
         let aside_entries = write_archive(&aside_scan, &aside, s, &p, &aside_rec, &Excluded::default(), None).unwrap();
         let ex = Excluded {
@@ -2816,10 +2863,7 @@ mod tests {
         assert_eq!((r.files, r.bytes), (2, 32_000));
         let m = read_manifest(&two).unwrap();
         let files: Vec<(&str, &str)> = m.entries.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e.method.as_str())).collect();
-        assert_eq!(
-            files,
-            [("other/again.jpg.atticarcdep", "dep"), ("pics/same.jpg.atticarcdep", "dep"), ("two.txt", "lzma2")]
-        );
+        assert_eq!(files, [("other/again.jpg.atticarcdep", "dep"), ("pics/same.jpg.atticarcdep", "dep"), ("two.txt", "lzma2")]);
         assert_eq!(m.excluded.deps.len(), 2);
         // The reference file says where the original is.
         let dir = tmp.path().join("x");

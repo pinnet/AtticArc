@@ -16,8 +16,8 @@ mod common;
 use std::path::Path;
 
 use atticarc_core::archive::{
-    self, DepFile, Manifest, archive_again, archive_folder, check_before_delete, check_index, read_manifest,
-    rebuild_catalog, scrub_archive, verify_archive,
+    self, DepFile, Manifest, archive_again, archive_folder, check_before_delete, check_index, read_manifest, rebuild_catalog,
+    scrub_archive, verify_archive,
 };
 use atticarc_core::catalog::{Catalog, DATA_DIR, EntryRecord};
 use atticarc_core::exclude::Action;
@@ -87,7 +87,8 @@ fn the_fixture_archives_still_verify_check_scrub_and_rebuild() {
     let r = rebuild_catalog(&out).unwrap();
     assert_eq!((r.added, r.failed.len(), r.copies.len()), (4, 0, 0), "{r:?}");
 
-    let expect: [(&str, &str, usize); 4] = [("Plain", "Plain.7z", 5), ("Rules", "Rules.7z", 2), ("Twice", "Twice.7z", 6), ("Again", "Again (2).7z", 1)];
+    let expect: [(&str, &str, usize); 4] =
+        [("Plain", "Plain.7z", 5), ("Rules", "Rules.7z", 2), ("Twice", "Twice.7z", 6), ("Again", "Again (2).7z", 1)];
     for (folder, file, files) in expect {
         let archive = out.join(file);
         let m: Manifest = read_manifest(&archive).unwrap();

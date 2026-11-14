@@ -269,10 +269,7 @@ pub fn scrub_list(out_dir: &Path, due_only: bool) -> Result<Vec<ScrubItem>> {
         return Ok(Vec::new());
     }
     let all = Catalog::open_existing(out_dir)?.scrub_list()?;
-    Ok(all
-        .into_iter()
-        .filter(|s| !due_only || days_since(&s.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS))
-        .collect())
+    Ok(all.into_iter().filter(|s| !due_only || days_since(&s.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS)).collect())
 }
 
 /// Decodes one archive again and checks every file against the catalogue,
@@ -305,7 +302,15 @@ mod tests {
     use crate::archive::archive_folder;
 
     fn settings(out: &Path) -> Settings {
-        Settings { out_dir: out.to_path_buf(), level: 1, store_mode: true, threads: 2, protected: vec![], exclusions: vec![], identical_once: false }
+        Settings {
+            out_dir: out.to_path_buf(),
+            level: 1,
+            store_mode: true,
+            threads: 2,
+            protected: vec![],
+            exclusions: vec![],
+            identical_once: false,
+        }
     }
 
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {

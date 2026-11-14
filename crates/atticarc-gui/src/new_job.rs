@@ -14,11 +14,7 @@ impl App {
     pub fn new_job(&mut self, ui: &mut egui::Ui) {
         let busy = self.jobs.is_busy();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            heading(
-                ui,
-                "New archive job",
-                "Each top-level folder in the source becomes one .7z in the destination, hashed and verified.",
-            );
+            heading(ui, "New archive job", "Each top-level folder in the source becomes one .7z in the destination, hashed and verified.");
             ui.add_enabled_ui(!busy, |ui| {
                 self.locations(ui);
                 ui.add_space(12.0);
@@ -67,10 +63,15 @@ impl App {
                 ui.label(RichText::new(format!("{} folders found", self.jobs.rows.len())).color(theme::muted()));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!settling, egui::Button::new("Change source…")).clicked()
-                        && let Some(p) = pick_folder("Choose the SOURCE folder (the one whose subfolders get archived)", &self.source_dir, &mut self.picker_closed) {
-                            self.source_dir = atticarc_core::settings::strip_verbatim(&p);
-                            changed = true;
-                        }
+                        && let Some(p) = pick_folder(
+                            "Choose the SOURCE folder (the one whose subfolders get archived)",
+                            &self.source_dir,
+                            &mut self.picker_closed,
+                        )
+                    {
+                        self.source_dir = atticarc_core::settings::strip_verbatim(&p);
+                        changed = true;
+                    }
                     if let Some(p) = recent_menu(ui, !settling, &self.saved.recent_sources, &self.source_dir, true) {
                         self.source_dir = p;
                         changed = true;
@@ -79,11 +80,8 @@ impl App {
             });
             card(&mut cols[1], |ui| {
                 ui.label(caption("Destination"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.out_dir_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY),
-                );
+                let resp = ui
+                    .add(egui::TextEdit::singleline(&mut self.out_dir_text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
                 if resp.lost_focus() {
                     changed = true;
                 }
@@ -96,10 +94,15 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!settling, egui::Button::new("Change destination…")).clicked()
-                        && let Some(p) = pick_folder("Choose the DESTINATION folder (where the archives go)", &nearest_existing(&self.out_dir()), &mut self.picker_closed) {
-                            self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
-                            changed = true;
-                        }
+                        && let Some(p) = pick_folder(
+                            "Choose the DESTINATION folder (where the archives go)",
+                            &nearest_existing(&self.out_dir()),
+                            &mut self.picker_closed,
+                        )
+                    {
+                        self.out_dir_text = atticarc_core::settings::strip_verbatim(&p).display().to_string();
+                        changed = true;
+                    }
                     let current = self.out_dir();
                     if let Some(p) = recent_menu(ui, !settling, &self.saved.recent_dests, &current, false) {
                         self.out_dir_text = p.display().to_string();
@@ -123,12 +126,10 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Compression").strong());
-                    egui::ComboBox::from_id_salt("level")
-                        .selected_text(format!("LZMA2 · level {}", self.saved.level))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.saved.level, 5, "LZMA2 · level 5 (default)");
-                            ui.selectable_value(&mut self.saved.level, 9, "LZMA2 · level 9 (smaller, about 2× slower)");
-                        });
+                    egui::ComboBox::from_id_salt("level").selected_text(format!("LZMA2 · level {}", self.saved.level)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.saved.level, 5, "LZMA2 · level 5 (default)");
+                        ui.selectable_value(&mut self.saved.level, 9, "LZMA2 · level 9 (smaller, about 2× slower)");
+                    });
                 });
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
@@ -250,13 +251,11 @@ impl App {
                     }
                     let path = row.path.clone();
                     ui.horizontal(|ui| {
-                        let again = ui
-                            .add_enabled(!busy, egui::Button::new("↻").small())
-                            .on_hover_text(
-                                "Archive again with the current settings and exclusions. The new archive gets a name \
+                        let again = ui.add_enabled(!busy, egui::Button::new("↻").small()).on_hover_text(
+                            "Archive again with the current settings and exclusions. The new archive gets a name \
                                  of its own; once it is verified, the older one is moved to .atticarc\\superseded in the \
                                  destination (not deleted).",
-                            );
+                        );
                         if again.clicked() {
                             again_clicked = Some(path);
                         }
@@ -279,7 +278,8 @@ impl App {
             if Exclusions::new(&self.saved.exclusions).is_err() {
                 self.jobs.dialog = Some(Dialog::Message("Not started".into(), "An exclusion can't be used; fix it first.".into()));
             } else if overlap(&self.source_dir, &self.out_dir()).is_some() {
-                self.jobs.dialog = Some(Dialog::Message("Not started".into(), "Choose a source and destination that don't overlap first.".into()));
+                self.jobs.dialog =
+                    Some(Dialog::Message("Not started".into(), "Choose a source and destination that don't overlap first.".into()));
             } else {
                 self.save();
                 self.jobs.archive_again(&path, self.settings(), self.saved.detailed_log);

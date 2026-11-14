@@ -1,0 +1,60 @@
+# Checks every pull request and every push to main on Windows, macOS and Linux:
+# formatting, clippy and the whole test suite. The three must stay identical
+# (docs/refactor-brief.md, "The outcome"), so a failure on any one fails the run.
+#
+# Move this file to .github/workflows/check.yml.
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Desktop libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Core and CLI must be clean. The GUI's warnings are shown but don't
+      # fail the run until they have been cleared on a machine that builds it
+      # (docs/refactor-log.md, phase 1).
+      - name: Clippy (core, CLI)
+        run: cargo clippy -p atticarc-core -p atticarc-cli --all-targets -- -D warnings
+
+      - name: Clippy (GUI, warnings only)
+        run: cargo clippy -p atticarc-gui --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release --workspace

@@ -191,8 +191,7 @@ impl App {
         settings::remember(&mut self.saved.recent_sources, &self.source_dir);
         settings::remember(&mut self.saved.recent_dests, &out);
         self.saved.out_dir = Some(out);
-        self.saved.protected =
-            self.protected_text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+        self.saved.protected = self.protected_text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect();
         settings::store(&self.saved);
     }
 
@@ -276,11 +275,12 @@ impl App {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let on = self.settings_open;
-            let button = egui::Button::new(RichText::new("⚙  Settings").size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() }))
-                .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
-                .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
-                .corner_radius(CornerRadius::same(6))
-                .min_size(egui::vec2(ui.available_width(), 40.0));
+            let button =
+                egui::Button::new(RichText::new("⚙  Settings").size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() }))
+                    .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
+                    .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
+                    .corner_radius(CornerRadius::same(6))
+                    .min_size(egui::vec2(ui.available_width(), 40.0));
             if ui.add(button).on_hover_text("Light or dark, colour, graphics and the log file").clicked() {
                 self.settings_open = !on;
             }
@@ -354,7 +354,11 @@ impl App {
                     self.saved.compatible_graphics = compat;
                     settings::store(&self.saved);
                 }
-                if ui.button("Refresh window (F5)").on_hover_text("Redraws the window at the right size, if it looks wrong after a display wakes").clicked() {
+                if ui
+                    .button("Refresh window (F5)")
+                    .on_hover_text("Redraws the window at the right size, if it looks wrong after a display wakes")
+                    .clicked()
+                {
                     refresh = true;
                 }
                 ui.add_space(10.0);
@@ -412,16 +416,17 @@ impl eframe::App for App {
             .exact_size(200.0)
             .frame(egui::Frame::NONE.fill(theme::sidebar()).inner_margin(Margin::symmetric(14, 18)))
             .show(ui, |ui| self.sidebar(ui));
-        egui::CentralPanel::no_frame()
-            .frame(egui::Frame::NONE.fill(theme::ground()).inner_margin(Margin::symmetric(32, 26)))
-            .show(ui, |ui| match self.screen {
+        egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(theme::ground()).inner_margin(Margin::symmetric(32, 26))).show(
+            ui,
+            |ui| match self.screen {
                 Screen::NewJob => self.new_job(ui),
                 Screen::Progress => self.progress(ui),
                 Screen::Catalogue => self.catalogue(ui),
                 Screen::Duplicates => self.duplicates(ui),
                 Screen::Excluded => self.excluded(ui),
                 Screen::Cleanup => self.cleanup(ui),
-            });
+            },
+        );
         self.settings_window(&ctx);
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
@@ -469,9 +474,7 @@ pub fn caption(text: &str) -> RichText {
 }
 
 pub fn primary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE))
-        .fill(theme::accent())
-        .min_size(egui::vec2(0.0, 40.0))
+    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE)).fill(theme::accent()).min_size(egui::vec2(0.0, 40.0))
 }
 
 /// A pill-shaped status tag like the mockups' "Verified" / "Queued".

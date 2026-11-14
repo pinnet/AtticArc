@@ -131,37 +131,39 @@ impl App {
             st.archive_filter = keep;
         }
         if let Some(rx) = &st.extracting
-            && let Ok(res) = rx.try_recv() {
-                st.note = Some(match res {
-                    Ok(p) => format!("Extracted to {}", p.display()),
-                    Err(e) => format!("Extract failed: {e}"),
-                });
-                st.extracting = None;
-            }
+            && let Ok(res) = rx.try_recv()
+        {
+            st.note = Some(match res {
+                Ok(p) => format!("Extracted to {}", p.display()),
+                Err(e) => format!("Extract failed: {e}"),
+            });
+            st.extracting = None;
+        }
         if let Some(rx) = &st.rebuilding
-            && let Ok(res) = rx.try_recv() {
-                st.rebuild_note = Some(match res {
-                    Ok(r) => {
-                        let mut n = format!("Rebuilt from the archives: {} added, {} already in the catalogue.", r.added, r.already_there);
-                        if !r.relinked.is_empty() {
-                            let list: Vec<String> = r.relinked.iter().map(|(o, n)| format!("{o} → {n}")).collect();
-                            n.push_str(&format!(" Relinked after a rename: {}.", list.join(", ")));
-                        }
-                        if !r.copies.is_empty() {
-                            n.push_str(&format!(" Not added, as copies: {}.", r.copies.join("; ")));
-                        }
-                        if !r.failed.is_empty() {
-                            n.push_str(&format!(" {} couldn't be read:\n{}", r.failed.len(), r.failed.join("\n")));
-                        }
-                        n
+            && let Ok(res) = rx.try_recv()
+        {
+            st.rebuild_note = Some(match res {
+                Ok(r) => {
+                    let mut n = format!("Rebuilt from the archives: {} added, {} already in the catalogue.", r.added, r.already_there);
+                    if !r.relinked.is_empty() {
+                        let list: Vec<String> = r.relinked.iter().map(|(o, n)| format!("{o} → {n}")).collect();
+                        n.push_str(&format!(" Relinked after a rename: {}.", list.join(", ")));
                     }
-                    Err(e) => format!("Rebuild failed: {e}"),
-                });
-                st.rebuilding = None;
-                st.rebuild_progress = None;
-                st.cleared = true;
-                st.invalidate();
-            }
+                    if !r.copies.is_empty() {
+                        n.push_str(&format!(" Not added, as copies: {}.", r.copies.join("; ")));
+                    }
+                    if !r.failed.is_empty() {
+                        n.push_str(&format!(" {} couldn't be read:\n{}", r.failed.len(), r.failed.join("\n")));
+                    }
+                    n
+                }
+                Err(e) => format!("Rebuild failed: {e}"),
+            });
+            st.rebuilding = None;
+            st.rebuild_progress = None;
+            st.cleared = true;
+            st.invalidate();
+        }
         if !st.loaded {
             st.loaded = true;
             st.error = None;
@@ -221,9 +223,7 @@ impl App {
             let (tx, rx) = channel();
             let (dir, key) = (out.clone(), want.clone());
             std::thread::spawn(move || {
-                let res = Catalog::open_existing(&dir)
-                    .and_then(|c| c.search(&key.0, key.1, MAX_RESULTS))
-                    .map_err(|e| format!("{e:#}"));
+                let res = Catalog::open_existing(&dir).and_then(|c| c.search(&key.0, key.1, MAX_RESULTS)).map_err(|e| format!("{e:#}"));
                 let _ = tx.send(res);
             });
             st.searching = Some((want.clone(), rx));
@@ -336,20 +336,29 @@ impl App {
                 let more = if st.results.len() == MAX_RESULTS { " (first 500, largest first)" } else { "" };
                 ui.label(RichText::new(format!("{} matches{more} · click a file for details", st.results.len())).color(theme::muted()));
                 ui.separator();
-                egui::ScrollArea::vertical().id_salt("results").auto_shrink([false, false]).max_height(ui.available_height()).show(ui, |ui| {
-                    for (i, f) in st.results.iter().enumerate() {
-                        let name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path);
-                        let folder = f.rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
-                        let text = format!("{name}\n{} › {folder}", f.archive_name);
-                        let on = st.selected == Some(i);
-                        ui.horizontal(|ui| {
-                            if ui.add(egui::Button::selectable(on, RichText::new(text).monospace()).min_size(egui::vec2(ui.available_width() - 90.0, 0.0))).clicked() {
-                                st.selected = Some(i);
-                            }
-                            ui.label(human(f.size));
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical().id_salt("results").auto_shrink([false, false]).max_height(ui.available_height()).show(
+                    ui,
+                    |ui| {
+                        for (i, f) in st.results.iter().enumerate() {
+                            let name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path);
+                            let folder = f.rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                            let text = format!("{name}\n{} › {folder}", f.archive_name);
+                            let on = st.selected == Some(i);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::selectable(on, RichText::new(text).monospace())
+                                            .min_size(egui::vec2(ui.available_width() - 90.0, 0.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    st.selected = Some(i);
+                                }
+                                ui.label(human(f.size));
+                            });
+                        }
+                    },
+                );
             });
             card(&mut c[1], |ui| match st.selected.and_then(|i| st.results.get(i)).cloned() {
                 None => {
@@ -500,11 +509,7 @@ fn title(ui: &mut egui::Ui, st: &mut State) {
     }
     // Only the path shrinks, and its width grows in step with its size.
     let (wide, narrow) = (width_at(&parts, FULL), width_at(&parts, SMALLEST));
-    let size = if wide <= avail {
-        FULL
-    } else {
-        (SMALLEST + (avail - narrow) * (FULL - SMALLEST) / (wide - narrow)).clamp(SMALLEST, FULL)
-    };
+    let size = if wide <= avail { FULL } else { (SMALLEST + (avail - narrow) * (FULL - SMALLEST) / (wide - narrow)).clamp(SMALLEST, FULL) };
 
     let mut go: Option<Option<String>> = None;
     // Bottom aligned, so the smaller path sits on the heading's line.
@@ -556,7 +561,9 @@ fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64, out: &Path, settings:
     let h = ui.available_height();
     let gap = ui.spacing().item_spacing.x;
     ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(w * 0.66 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| card(ui, |ui| b.table(ui)));
+        ui.allocate_ui_with_layout(egui::vec2(w * 0.66 - gap, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+            card(ui, |ui| b.table(ui))
+        });
         ui.allocate_ui_with_layout(egui::vec2(w * 0.34, h), egui::Layout::top_down(egui::Align::Min), |ui| {
             card(ui, |ui| match b.selected_file().cloned() {
                 Some(f) => details(ui, st, &f, out, settings),
@@ -570,7 +577,10 @@ fn browse_view(ui: &mut egui::Ui, st: &mut State, id: i64, out: &Path, settings:
 /// A reference file that stands in for a duplicate: what it replaced, where
 /// the original is, and following it or putting the file back.
 fn reference_details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replaced, out: &Path, settings: &archive::Settings) {
-    egui::ScrollArea::vertical().id_salt("dep-details").auto_shrink([false, true]).show(ui, |ui| reference_body(ui, st, f, dep, out, settings));
+    egui::ScrollArea::vertical()
+        .id_salt("dep-details")
+        .auto_shrink([false, true])
+        .show(ui, |ui| reference_body(ui, st, f, dep, out, settings));
 }
 
 fn reference_body(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replaced, out: &Path, settings: &archive::Settings) {
@@ -595,7 +605,8 @@ fn reference_body(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, dep: &Replac
             st.extracting = Some(rx);
             st.note = Some(format!("Extracting {name} from {}…", dep.original_archive));
         }
-        let tip = "Rewrites this archive with the real file in place of the reference, taken from the original and checked against its hash";
+        let tip =
+            "Rewrites this archive with the real file in place of the reference, taken from the original and checked against its hash";
         let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
         if ui.add_enabled(idle && there && archive_path.is_some(), egui::Button::new("Put the file back")).on_hover_text(tip).clicked()
             && let Some(arch) = archive_path
@@ -723,9 +734,8 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, out: &Path, setting
     }
     if st.refs.as_ref().map(|r| r.0) != Some(f.entry_id) {
         let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
-        let refs = archive_path
-            .and_then(|p| Catalog::open_existing(out).and_then(|c| c.references_to(&p, &f.rel_path)).ok())
-            .unwrap_or_default();
+        let refs =
+            archive_path.and_then(|p| Catalog::open_existing(out).and_then(|c| c.references_to(&p, &f.rel_path)).ok()).unwrap_or_default();
         st.refs = Some((f.entry_id, refs));
     }
     let refs = st.refs.as_ref().map(|r| r.1.clone()).unwrap_or_default();
@@ -755,16 +765,17 @@ fn details(ui: &mut egui::Ui, st: &mut State, f: &FoundFile, out: &Path, setting
         let archive_path = st.archives.iter().find(|a| a.id == f.archive_id).map(|a| PathBuf::from(&a.archive_path));
         let can = archive_path.as_ref().is_some_and(|p| p.is_file()) && st.extracting.is_none();
         if ui.add_enabled(can, primary_button("Extract to…")).clicked()
-            && let (Some(dest), Some(arch)) = (crate::dialog::pick_folder("Choose where to extract to", None), archive_path) {
-                let (tx, rx) = channel();
-                let rel = f.rel_path.clone();
-                std::thread::spawn(move || {
-                    let threads = archive::default_threads();
-                    let _ = tx.send(archive::extract_file(&arch, &rel, &dest, threads).map_err(|e| format!("{e:#}")));
-                });
-                st.extracting = Some(rx);
-                st.note = Some(format!("Extracting {name}…"));
-            }
+            && let (Some(dest), Some(arch)) = (crate::dialog::pick_folder("Choose where to extract to", None), archive_path)
+        {
+            let (tx, rx) = channel();
+            let rel = f.rel_path.clone();
+            std::thread::spawn(move || {
+                let threads = archive::default_threads();
+                let _ = tx.send(archive::extract_file(&arch, &rel, &dest, threads).map_err(|e| format!("{e:#}")));
+            });
+            st.extracting = Some(rx);
+            st.note = Some(format!("Extracting {name}…"));
+        }
         if ui.button("Copy hash").clicked() {
             ui.ctx().copy_text(f.blake3.clone().unwrap_or_default());
         }

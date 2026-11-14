@@ -33,15 +33,15 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
 /// check passes: the write itself will still fail cleanly if the disk fills.
 pub fn ensure_free(dir: &Path, needed: u64, what: &str) -> Result<()> {
     let need = needed.saturating_add(MARGIN);
-    if let Some(free) = free_bytes(dir) {
-        if free < need {
-            bail!(
-                "not enough free space for {what}: needs about {} on {}, but only {} is free",
-                human(need),
-                crate::settings::strip_verbatim(dir).display(),
-                human(free)
-            );
-        }
+    if let Some(free) = free_bytes(dir)
+        && free < need
+    {
+        bail!(
+            "not enough free space for {what}: needs about {} on {}, but only {} is free",
+            human(need),
+            crate::settings::strip_verbatim(dir).display(),
+            human(free)
+        );
     }
     Ok(())
 }
@@ -59,12 +59,7 @@ fn free_bytes_at(dir: &Path) -> Option<u64> {
     // SAFETY: a NUL-terminated path and an out-pointer to a local; the other
     // out-pointers are optional and passed as null.
     let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
     };
     (ok != 0).then_some(free)
 }
