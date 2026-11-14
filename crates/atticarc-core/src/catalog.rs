@@ -182,6 +182,19 @@ CREATE TABLE IF NOT EXISTS archive_aliases (
 CREATE INDEX IF NOT EXISTS archive_aliases_name ON archive_aliases(old_name);
 "#;
 
+/// Adds `column` to `table` if it isn't there yet.
+fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let has: bool = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        params![column],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+    }
+    Ok(())
+}
+
 /// One file or folder as recorded in the catalog and the manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EntryRecord {
@@ -256,14 +269,19 @@ impl Catalog {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
-        // Added after the first release: the source folder as spelled on disk.
-        let has_display: bool = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('archives') WHERE name = 'source_display'",
-            [],
-            |r| r.get::<_, i64>(0).map(|n| n > 0),
-        )?;
-        if !has_display {
-            conn.execute_batch("ALTER TABLE archives ADD COLUMN source_display TEXT")?;
+        // Columns added after the first release.
+        for (table, column, kind) in [
+            // The source folder as spelled on disk.
+            ("archives", "source_display", "TEXT"),
+            // When the archive last decoded and matched its record (a full
+            // check or a scrub); NULL means only when it was made.
+            ("archives", "decoded_utc", "TEXT"),
+            // The archive's size and modified time when the check passed, so
+            // a changed archive is caught before deleting.
+            ("cleanup_checks", "archive_len", "INTEGER"),
+            ("cleanup_checks", "archive_modified", "INTEGER"),
+        ] {
+            add_column(&conn, table, column, kind)?;
         }
         Ok(Self { conn })
     }
@@ -370,6 +388,17 @@ impl Catalog {
             tx.execute("INSERT INTO archive_aliases (old_name, archive_id) VALUES (?1, ?2)", params![old_name, id])?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks archive `id` as replaced by a newer archive of the same folder,
+    /// its file now at `new_path`. It drops out of every list (they show
+    /// verified archives only), but reference files naming it still resolve
+    /// through its old name.
+    pub fn supersede(&mut self, id: i64, new_path: &str) -> Result<()> {
+        self.relink(id, new_path)?;
+        self.conn.execute("UPDATE archives SET status = 'superseded' WHERE id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -768,17 +797,72 @@ impl Catalog {
     pub fn save_cleanup_check(&self, c: &SavedCheck) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO cleanup_checks
-                (archive_id, source_path, passed, snapshot, discarded, detail, checked_utc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![c.archive_id, c.source_path, c.passed, c.snapshot, c.discarded as i64, c.detail, c.checked_utc],
+                (archive_id, source_path, passed, snapshot, discarded, detail, checked_utc, archive_len, archive_modified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                c.archive_id,
+                c.source_path,
+                c.passed,
+                c.snapshot,
+                c.discarded as i64,
+                c.detail,
+                c.checked_utc,
+                c.archive_len.map(|n| n as i64),
+                c.archive_modified
+            ],
         )?;
         Ok(())
+    }
+
+    /// Forgets the Clean up check of an archive, so its folder needs a full
+    /// check before it can be deleted.
+    pub fn forget_cleanup_check(&self, archive_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![archive_id])?;
+        Ok(())
+    }
+
+    /// Records that the archive decoded and matched its record at `when_utc`.
+    pub fn set_decoded(&self, archive_id: i64, when_utc: &str) -> Result<()> {
+        self.conn.execute("UPDATE archives SET decoded_utc = ?2 WHERE id = ?1", params![archive_id, when_utc])?;
+        Ok(())
+    }
+
+    /// When the archive last decoded and matched its record: its latest full
+    /// check or scrub, or else when it was made (it is verified then).
+    pub fn decoded_utc(&self, archive_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(decoded_utc, created_utc) FROM archives WHERE id = ?1",
+                params![archive_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every verified archive, for a scrub: oldest decode first.
+    pub fn scrub_list(&self) -> Result<Vec<ScrubItem>> {
+        let mut q = self.conn.prepare(
+            "SELECT id, name, archive_path, COALESCE(decoded_utc, created_utc), archive_bytes
+             FROM archives WHERE status = 'verified' ORDER BY COALESCE(decoded_utc, created_utc), id",
+        )?;
+        let rows = q.query_map([], |r| {
+            Ok(ScrubItem {
+                archive_id: r.get(0)?,
+                name: r.get(1)?,
+                archive_path: PathBuf::from(r.get::<_, String>(2)?),
+                decoded_utc: r.get(3)?,
+                archive_bytes: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Every Clean up check recorded, for folders not yet deleted.
     pub fn cleanup_checks(&self) -> Result<Vec<SavedCheck>> {
         let mut q = self.conn.prepare(
-            "SELECT archive_id, source_path, passed, snapshot, discarded, detail, checked_utc FROM cleanup_checks",
+            "SELECT archive_id, source_path, passed, snapshot, discarded, detail, checked_utc, archive_len, archive_modified
+             FROM cleanup_checks",
         )?;
         let rows = q.query_map([], |r| {
             Ok(SavedCheck {
@@ -789,6 +873,8 @@ impl Catalog {
                 discarded: r.get::<_, i64>(4)? as usize,
                 detail: r.get(5)?,
                 checked_utc: r.get(6)?,
+                archive_len: r.get::<_, Option<i64>>(7)?.map(|n| n as u64),
+                archive_modified: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1192,4 +1278,19 @@ pub struct SavedCheck {
     /// Why it failed; empty if it passed.
     pub detail: String,
     pub checked_utc: String,
+    /// The archive's size and modified time (Unix nanoseconds) when the check
+    /// passed. Missing for checks saved before these were recorded.
+    pub archive_len: Option<u64>,
+    pub archive_modified: Option<i64>,
+}
+
+/// An archive due for a scrub (decoding it again to catch damage).
+#[derive(Clone, Debug)]
+pub struct ScrubItem {
+    pub archive_id: i64,
+    pub name: String,
+    pub archive_path: PathBuf,
+    /// When it last decoded and matched its record.
+    pub decoded_utc: String,
+    pub archive_bytes: u64,
 }

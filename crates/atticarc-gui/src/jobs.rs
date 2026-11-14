@@ -7,6 +7,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Lines the log keeps on screen; older ones go (the catalogue keeps the record).
+const LOG_MAX: usize = 20_000;
+
 use eframe::egui::{self, Color32, RichText};
 
 use atticarc_core::archive::{self, DeleteCheck, Progress, Settings};
@@ -168,6 +171,11 @@ impl Jobs {
 
     fn log(&mut self, line: String) {
         let t = catalog::local_hhmm();
+        // A detailed log of a big folder can run to many thousands of lines;
+        // only the latest are kept on screen.
+        if self.log.len() >= LOG_MAX {
+            self.log.drain(..LOG_MAX / 10);
+        }
         self.log.push(format!("{t}  {line}"));
     }
 
@@ -237,6 +245,12 @@ impl Jobs {
     /// ended, so catalogue views can refresh.
     pub fn handle_messages(&mut self, out_dir: &Path) -> bool {
         let mut batch_ended = false;
+        // A detailed log's lines, folded into the log as they come.
+        if let Some(events) = self.batch.as_ref().map(|b| b.progress.take_events()) {
+            for line in events {
+                self.log(line);
+            }
+        }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Size(p, b, f) => {
@@ -340,7 +354,8 @@ impl Jobs {
             .fold((0, 0), |(c, b), r| (c + 1, b + r.size.map(|s| s.0).unwrap_or(0)))
     }
 
-    pub fn archive_selected(&mut self, settings: Settings) {
+    /// Archives the ticked folders; with `detailed`, the log lists every file.
+    pub fn archive_selected(&mut self, settings: Settings, detailed: bool) {
         let todo: Vec<(PathBuf, u64)> = self
             .ordered()
             .into_iter()
@@ -349,6 +364,19 @@ impl Jobs {
                 (r.ticked && r.archived.is_none()).then(|| (r.path.clone(), r.size.map(|s| s.0).unwrap_or(0)))
             })
             .collect();
+        self.start_batch(todo, settings, detailed);
+    }
+
+    /// Archives one folder that was archived before again, with the current
+    /// settings and exclusions; its older archive is moved aside once the new
+    /// one is verified ([`archive::archive_again`]).
+    pub fn archive_again(&mut self, path: &Path, settings: Settings, detailed: bool) {
+        let Some(r) = self.rows.iter().find(|r| r.path == path) else { return };
+        let todo = vec![(r.path.clone(), r.size.map(|s| s.0).unwrap_or(0))];
+        self.start_batch(todo, settings, detailed);
+    }
+
+    fn start_batch(&mut self, todo: Vec<(PathBuf, u64)>, settings: Settings, detailed: bool) {
         if todo.is_empty() {
             return;
         }
@@ -357,8 +385,10 @@ impl Jobs {
                 r.state = RowState::Queued;
             }
         }
+        let progress = Progress::default();
+        progress.detailed.store(detailed, Ordering::Relaxed);
         let batch = Batch {
-            progress: Arc::new(Progress::default()),
+            progress: Arc::new(progress),
             stop_after: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
             started: Instant::now(),
@@ -397,7 +427,8 @@ impl Jobs {
                 }
                 *current.lock().unwrap() = Some(p.clone());
                 let _ = tx.send(Msg::Started(p.clone()));
-                let res = archive::archive_folder(&p, &settings, &progress)
+                // Archived before (Archive again): the older archive is moved aside.
+                let res = archive::archive_again(&p, &settings, &progress)
                     .map(|o| {
                         let mut note = format!(
                             "{} {}, {} → {}",
@@ -414,6 +445,16 @@ impl Jobs {
                         }
                         if !o.excluded.discarded.is_empty() {
                             note.push_str(&format!(", {} discarded", o.excluded.discarded.len()));
+                        }
+                        if !o.excluded.deps.is_empty() {
+                            note.push_str(&format!(", {} copies stored once", o.excluded.deps.len()));
+                        }
+                        if let Some(old) = &o.superseded {
+                            let name = old.file_name().unwrap_or_default().to_string_lossy();
+                            note.push_str(&format!(", older archive moved to .atticarc\\superseded\\{name}"));
+                        }
+                        if let Some(why) = &o.superseded_problem {
+                            note.push_str(&format!(", older archive left in place ({why})"));
                         }
                         note
                     })

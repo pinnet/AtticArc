@@ -35,7 +35,7 @@ impl App {
                     let overlap_ok = overlap(&self.source_dir, &self.out_dir()).is_none();
                     if ui.add_enabled(!busy && count > 0 && rules_ok && overlap_ok, start).clicked() {
                         self.save();
-                        self.jobs.archive_selected(self.settings());
+                        self.jobs.archive_selected(self.settings(), self.saved.detailed_log);
                         self.screen = Screen::Progress;
                     }
                     if busy {
@@ -149,6 +149,12 @@ impl App {
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
                     ui.checkbox(&mut self.saved.store_mode, "Store already-compressed files (zip, jpg, mp4…) without recompressing");
+                    ui.checkbox(&mut self.saved.identical_once, "Store identical files in a folder once").on_hover_text(
+                        "Files of 64 KiB or more with exactly the same content (same size and BLAKE3 hash) inside \
+                         the folder are archived once; each later copy goes in as a small .atticarcdep reference \
+                         file to the first. The folder on disk is not changed. The Catalogue's \"Extract the \
+                         original\" and \"Put back\" bring a copy back; 7-Zip on its own extracts the reference file.",
+                    );
                     ui.label(RichText::new("Every archive is decoded and checked against its hashes after writing.").color(theme::muted()));
                 });
             });
@@ -171,6 +177,7 @@ impl App {
         let order = self.jobs.ordered();
         let archived = self.jobs.archived_rows();
         let (count, bytes) = self.jobs.selection();
+        let mut again_clicked: Option<std::path::PathBuf> = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Folders in {}", self.source_dir.display())).strong().size(16.0));
@@ -241,7 +248,20 @@ impl App {
                     if resp.clicked() {
                         self.jobs.dialog = Some(Dialog::ConfirmDelete(row.path.clone()));
                     }
-                    ui.label(RichText::new(&row.name).monospace());
+                    let path = row.path.clone();
+                    ui.horizontal(|ui| {
+                        let again = ui
+                            .add_enabled(!busy, egui::Button::new("↻").small())
+                            .on_hover_text(
+                                "Archive again with the current settings and exclusions. The new archive gets a name \
+                                 of its own; once it is verified, the older one is moved to .atticarc\\superseded in the \
+                                 destination (not deleted).",
+                            );
+                        if again.clicked() {
+                            again_clicked = Some(path);
+                        }
+                        ui.label(RichText::new(&row.name).monospace());
+                    });
                     ui.label(size_text(row.size));
                     let when = a.created_utc.get(..10).unwrap_or(&a.created_utc);
                     let text = match &row.state {
@@ -253,6 +273,19 @@ impl App {
                 }
             });
         });
+        // Archive again: only with rules that compile and a destination apart from the source,
+        // as for Start archiving (a bad rule fails the job anyway, but say so first).
+        if let Some(path) = again_clicked {
+            if Exclusions::new(&self.saved.exclusions).is_err() {
+                self.jobs.dialog = Some(Dialog::Message("Not started".into(), "An exclusion can't be used; fix it first.".into()));
+            } else if overlap(&self.source_dir, &self.out_dir()).is_some() {
+                self.jobs.dialog = Some(Dialog::Message("Not started".into(), "Choose a source and destination that don't overlap first.".into()));
+            } else {
+                self.save();
+                self.jobs.archive_again(&path, self.settings(), self.saved.detailed_log);
+                self.screen = Screen::Progress;
+            }
+        }
     }
 }
 

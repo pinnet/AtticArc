@@ -228,14 +228,15 @@ impl App {
         heading(
             ui,
             "Duplicates",
-            "Every archive, oldest first. The oldest copy of each file is the original and stays; each later copy is listed \
-             under its archive. Replacing a copy swaps it inside its archive for a small .atticarcdep file that points to the original.",
+            "Every archive, oldest first. The oldest copy of each file is the original; each later copy is listed under its \
+             archive with the space it takes. Copies inside archives are shown, not removed: taking one out means rewriting the \
+             whole archive, which takes hours.",
         );
         ui.horizontal(|ui| {
             let stats = [
                 ("Archives", st.tree.len().to_string()),
                 ("Duplicate copies", n_leaves.to_string()),
-                ("Reclaimable", human(reclaimable)),
+                ("Space they take", human(reclaimable)),
                 ("Already replaced", replaced.to_string()),
             ];
             for (label, value) in stats {
@@ -247,11 +248,9 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let idle = st.running.is_none() && !busy;
-                let go = egui::Button::new(RichText::new("Replace duplicates…").color(egui::Color32::WHITE)).fill(theme::danger_fill());
-                let tip = "Lists every copy to tick the ones to replace; none are ticked to start. Nothing changes until you press Replace there.";
-                if ui.add_enabled(idle && n_leaves > 0, go).on_hover_text(tip).clicked() {
-                    st.review = true;
-                }
+                // Replacing copies inside archives is switched off (show only):
+                // each archive rewrite took hours. `review` is kept for a later
+                // batched mode.
                 if ui.add_enabled(idle && st.loading.is_none(), egui::Button::new("Refresh")).clicked() {
                     st.loaded = false;
                 }

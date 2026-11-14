@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{ArchiveRecord, Catalog, DATA_DIR, EntryRecord, now_utc, path_key};
+use crate::catalog::{ArchiveRecord, Catalog, DATA_DIR, EntryRecord, SavedCheck, now_utc, path_key};
 use crate::exclude::{Action, Exclusions, Rule};
 
 /// The manifest's path inside every archive: what the archive holds, with
@@ -144,7 +144,14 @@ pub struct Settings {
     pub protected: Vec<PathBuf>,
     /// Files to leave out of archives.
     pub exclusions: Vec<Rule>,
+    /// Store identical files inside a folder once: each later copy goes in
+    /// as a small reference file to the first (see [`IDENTICAL_MIN_BYTES`]).
+    pub identical_once: bool,
 }
+
+/// Identical files smaller than this are archived as they are: a reference
+/// file would save next to nothing.
+pub const IDENTICAL_MIN_BYTES: u64 = 64 * 1024;
 
 impl Settings {
     pub fn engine_label(&self) -> String {
@@ -164,13 +171,49 @@ pub struct Progress {
     pub total: AtomicU64,
     pub cancel: AtomicBool,
     pub phase: Mutex<String>,
+    /// The file being read now (path inside the folder), for "Now:" lines.
+    pub current_file: Mutex<String>,
+    /// With this set, every phase and every file read is also added to
+    /// `events`, for a detailed log; see [`Progress::take_events`].
+    pub detailed: AtomicBool,
+    events: Mutex<Vec<String>>,
 }
+
+/// Events kept for a detailed log the window hasn't collected yet; past
+/// this, the oldest go, so a window left closed can't use up memory.
+const EVENTS_MAX: usize = 50_000;
 
 impl Progress {
     pub fn set_phase(&self, phase: &str, total: u64) {
         *self.phase.lock().unwrap() = phase.to_string();
+        self.current_file.lock().unwrap().clear();
         self.done.store(0, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
+        if !phase.is_empty() {
+            self.event(|| if total > 0 { format!("{phase} ({})", crate::disk::human(total)) } else { phase.to_string() });
+        }
+    }
+
+    /// Records the file being read now, and with a detailed log, a line for it.
+    pub fn set_file(&self, verb: &str, rel: &str, size: u64) {
+        *self.current_file.lock().unwrap() = rel.to_string();
+        self.event(|| format!("  {verb} {rel} ({})", crate::disk::human(size)));
+    }
+
+    /// Adds a line to the detailed log, if there is one.
+    pub fn event(&self, line: impl FnOnce() -> String) {
+        if self.detailed.load(Ordering::Relaxed) {
+            let mut ev = self.events.lock().unwrap();
+            if ev.len() >= EVENTS_MAX {
+                ev.drain(..EVENTS_MAX / 10);
+            }
+            ev.push(line());
+        }
+    }
+
+    /// The detailed log lines since the last call.
+    pub fn take_events(&self) -> Vec<String> {
+        std::mem::take(&mut *self.events.lock().unwrap())
     }
 
     pub fn fraction(&self) -> f32 {
@@ -300,6 +343,8 @@ struct FileHash {
 /// compressor, so each source byte is read from disk once.
 struct HashReader {
     path: PathBuf,
+    rel: String,
+    size: u64,
     file: Option<File>,
     slot: usize,
     b3: blake3::Hasher,
@@ -314,8 +359,12 @@ impl Read for HashReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.progress.check_cancel()?;
         if self.file.is_none() {
+            if self.finished {
+                return Ok(0);
+            }
             let f = File::open(&self.path)
                 .map_err(|e| io::Error::new(e.kind(), format!("can't open {}: {e}", self.path.display())))?;
+            self.progress.set_file("compressing", &self.rel, self.size);
             self.file = Some(f);
         }
         let n = self.file.as_mut().unwrap().read(buf)?;
@@ -368,6 +417,56 @@ pub struct ArchiveOutcome {
     pub skipped_links: Vec<String>,
     /// What the exclusions left out, as recorded in the manifest.
     pub excluded: Excluded,
+    /// With [`archive_again`]: where the folder's older archive was moved.
+    pub superseded: Option<PathBuf>,
+    /// With [`archive_again`]: why the older archive was left where it was.
+    pub superseded_problem: Option<String>,
+}
+
+/// Inside the destination's `.atticarc` folder: archives replaced by a newer
+/// archive of the same folder ([`archive_again`]).
+pub const SUPERSEDED_DIR: &str = "superseded";
+
+/// Archives `source` like [`archive_folder`], for a folder that may have
+/// been archived before (to apply changed exclusions or settings, say).
+/// The new archive gets a name of its own (`Name (2).7z`); only once it is
+/// verified, the folder's older archive is moved into
+/// `.atticarc\superseded` and marked so in the catalogue, so every list
+/// shows the new one only. Nothing is deleted: the older archive can be
+/// removed by hand. If it can't be moved, it stays as it was, and the new
+/// archive still counts.
+pub fn archive_again(source: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<ArchiveOutcome> {
+    let canonical = std::fs::canonicalize(source).with_context(|| format!("can't open {}", source.display()))?;
+    let old = if crate::catalog::exists(&settings.out_dir) {
+        Catalog::open_existing(&settings.out_dir)?.archived_folder(&canonical)?
+    } else {
+        None
+    };
+    let mut o = archive_folder(source, settings, progress)?;
+    let Some(old) = old else { return Ok(o) };
+    let moved = (|| -> Result<PathBuf> {
+        let out = std::fs::canonicalize(&settings.out_dir)?;
+        let dir = out.join(DATA_DIR).join(SUPERSEDED_DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
+        let stem = old.archive_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let day = chrono::Local::now().format("%Y-%m-%d");
+        let to = std::iter::once(dir.join(format!("{stem}.7z")))
+            .chain((1..).map(|n| dir.join(if n == 1 { format!("{stem} (superseded {day}).7z") } else { format!("{stem} (superseded {day}, {n}).7z") })))
+            .find(|p| !p.exists())
+            .expect("a free name");
+        std::fs::rename(&old.archive_path, &to)
+            .with_context(|| format!("can't move {} to {}", old.archive_path.display(), to.display()))?;
+        let to_key = crate::settings::strip_verbatim(&to).to_string_lossy().into_owned();
+        let mut cat = Catalog::open_existing(&settings.out_dir)?;
+        cat.supersede(old.archive_id, &to_key)?;
+        let _ = cat.log_run(Some(old.archive_id), "supersede", &canonical, &now_utc(), "moved", &format!("replaced by {}", o.record.archive_path));
+        Ok(to)
+    })();
+    match moved {
+        Ok(p) => o.superseded = Some(p),
+        Err(e) => o.superseded_problem = Some(format!("{e:#}")),
+    }
+    Ok(o)
 }
 
 /// Archives `source` into `settings.out_dir`, verifies the archive by
@@ -400,10 +499,33 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         .to_string_lossy()
         .into_owned();
     let final_path = unique_archive_path(&out_dir, &name);
+    // "Name (2)" when "Name" is taken: the archive's own name from here on.
+    let name = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(name);
     let partial = PathBuf::from(format!("{}.partial", final_path.display()));
 
+    // Snapshots before reading and after verifying (see the end): if they
+    // match, the folder didn't change while it was archived.
+    progress.set_phase("Taking a snapshot of the folder", 0);
+    let snapshot_before = folder_snapshot_with(&source, progress).ok();
+
     progress.set_phase("Scanning", 0);
-    let scan = scan_excluding(&source, &exclusions)?;
+    let mut scan = scan_excluding(&source, &exclusions)?;
+
+    // Identical files stored once: the reference files standing in for the
+    // later copies are written here, then archived like any other file.
+    let deps_dir = PathBuf::from(format!("{}.deps.partial", final_path.display()));
+    let deps = if settings.identical_once {
+        let archive_file = final_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match store_identical_once(&mut scan, &deps_dir, &archive_file, settings.store_mode, progress) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&deps_dir);
+                return Err(e);
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     let source_display = crate::settings::strip_verbatim(&source).to_string_lossy().into_owned();
     let record_for = |name: String, source_path: String, scan: &Scan| ArchiveRecord {
@@ -439,7 +561,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         let aside_worst = crate::disk::archive_worst_case(aside_scan.total_bytes);
         let needed = crate::disk::archive_worst_case(scan.total_bytes).saturating_add(aside_worst.saturating_mul(2));
         crate::disk::ensure_free(&out_dir, needed, &format!("archiving {name}"))?;
-        let mut excluded = Excluded::default();
+        let mut excluded = Excluded { deps: deps.clone(), ..Excluded::default() };
         if !scan.discarded.is_empty() {
             progress.set_phase("Hashing discarded files", scan.discarded.iter().map(|f| f.size).sum());
             excluded.discarded = scan.discarded.iter().map(|f| hash_record(f, progress)).collect::<Result<_>>()?;
@@ -454,6 +576,14 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
         }
         progress.set_phase("Compressing", scan.total_bytes);
         let entries = write_archive(&scan, &partial, settings, progress, &record, &excluded, aside_partial.as_deref())?;
+        // Each first copy was read twice, to find the copies and to archive
+        // it: both reads must agree, or a reference would point to other bytes.
+        for d in &excluded.deps {
+            let original = entries.iter().find(|e| e.rel_path == d.original_path);
+            if original.and_then(|o| o.blake3.as_deref()) != d.entry.blake3.as_deref() {
+                bail!("{} changed while it was being archived; close whatever is writing to it and try again", d.original_path);
+            }
+        }
         progress.set_phase("Verifying", scan.total_bytes);
         verify_archive(&partial, &with_inner(&entries, &excluded), settings.threads, progress)?;
         let archive_bytes = std::fs::metadata(&partial)?.len();
@@ -462,6 +592,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     if let Some(p) = &aside_partial {
         let _ = std::fs::remove_file(p);
     }
+    let _ = std::fs::remove_dir_all(&deps_dir);
 
     let ((entries, archive_bytes), excluded) = match result {
         Ok(v) => v,
@@ -493,9 +624,166 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
     if !excluded.discarded.is_empty() {
         detail.push(format!("discarded: {}", names(&excluded.discarded)));
     }
+    if !excluded.deps.is_empty() {
+        let bytes: u64 = excluded.deps.iter().map(|d| d.entry.size).sum();
+        detail.push(format!("stored once ({} identical copies, {bytes} bytes): {}", excluded.deps.len(),
+            excluded.deps.iter().map(|d| format!("{} = {}", d.entry.rel_path, d.original_path)).collect::<Vec<_>>().join(", ")));
+    }
     let detail = detail.join("; ");
     cat.log_run(Some(archive_id), "archive", &source, &started, "verified", &detail)?;
-    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded })
+
+    // The folder's check for Clean up, done here rather than later: every
+    // file was hashed as it was compressed and the archive was decoded
+    // against those hashes. If the folder is the same before and after (on
+    // NTFS, by its change journal, which catches any write), the archive
+    // matches the folder as it stands, and Clean up only has to compare
+    // snapshots before deleting it. Without a change journal, a timestamp
+    // snapshot isn't trusted for that; such folders get the full check.
+    if let Some(before) = snapshot_before.filter(|s| snapshot_used_journal(s)) {
+        progress.set_phase("Taking a snapshot of the folder", 0);
+        if folder_snapshot_with(&source, progress).ok().as_deref() == Some(before.as_str()) {
+            let (archive_len, archive_modified) = match archive_fingerprint(&final_path) {
+                Ok((l, m)) => (Some(l), Some(m)),
+                Err(_) => (None, None),
+            };
+            let _ = cat.save_cleanup_check(&SavedCheck {
+                archive_id,
+                source_path: source_display.clone(),
+                passed: true,
+                snapshot: Some(before),
+                discarded: excluded.discarded.len(),
+                detail: String::new(),
+                checked_utc: now_utc(),
+                archive_len,
+                archive_modified,
+            });
+        }
+    }
+    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded, superseded: None, superseded_problem: None })
+}
+
+/// Finds files in `scan` with the same content (same size and BLAKE3 hash,
+/// at least [`IDENTICAL_MIN_BYTES`]) and keeps only the first of each set,
+/// by path; every later copy is taken out of `scan` and a reference file to
+/// the first, written in `dir`, goes in at `<copy>.atticarcdep`. Only files
+/// sharing a size with another are read. Returns the copies replaced, as
+/// the manifest records them; the folder on disk is not touched.
+fn store_identical_once(scan: &mut Scan, dir: &Path, archive_file: &str, store_mode: bool, progress: &Arc<Progress>) -> Result<Vec<Replaced>> {
+    let mut by_size: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (i, f) in scan.files.iter().enumerate() {
+        if f.size >= IDENTICAL_MIN_BYTES {
+            by_size.entry(f.size).or_default().push(i);
+        }
+    }
+    let candidates: Vec<usize> = by_size.into_values().filter(|v| v.len() > 1).flatten().collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    progress.set_phase("Looking for identical files", candidates.iter().map(|&i| scan.files[i].size).sum());
+    let mut sets: BTreeMap<(u64, String), Vec<(usize, EntryRecord)>> = BTreeMap::new();
+    for i in candidates {
+        let rec = hash_record(&scan.files[i], progress)?;
+        sets.entry((rec.size, rec.blake3.clone().unwrap_or_default())).or_default().push((i, rec));
+    }
+    // Windows names ignore case, so a reference file mustn't clash with a file in any case.
+    let taken: std::collections::HashSet<String> = scan.files.iter().map(|f| f.rel.to_lowercase()).collect();
+    let now = now_utc();
+    let mut gone = std::collections::HashSet::new();
+    let mut deps = Vec::new();
+    let mut added = Vec::new();
+    for (_, mut copies) in sets {
+        if copies.len() < 2 {
+            continue;
+        }
+        copies.sort_by(|a, b| a.1.rel_path.cmp(&b.1.rel_path));
+        let original = copies[0].1.rel_path.clone();
+        for (i, mut entry) in copies.into_iter().skip(1) {
+            let at = dep_path(&entry.rel_path);
+            if taken.contains(&at.to_lowercase()) {
+                continue;
+            }
+            let store = store_mode && STORE_EXTS.contains(&ext_of(&entry.rel_path).as_str());
+            entry.method = if store { "copy" } else { "lzma2" }.into();
+            let r = Replaced {
+                entry,
+                dep_path: at.clone(),
+                original_archive: archive_file.to_string(),
+                original_path: original.clone(),
+                replaced_utc: now.clone(),
+            };
+            std::fs::create_dir_all(dir).with_context(|| format!("can't create {}", dir.display()))?;
+            let file = dir.join(format!("{}.json", deps.len()));
+            std::fs::write(&file, serde_json::to_vec_pretty(&DepFile::new(r.clone()))?)
+                .with_context(|| format!("can't write {}", file.display()))?;
+            set_times(&file, parse_utc(r.entry.modified_utc.as_deref()), parse_utc(r.entry.created_utc.as_deref()), false);
+            let meta = std::fs::metadata(&file)?;
+            added.push(ScannedFile { abs: file, rel: at, size: meta.len(), modified: meta.modified().ok(), created: meta.created().ok() });
+            gone.insert(i);
+            deps.push(r);
+        }
+    }
+    let mut i = 0;
+    scan.files.retain(|_| {
+        i += 1;
+        !gone.contains(&(i - 1))
+    });
+    scan.files.extend(added);
+    scan.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    scan.total_bytes = scan.files.iter().map(|f| f.size).sum();
+    deps.sort_by(|a, b| a.entry.rel_path.cmp(&b.entry.rel_path));
+    Ok(deps)
+}
+
+/// An archive's size and modified time (Unix nanoseconds): any rewrite of it
+/// changes one or the other.
+pub fn archive_fingerprint(archive: &Path) -> Result<(u64, i64)> {
+    let meta = std::fs::metadata(archive).with_context(|| format!("can't read {}", archive.display()))?;
+    let modified = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Ok((meta.len(), modified))
+}
+
+/// Reads only the archive's header (no decoding) and checks that every file
+/// recorded for it is listed there with the recorded size. Catches an archive
+/// cut short, replaced, or rewritten without these files, in a moment.
+pub fn check_index(archive: &Path, recorded: &[EntryRecord]) -> Result<()> {
+    let header = sevenz_turbo::Archive::open(archive).map_err(|e| anyhow!("can't read the archive's header: {e}"))?;
+    let listed: HashMap<&str, u64> = header.files.iter().filter(|f| !f.is_directory()).map(|f| (f.name(), f.size())).collect();
+    let mut problems = Vec::new();
+    for e in recorded.iter().filter(|e| !e.is_dir) {
+        match listed.get(e.rel_path.as_str()) {
+            None => problems.push(format!("{} isn't in the archive", e.rel_path)),
+            Some(&n) if n != e.size => problems.push(format!("{} has a different size in the archive", e.rel_path)),
+            _ => {}
+        }
+    }
+    if !problems.is_empty() {
+        bail!("the archive doesn't list what was recorded:\n{}", summarize(&problems));
+    }
+    Ok(())
+}
+
+/// Decodes the archive again and checks every file against its recorded
+/// hash, including the set-aside files (inside it or in their own archive
+/// beside it). Reads only the archive, not the folder: this is what catches
+/// damage to an archive after it was made (bit rot, a bad sector).
+pub fn scrub_archive(archive: &Path, recorded: &[EntryRecord], threads: u32, progress: &Arc<Progress>) -> Result<()> {
+    let excluded = read_manifest(archive).map(|m| m.excluded).unwrap_or_default();
+    let total = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+    progress.set_phase("Decoding the archive", recorded.iter().map(|e| e.size).sum::<u64>().max(total));
+    verify_archive(archive, &with_inner(recorded, &excluded), threads, progress)?;
+    if let Some(name) = &excluded.set_aside_archive {
+        let aside = archive.with_file_name(name);
+        if !aside.is_file() {
+            bail!("{} holds this archive's set-aside files but isn't there", aside.display());
+        }
+        progress.set_phase("Decoding the set-aside files' archive", excluded.set_aside.iter().map(|e| e.size).sum());
+        verify_archive(&aside, &excluded.set_aside, threads, progress)?;
+    }
+    Ok(())
 }
 
 /// The record of an archive of set-aside files about to go inside the main
@@ -517,6 +805,7 @@ fn with_inner(entries: &[EntryRecord], excluded: &Excluded) -> Vec<EntryRecord> 
 
 /// Hashes one file that isn't archived, for the manifest.
 fn hash_record(f: &ScannedFile, progress: &Arc<Progress>) -> Result<EntryRecord> {
+    progress.set_file("hashing", &f.rel, f.size);
     let mut b3 = blake3::Hasher::new();
     let mut sha = Sha256::new();
     let mut file = File::open(&f.abs).with_context(|| format!("can't open {}", f.abs.display()))?;
@@ -730,13 +1019,19 @@ fn original_archive_file(out_dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(plain)
 }
 
+/// `name.7z`, or if that's taken `name (2).7z`, `name (3).7z` and so on: a
+/// folder with the same name as one archived before (or the same folder
+/// archived again) gets an archive and a catalogue entry of its own.
 fn unique_archive_path(out_dir: &Path, name: &str) -> PathBuf {
+    let taken = |p: &Path| p.exists() || PathBuf::from(format!("{}.partial", p.display())).exists();
     let plain = out_dir.join(format!("{name}.7z"));
-    if !plain.exists() {
+    if !taken(&plain) {
         return plain;
     }
-    let stamp = chrono::Local::now().format("%Y-%m-%d %H%M%S");
-    out_dir.join(format!("{name} ({stamp}).7z"))
+    (2u32..)
+        .map(|n| out_dir.join(format!("{name} ({n}).7z")))
+        .find(|p| !taken(p))
+        .expect("a free name")
 }
 
 /// Writes the archive, with the manifest describing `record` and the files
@@ -776,6 +1071,8 @@ fn write_archive(
         w.set_content_methods(vec![method]);
         let reader_for = |i: usize| HashReader {
             path: scan.files[i].abs.clone(),
+            rel: scan.files[i].rel.clone(),
+            size: scan.files[i].size,
             file: None,
             slot: i,
             b3: blake3::Hasher::new(),
@@ -940,6 +1237,7 @@ fn verify_archive_saving(
                 }
                 return Ok(true);
             }
+            progress.set_file("verifying", entry.name(), entry.size());
             let mut h = blake3::Hasher::new();
             let mut n = 0u64;
             let mut save = match save_inner.filter(|_| entry.name() == EXCLUDED_ENTRY) {
@@ -1706,8 +2004,13 @@ pub struct DeleteCheck {
 }
 
 pub fn is_protected(path: &Path, settings: &Settings) -> bool {
+    is_protected_by(path, &settings.protected)
+}
+
+/// Whether `path` is one of the `protected` folders or inside one.
+pub fn is_protected_by(path: &Path, protected: &[PathBuf]) -> bool {
     let key = path_key(path);
-    settings.protected.iter().any(|p| {
+    protected.iter().any(|p| {
         let pk = path_key(p);
         key == pk || key.starts_with(&format!("{pk}{}", std::path::MAIN_SEPARATOR))
     })
@@ -1970,7 +2273,7 @@ mod tests {
     use std::io::Write;
 
     fn settings(out: &Path, store: bool) -> Settings {
-        Settings { out_dir: out.to_path_buf(), level: 5, store_mode: store, threads: 4, protected: vec![], exclusions: vec![] }
+        Settings { out_dir: out.to_path_buf(), level: 5, store_mode: store, threads: 4, protected: vec![], exclusions: vec![], identical_once: false }
     }
 
     /// A tree with the awkward cases: Unicode names, an empty folder, an
@@ -2107,6 +2410,52 @@ mod tests {
         let f = walkdir::WalkDir::new(&renamed).into_iter().flatten().find(|e| e.file_type().is_file()).unwrap();
         std::fs::write(f.path(), b"something else entirely, of another size").unwrap();
         assert_eq!(find_renamed_source(&src, &a.archive_path, &entries, &none), None);
+    }
+
+    #[test]
+    fn same_name_different_content_gets_a_numbered_archive() {
+        let (_tmp, src, out) = run(true);
+        let first = recorded(&out, &src).0;
+        assert!(first.archive_path.ends_with("My Folder.7z"));
+        // Different files under the same name, archived again.
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("other.txt"), b"something else").unwrap();
+        let o = archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
+        assert_eq!(o.record.name, "My Folder (2)");
+        assert!(o.record.archive_path.ends_with("My Folder (2).7z"), "{}", o.record.archive_path);
+        // Both archives are there and intact; the folder now goes with the new one.
+        let (second, entries) = recorded(&out, &src);
+        assert!(second.archive_path.ends_with("My Folder (2).7z"));
+        assert_eq!(entries.iter().filter(|e| !e.is_dir).count(), 1);
+        let cat = Catalog::open(&out).unwrap();
+        verify_archive(&first.archive_path, &cat.entries(first.archive_id).unwrap(), 2, &Arc::new(Progress::default()))
+            .unwrap();
+        // A third time: "(3)".
+        std::fs::write(src.join("more.txt"), b"and more").unwrap();
+        let o = archive_folder(&src, &settings(&out, true), &Arc::new(Progress::default())).unwrap();
+        assert!(o.record.archive_path.ends_with("My Folder (3).7z"));
+    }
+
+    #[test]
+    fn index_and_scrub_catch_what_they_should() {
+        let (_tmp, src, out) = run(true);
+        let (a, entries) = recorded(&out, &src);
+        check_index(&a.archive_path, &entries).unwrap();
+        scrub_archive(&a.archive_path, &entries, 2, &Arc::new(Progress::default())).unwrap();
+        // A file the archive doesn't list.
+        let mut more = entries.clone();
+        more.push(EntryRecord { rel_path: "not/there.txt".into(), is_dir: false, size: 3, ..entries[0].clone() });
+        assert!(check_index(&a.archive_path, &more).is_err());
+        // Damage inside the stored data: the header still reads, decoding fails.
+        let mut bytes = std::fs::read(&a.archive_path).unwrap();
+        bytes[40] ^= 0x5A;
+        std::fs::write(&a.archive_path, &bytes).unwrap();
+        check_index(&a.archive_path, &entries).unwrap();
+        assert!(scrub_archive(&a.archive_path, &entries, 2, &Arc::new(Progress::default())).is_err());
+        // Cut short: even the header can't be read.
+        std::fs::write(&a.archive_path, &bytes[..bytes.len() - 1024]).unwrap();
+        assert!(check_index(&a.archive_path, &entries).is_err());
     }
 
     #[test]
@@ -2519,6 +2868,149 @@ mod tests {
         drop(cat);
         let (a, entries) = recorded(&out, &src);
         check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+    }
+
+    #[test]
+    fn archiving_again_applies_new_exclusions_and_moves_the_old_archive_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("Songs");
+        let out = tmp.path().join("out");
+        make_tree(&src);
+        std::fs::write(src.join("junk.tmp"), b"scratch").unwrap();
+        let p = Arc::new(Progress::default());
+        let mut s = settings(&out, true);
+        // First time: nothing older, so it is just an archive.
+        let first = archive_again(&src, &s, &p).unwrap();
+        assert!(first.superseded.is_none() && first.superseded_problem.is_none());
+        let (a1, _) = recorded(&out, &src);
+
+        // An exclusion added afterwards, and the folder archived again.
+        s.exclusions = vec![Rule { pattern: "*.tmp".into(), action: Action::Discard, ..Rule::default() }];
+        let again = archive_again(&src, &s, &p).unwrap();
+        let moved = again.superseded.clone().expect("older archive moved");
+        assert_eq!(moved, std::fs::canonicalize(&out).unwrap().join(DATA_DIR).join(SUPERSEDED_DIR).join("Songs.7z"));
+        assert!(moved.is_file() && !out.join("Songs.7z").exists());
+        assert!(out.join("Songs (2).7z").is_file());
+        let m = read_manifest(&out.join("Songs (2).7z")).unwrap();
+        assert_eq!(m.excluded.discarded.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["junk.tmp"]);
+
+        // Every list shows the new archive only; the folder still passes its check.
+        let (a2, entries) = recorded(&out, &src);
+        assert_ne!(a1.archive_id, a2.archive_id);
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.archives().unwrap().len(), 1);
+        drop(cat);
+        check_before_delete(&src, &a2.archive_path, &entries, 2, &p).unwrap();
+        // A rebuild doesn't bring the old one back.
+        assert!(rebuild_catalog(&out).is_ok());
+        assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
+
+        // A third time: the second goes aside too, under a name of its own.
+        let third = archive_again(&src, &s, &p).unwrap();
+        assert!(third.superseded.unwrap().ends_with("Songs (2).7z"));
+        assert!(out.join("Songs.7z").is_file(), "the plain name is free again");
+    }
+
+    #[test]
+    fn a_detailed_log_names_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        make_tree(&src);
+        let p = Arc::new(Progress::default());
+        archive_folder(&src, &settings(&tmp.path().join("quiet"), true), &p).unwrap();
+        assert!(p.take_events().is_empty(), "nothing kept without a detailed log");
+        p.detailed.store(true, Ordering::Relaxed);
+        archive_folder(&src, &settings(&tmp.path().join("out"), true), &p).unwrap();
+        let ev = p.take_events();
+        for f in ["notes.txt", "sub/already.zip", "sub/random.dat"] {
+            assert!(ev.iter().any(|l| l.contains("compressing") && l.contains(f)), "{f} compressing: {ev:#?}");
+            assert!(ev.iter().any(|l| l.contains("verifying") && l.contains(f)), "{f} verifying: {ev:#?}");
+        }
+        assert!(ev.iter().any(|l| l.starts_with("Compressing")) && ev.iter().any(|l| l.starts_with("Verifying")));
+        assert!(p.take_events().is_empty());
+    }
+
+    #[test]
+    fn identical_files_in_a_folder_are_stored_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("Songs");
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::create_dir_all(src.join("b/c")).unwrap();
+        let big = "same take ".repeat(20_000);
+        std::fs::write(src.join("a/take.wav"), &big).unwrap();
+        std::fs::write(src.join("b/take copy.wav"), &big).unwrap();
+        std::fs::write(src.join("b/c/take.wav"), &big).unwrap();
+        // Same size, different bytes: not a copy.
+        std::fs::write(src.join("b/other.wav"), "SAME TAKE ".repeat(20_000)).unwrap();
+        // Identical but small: archived as they are.
+        std::fs::write(src.join("a/small.txt"), "tiny").unwrap();
+        std::fs::write(src.join("b/small.txt"), "tiny").unwrap();
+        let mut s = settings(&out, true);
+        s.identical_once = true;
+        let p = Arc::new(Progress::default());
+        let o = archive_folder(&src, &s, &p).unwrap();
+        let archive = out.join("Songs.7z");
+        assert!(!PathBuf::from(format!("{}.deps.partial", archive.display())).exists(), "work folder removed");
+
+        let m = read_manifest(&archive).unwrap();
+        let copies: Vec<(&str, &str, &str)> =
+            m.excluded.deps.iter().map(|d| (d.entry.rel_path.as_str(), d.original_archive.as_str(), d.original_path.as_str())).collect();
+        assert_eq!(copies, [("b/c/take.wav", "Songs.7z", "a/take.wav"), ("b/take copy.wav", "Songs.7z", "a/take.wav")]);
+        assert_eq!(o.excluded.deps.len(), 2);
+        let files: Vec<(&str, &str)> = m.entries.iter().filter(|e| !e.is_dir).map(|e| (e.rel_path.as_str(), e.method.as_str())).collect();
+        assert_eq!(
+            files,
+            [
+                ("a/small.txt", "lzma2"),
+                ("a/take.wav", "lzma2"),
+                ("b/c/take.wav.atticarcdep", "dep"),
+                ("b/other.wav", "lzma2"),
+                ("b/small.txt", "lzma2"),
+                ("b/take copy.wav.atticarcdep", "dep"),
+            ]
+        );
+        assert_eq!(o.record.file_count, 6);
+        let dir = tmp.path().join("x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dep = extract_file(&archive, "b/take copy.wav.atticarcdep", &dir, 2).unwrap();
+        let d: DepFile = serde_json::from_slice(&std::fs::read(dep).unwrap()).unwrap();
+        assert_eq!(d.replaced.original_path, "a/take.wav");
+
+        // The folder on disk is untouched and passes the check before a delete.
+        assert_eq!(std::fs::read_to_string(src.join("b/take copy.wav")).unwrap(), big);
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+
+        // The first copy can't be removed as a duplicate; a copy comes back from it.
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert!(cat.is_dep_original(&archive, "a/take.wav").unwrap());
+        let rep = cat.dep_at(a.archive_id, "b/take copy.wav.atticarcdep").unwrap().unwrap();
+        drop(cat);
+        let got = extract_original(&out, &rep, &dir, 2).unwrap();
+        assert_eq!(got.file_name().unwrap(), "take copy.wav");
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), big);
+
+        // A copy changed on disk since is caught.
+        std::fs::write(src.join("b/c/take.wav"), "Same take ".repeat(20_000)).unwrap();
+        let e = check_before_delete(&src, &a.archive_path, &entries, 2, &p).err().unwrap();
+        assert!(format!("{e:#}").contains("b/c/take.wav"), "{e:#}");
+        std::fs::write(src.join("b/c/take.wav"), &big).unwrap();
+
+        // Survives a rebuild; a copy can be put back into the archive.
+        Catalog::open_existing(&out).unwrap().clear().unwrap();
+        rebuild_catalog(&out).unwrap();
+        assert_eq!(put_back_replaced(&archive, &["b/c/take.wav".to_string()], &s, &p).unwrap(), 1);
+        let m = read_manifest(&archive).unwrap();
+        assert!(m.entries.iter().any(|e| e.rel_path == "b/c/take.wav" && e.method == "lzma2"));
+        assert_eq!(m.excluded.deps.len(), 1);
+        let (a, entries) = recorded(&out, &src);
+        check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+
+        // Off: every copy is archived.
+        let out2 = tmp.path().join("out2");
+        archive_folder(&src, &settings(&out2, true), &p).unwrap();
+        assert!(read_manifest(&out2.join("Songs.7z")).unwrap().excluded.deps.is_empty());
     }
 
     #[test]

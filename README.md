@@ -20,7 +20,10 @@ other platforms too.
   carries its own manifest.
 - **Safe clean-up**: originals are deleted in two passes: check every ticked folder (every file
   hashed, the archive decoded), then delete only those that passed and haven't changed since.
-- **Duplicates**: found across all archives by hash; replacing them is opt-in, with a dry run.
+- **Duplicates**: found across all archives by hash and shown with the space they take. Copies inside
+  archives are listed, not removed (taking one out rewrites the whole archive, which takes hours).
+  Copies inside one folder can be stored once as it is archived (**Store identical files in a folder
+  once**, below).
 - **Exclusions**: leave junk out (discard) or keep files apart (set aside) by rule.
 - **Free-space check**: a folder that can't fit is refused before anything is written.
 - **Rename-proof**: archives and archived folders renamed in Explorer are found again by what they
@@ -96,6 +99,15 @@ cargo run --release -p atticarc-gui -- D:\Photos
 Starts on the given source folder (or the last one used).
 
 - **New job**: source and destination, compression level, threads, store mode and protected folders.
+  **↻** beside an already-archived folder archives it again with the current settings and
+  exclusions (say, after adding an exclusion); once the new archive is verified, the older one is
+  moved to `.atticarc\superseded` in the destination (not deleted) and drops out of every list.
+  **Store identical files in a folder once** (off by default; `atticarc-cli archive --identical-once`):
+  files of 64 KiB or more with exactly the same content in the folder are compressed once, and each
+  later copy goes into the archive as a small `<name>.atticarcdep` reference file naming the first
+  copy. The folder on disk isn't changed, and its check before a delete still compares every copy
+  with its hash. The Catalogue's **Extract the original to…** brings a copy back as a file, and
+  **Put back** puts it back into the archive; 7-Zip on its own extracts the reference file.
   Each has a **Recent ▾** menu of the last 8 folders used (a folder that isn't there now, such as on an
   unplugged drive, is greyed out), and the app starts on the last ones used.
   Every subfolder of the source is listed with a tick box; unticked folders grey out and sink to the
@@ -128,12 +140,20 @@ Starts on the given source folder (or the last one used).
 - **Progress**: overall progress, throughput, time left, per-folder status and a log. *Stop after this
   folder* or *Cancel now* (the partial archive is removed).
 - **Clean up**: the last step. Every archived folder whose source is still on disk, as a tree by parent
-  folder with tick boxes (nothing ticked to start; a parent's box ticks all its folders). Deleting is
-  two separate passes, so nothing is deleted until every ticked folder has been checked:
-  **1. Check** compares each ticked folder with the catalogue and its archive (every file hashed, the
-  archive decoded) and shows the result on each folder, deleting nothing; **2. Delete … that passed**
-  deletes only ticked folders that passed, after a yes, and just before each one compares it with a
-  snapshot taken at its check: a folder changed since then is left alone. **Stop after this folder**
+  folder with tick boxes (nothing ticked to start; a parent's box ticks all its folders). Nothing is
+  deleted without a passed check. On NTFS the check is done as each folder is archived (every file is
+  hashed as it is compressed and the archive decoded against those hashes, and the folder's change
+  journal shows it didn't change meanwhile), so those folders can go straight to **2. Delete … that
+  passed**. Just before each delete, after a yes, AtticARC makes sure in seconds that the folder still
+  matches its snapshot and the archive its size, modified time and header; anything changed is left
+  alone. An archive last decoded more than 30 days ago is decoded again first, since after the delete
+  it is the only copy. **1. Check** is the full check (every file hashed, the archive decoded), for
+  folders without a check: archived before this, on a drive without a change journal, changed while
+  archiving, or after a refused delete. **Check archives for damage** decodes again every archive not
+  decoded for 30 days (**…all of them** for every one), reading only the archives, to catch damage
+  such as a bad sector; it can be stopped and carried on. (Measured on a USB HDD, per 4 TB: the checks
+  before a delete take seconds, decoding the archives about 14.5 hours, and the old full check about
+  59 hours.) **Stop after this folder**
   ends either pass cleanly. Archived folders no longer where they were are listed apart, with
   **Look for renamed folders**, which finds a folder holding exactly their files among those beside
   them and lists it under its new name (checked like any other before deleting).
@@ -143,7 +163,7 @@ Starts on the given source folder (or the last one used).
   snapshot holds every file's change journal number, so any write since the check is caught, even
   one whose timestamps were set back; it needs no administrator rights, and on drives without a
   journal (exFAT) timestamps are used. Folders checked with the journal show "change journal". The same steps run without the window
-  with `atticarc-cli cleanup <destination> [--check] [--delete]`.
+  with `atticarc-cli cleanup <destination> [--check] [--scrub | --scrub-all] [--delete]`.
 - The sidebar runs in the order of the work: New job, Progress, Duplicates, Excluded, Clean up. The
   **Catalogue** sits apart below it, under *Look up*, since it is for finding things, not a step.
 - **Catalogue**: open any archive and browse its folders like a file manager (name, type, size and
@@ -153,7 +173,9 @@ Starts on the given source folder (or the last one used).
 - **Duplicates**: a tree on the right lists every archive, oldest first. The oldest copy of each file
   (same size and BLAKE3 hash) is the original and always stays; every later copy is a leaf under its
   archive, shown with its full path and the archive and path of its original. The left pane shows the
-  details of what is selected. **Replace duplicates…** opens the list of every copy, none ticked: tick
+  details of what is selected. Copies are shown, not removed: the **Replace duplicates…** button is
+  switched off for now, because each archive rewrite took hours (five copies, about eight hours). The
+  replacing described here stays in the code for a later batched mode. **Replace duplicates…** opens the list of every copy, none ticked: tick
   the copies to replace (or **Tick all**); anything unticked stays as it is. Tick **Only copies of at least … MB** (200 MB to start; type or drag any size) to leave smaller
   copies alone. **Preview (dry run)** decodes every original from its archive and checks
   its hash, changing nothing. **Replace** runs the same check (nothing changes if any original fails),
@@ -166,7 +188,9 @@ Starts on the given source folder (or the last one used).
 - **Catalogue → a reference file** shows the file it stands for and where the original is:
   **Extract the original to…** follows it (checking the hash), **Show the original** opens it, and
   **Put the file back** rewrites the archive with the real file again, taken from the original.
-- **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
+- **Settings** (bottom of the sidebar): Light or Dark, a colour for buttons and highlights (Teal,
+  Amber, Sunset, Blue, Plum or Slate), a background (Stone, Paper, Mist, Sage, Blush or Snow), Compatible graphics, Refresh window, the detailed Progress log
+  and the log file. Choices are remembered.
 
 ## Output
 
@@ -216,8 +240,8 @@ stop responding. Work in the background (archiving, checking, deleting) carries 
   asleep or changing mode (the likely cause of the freeze), and on Windows it uses DirectX 12, which
   copes with display changes better (set `WGPU_BACKEND` to choose another).
 - AtticARC notices when the display it is on changes and redraws itself at the new size and scale.
-- **Refresh window (F5)** in the sidebar does the same on demand.
-- If the window still freezes, tick **Compatible graphics** (bottom of the sidebar) and restart:
+- **Refresh window (F5)** in Settings does the same on demand.
+- If the window still freezes, tick **Compatible graphics** (in Settings) and restart:
   AtticARC then draws with OpenGL instead of the default renderer. The same can be chosen for one
   run with `atticarc --compatible-graphics` or `ATTICARC_RENDERER=glow`.
 - A log is kept at `%APPDATA%\atticarc\atticarc.log`: the renderer and graphics card used, display
