@@ -38,9 +38,15 @@ echo "  ok: $(rustc --version)"
 
 fetch() { # repo dir branch
   if [ -d "$2/.git" ]; then
-    git -C "$2" fetch -q origin && git -C "$2" checkout -q "$3" && git -C "$2" pull -q --ff-only
+    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$2" fetch -q origin &&
+      git -C "$2" checkout -q "$3" &&
+      GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$2" pull -q --ff-only
   else
-    git clone -q -b "$3" "https://github.com/$1.git" "$2"
+    # Public repos over HTTPS; a private one (plugin-squared) over SSH, with the
+    # key you added to GitHub. GitHub's host key is accepted the first time.
+    GIT_TERMINAL_PROMPT=0 git clone -q -b "$3" "https://github.com/$1.git" "$2" 2>/dev/null ||
+      GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git clone -q -b "$3" "git@github.com:$1.git" "$2" ||
+      { echo "  can't clone $1: for a private repo, add this VM's SSH key to GitHub (ssh -T git@github.com to check)"; exit 1; }
   fi
   echo "  ok: $(git -C "$2" log --oneline -1)"
 }
