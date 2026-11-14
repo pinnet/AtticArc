@@ -27,10 +27,16 @@ pub struct Saved {
     pub identical_once: bool,
     /// GUI colour scheme.
     pub dark_mode: bool,
+    /// The GUI's accent colour, by name (Teal, Amber, Sunset, Blue, Plum, Slate).
+    pub accent: String,
+    /// The GUI's background, by name (Stone, Paper, Mist, Sage, Blush, Snow).
+    pub background: String,
     /// Source folders used before, most recent first (at most [`RECENT_MAX`]).
     pub recent_sources: Vec<PathBuf>,
     /// Destination folders used before, most recent first.
     pub recent_dests: Vec<PathBuf>,
+    /// The GUI's log lists every file as it is compressed and verified.
+    pub detailed_log: bool,
     /// Text size of the GUI's log, in points ([`LOG_TEXT_MIN`] to [`LOG_TEXT_MAX`]).
     pub log_text_size: f32,
     /// Draw the GUI with OpenGL instead of the default (Direct3D/Vulkan through
@@ -99,8 +105,11 @@ impl Default for Saved {
             exclusions: exclude::default_rules(),
             identical_once: false,
             dark_mode: false,
+            accent: "Teal".into(),
+            background: "Stone".into(),
             recent_sources: Vec::new(),
             recent_dests: Vec::new(),
+            detailed_log: false,
             log_text_size: 13.0,
             compatible_graphics: false,
         }

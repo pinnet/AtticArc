@@ -171,13 +171,49 @@ pub struct Progress {
     pub total: AtomicU64,
     pub cancel: AtomicBool,
     pub phase: Mutex<String>,
+    /// The file being read now (path inside the folder), for "Now:" lines.
+    pub current_file: Mutex<String>,
+    /// With this set, every phase and every file read is also added to
+    /// `events`, for a detailed log; see [`Progress::take_events`].
+    pub detailed: AtomicBool,
+    events: Mutex<Vec<String>>,
 }
+
+/// Events kept for a detailed log the window hasn't collected yet; past
+/// this, the oldest go, so a window left closed can't use up memory.
+const EVENTS_MAX: usize = 50_000;
 
 impl Progress {
     pub fn set_phase(&self, phase: &str, total: u64) {
         *self.phase.lock().unwrap() = phase.to_string();
+        self.current_file.lock().unwrap().clear();
         self.done.store(0, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
+        if !phase.is_empty() {
+            self.event(|| if total > 0 { format!("{phase} ({})", crate::disk::human(total)) } else { phase.to_string() });
+        }
+    }
+
+    /// Records the file being read now, and with a detailed log, a line for it.
+    pub fn set_file(&self, verb: &str, rel: &str, size: u64) {
+        *self.current_file.lock().unwrap() = rel.to_string();
+        self.event(|| format!("  {verb} {rel} ({})", crate::disk::human(size)));
+    }
+
+    /// Adds a line to the detailed log, if there is one.
+    pub fn event(&self, line: impl FnOnce() -> String) {
+        if self.detailed.load(Ordering::Relaxed) {
+            let mut ev = self.events.lock().unwrap();
+            if ev.len() >= EVENTS_MAX {
+                ev.drain(..EVENTS_MAX / 10);
+            }
+            ev.push(line());
+        }
+    }
+
+    /// The detailed log lines since the last call.
+    pub fn take_events(&self) -> Vec<String> {
+        std::mem::take(&mut *self.events.lock().unwrap())
     }
 
     pub fn fraction(&self) -> f32 {
@@ -307,6 +343,8 @@ struct FileHash {
 /// compressor, so each source byte is read from disk once.
 struct HashReader {
     path: PathBuf,
+    rel: String,
+    size: u64,
     file: Option<File>,
     slot: usize,
     b3: blake3::Hasher,
@@ -321,8 +359,12 @@ impl Read for HashReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.progress.check_cancel()?;
         if self.file.is_none() {
+            if self.finished {
+                return Ok(0);
+            }
             let f = File::open(&self.path)
                 .map_err(|e| io::Error::new(e.kind(), format!("can't open {}: {e}", self.path.display())))?;
+            self.progress.set_file("compressing", &self.rel, self.size);
             self.file = Some(f);
         }
         let n = self.file.as_mut().unwrap().read(buf)?;
@@ -375,6 +417,56 @@ pub struct ArchiveOutcome {
     pub skipped_links: Vec<String>,
     /// What the exclusions left out, as recorded in the manifest.
     pub excluded: Excluded,
+    /// With [`archive_again`]: where the folder's older archive was moved.
+    pub superseded: Option<PathBuf>,
+    /// With [`archive_again`]: why the older archive was left where it was.
+    pub superseded_problem: Option<String>,
+}
+
+/// Inside the destination's `.atticarc` folder: archives replaced by a newer
+/// archive of the same folder ([`archive_again`]).
+pub const SUPERSEDED_DIR: &str = "superseded";
+
+/// Archives `source` like [`archive_folder`], for a folder that may have
+/// been archived before (to apply changed exclusions or settings, say).
+/// The new archive gets a name of its own (`Name (2).7z`); only once it is
+/// verified, the folder's older archive is moved into
+/// `.atticarc\superseded` and marked so in the catalogue, so every list
+/// shows the new one only. Nothing is deleted: the older archive can be
+/// removed by hand. If it can't be moved, it stays as it was, and the new
+/// archive still counts.
+pub fn archive_again(source: &Path, settings: &Settings, progress: &Arc<Progress>) -> Result<ArchiveOutcome> {
+    let canonical = std::fs::canonicalize(source).with_context(|| format!("can't open {}", source.display()))?;
+    let old = if crate::catalog::exists(&settings.out_dir) {
+        Catalog::open_existing(&settings.out_dir)?.archived_folder(&canonical)?
+    } else {
+        None
+    };
+    let mut o = archive_folder(source, settings, progress)?;
+    let Some(old) = old else { return Ok(o) };
+    let moved = (|| -> Result<PathBuf> {
+        let out = std::fs::canonicalize(&settings.out_dir)?;
+        let dir = out.join(DATA_DIR).join(SUPERSEDED_DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
+        let stem = old.archive_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let day = chrono::Local::now().format("%Y-%m-%d");
+        let to = std::iter::once(dir.join(format!("{stem}.7z")))
+            .chain((1..).map(|n| dir.join(if n == 1 { format!("{stem} (superseded {day}).7z") } else { format!("{stem} (superseded {day}, {n}).7z") })))
+            .find(|p| !p.exists())
+            .expect("a free name");
+        std::fs::rename(&old.archive_path, &to)
+            .with_context(|| format!("can't move {} to {}", old.archive_path.display(), to.display()))?;
+        let to_key = crate::settings::strip_verbatim(&to).to_string_lossy().into_owned();
+        let mut cat = Catalog::open_existing(&settings.out_dir)?;
+        cat.supersede(old.archive_id, &to_key)?;
+        let _ = cat.log_run(Some(old.archive_id), "supersede", &canonical, &now_utc(), "moved", &format!("replaced by {}", o.record.archive_path));
+        Ok(to)
+    })();
+    match moved {
+        Ok(p) => o.superseded = Some(p),
+        Err(e) => o.superseded_problem = Some(format!("{e:#}")),
+    }
+    Ok(o)
 }
 
 /// Archives `source` into `settings.out_dir`, verifies the archive by
@@ -567,7 +659,7 @@ pub fn archive_folder(source: &Path, settings: &Settings, progress: &Arc<Progres
             });
         }
     }
-    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded })
+    Ok(ArchiveOutcome { record, skipped_links: scan.skipped_links, excluded, superseded: None, superseded_problem: None })
 }
 
 /// Finds files in `scan` with the same content (same size and BLAKE3 hash,
@@ -713,6 +805,7 @@ fn with_inner(entries: &[EntryRecord], excluded: &Excluded) -> Vec<EntryRecord> 
 
 /// Hashes one file that isn't archived, for the manifest.
 fn hash_record(f: &ScannedFile, progress: &Arc<Progress>) -> Result<EntryRecord> {
+    progress.set_file("hashing", &f.rel, f.size);
     let mut b3 = blake3::Hasher::new();
     let mut sha = Sha256::new();
     let mut file = File::open(&f.abs).with_context(|| format!("can't open {}", f.abs.display()))?;
@@ -978,6 +1071,8 @@ fn write_archive(
         w.set_content_methods(vec![method]);
         let reader_for = |i: usize| HashReader {
             path: scan.files[i].abs.clone(),
+            rel: scan.files[i].rel.clone(),
+            size: scan.files[i].size,
             file: None,
             slot: i,
             b3: blake3::Hasher::new(),
@@ -1142,6 +1237,7 @@ fn verify_archive_saving(
                 }
                 return Ok(true);
             }
+            progress.set_file("verifying", entry.name(), entry.size());
             let mut h = blake3::Hasher::new();
             let mut n = 0u64;
             let mut save = match save_inner.filter(|_| entry.name() == EXCLUDED_ENTRY) {
@@ -2772,6 +2868,66 @@ mod tests {
         drop(cat);
         let (a, entries) = recorded(&out, &src);
         check_before_delete(&src, &a.archive_path, &entries, 2, &p).unwrap();
+    }
+
+    #[test]
+    fn archiving_again_applies_new_exclusions_and_moves_the_old_archive_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("Songs");
+        let out = tmp.path().join("out");
+        make_tree(&src);
+        std::fs::write(src.join("junk.tmp"), b"scratch").unwrap();
+        let p = Arc::new(Progress::default());
+        let mut s = settings(&out, true);
+        // First time: nothing older, so it is just an archive.
+        let first = archive_again(&src, &s, &p).unwrap();
+        assert!(first.superseded.is_none() && first.superseded_problem.is_none());
+        let (a1, _) = recorded(&out, &src);
+
+        // An exclusion added afterwards, and the folder archived again.
+        s.exclusions = vec![Rule { pattern: "*.tmp".into(), action: Action::Discard, ..Rule::default() }];
+        let again = archive_again(&src, &s, &p).unwrap();
+        let moved = again.superseded.clone().expect("older archive moved");
+        assert_eq!(moved, std::fs::canonicalize(&out).unwrap().join(DATA_DIR).join(SUPERSEDED_DIR).join("Songs.7z"));
+        assert!(moved.is_file() && !out.join("Songs.7z").exists());
+        assert!(out.join("Songs (2).7z").is_file());
+        let m = read_manifest(&out.join("Songs (2).7z")).unwrap();
+        assert_eq!(m.excluded.discarded.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(), ["junk.tmp"]);
+
+        // Every list shows the new archive only; the folder still passes its check.
+        let (a2, entries) = recorded(&out, &src);
+        assert_ne!(a1.archive_id, a2.archive_id);
+        let cat = Catalog::open_existing(&out).unwrap();
+        assert_eq!(cat.archives().unwrap().len(), 1);
+        drop(cat);
+        check_before_delete(&src, &a2.archive_path, &entries, 2, &p).unwrap();
+        // A rebuild doesn't bring the old one back.
+        assert!(rebuild_catalog(&out).is_ok());
+        assert_eq!(Catalog::open_existing(&out).unwrap().archives().unwrap().len(), 1);
+
+        // A third time: the second goes aside too, under a name of its own.
+        let third = archive_again(&src, &s, &p).unwrap();
+        assert!(third.superseded.unwrap().ends_with("Songs (2).7z"));
+        assert!(out.join("Songs.7z").is_file(), "the plain name is free again");
+    }
+
+    #[test]
+    fn a_detailed_log_names_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        make_tree(&src);
+        let p = Arc::new(Progress::default());
+        archive_folder(&src, &settings(&tmp.path().join("quiet"), true), &p).unwrap();
+        assert!(p.take_events().is_empty(), "nothing kept without a detailed log");
+        p.detailed.store(true, Ordering::Relaxed);
+        archive_folder(&src, &settings(&tmp.path().join("out"), true), &p).unwrap();
+        let ev = p.take_events();
+        for f in ["notes.txt", "sub/already.zip", "sub/random.dat"] {
+            assert!(ev.iter().any(|l| l.contains("compressing") && l.contains(f)), "{f} compressing: {ev:#?}");
+            assert!(ev.iter().any(|l| l.contains("verifying") && l.contains(f)), "{f} verifying: {ev:#?}");
+        }
+        assert!(ev.iter().any(|l| l.starts_with("Compressing")) && ev.iter().any(|l| l.starts_with("Verifying")));
+        assert!(p.take_events().is_empty());
     }
 
     #[test]

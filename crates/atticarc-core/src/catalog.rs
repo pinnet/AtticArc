@@ -391,6 +391,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// Marks archive `id` as replaced by a newer archive of the same folder,
+    /// its file now at `new_path`. It drops out of every list (they show
+    /// verified archives only), but reference files naming it still resolve
+    /// through its old name.
+    pub fn supersede(&mut self, id: i64, new_path: &str) -> Result<()> {
+        self.relink(id, new_path)?;
+        self.conn.execute("UPDATE archives SET status = 'superseded' WHERE id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// The current path of the archive once called `old_name` (a file name),
     /// if it was renamed and relinked.
     pub fn path_for_alias(&self, old_name: &str) -> Result<Option<String>> {

@@ -25,7 +25,9 @@ Usage:
                                   (64 KiB first, the whole file only if that matches),
                                   and optionally write the confirmed ones to FILE.
   atticarc-cli archive <folder>...       Archive each folder to its own .7z and verify it,
-                                  using the settings saved by the GUI.
+                                  using the settings saved by the GUI. A folder archived
+                                  before gets a new archive, and its older one is moved to
+                                  .atticarc\\superseded in the destination (not deleted).
         [--out DIR] [--level 5|9]  Override the output folder or level.
         [--identical-once | --every-copy]
                                   Store identical files (64 KiB or more) inside a folder once,
@@ -324,7 +326,8 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
         }
         println!("Archiving {} to {} ({}, {} threads)", folder.display(), s.out_dir.display(), s.engine_label(), s.threads);
         let started = std::time::Instant::now();
-        match archive::archive_folder(folder, &s, &Arc::new(Progress::default())) {
+        // Archived before: the new archive gets a name of its own and the older one is moved aside.
+        match archive::archive_again(folder, &s, &Arc::new(Progress::default())) {
             Ok(o) => {
                 println!(
                     "  verified: {} files, {} → {} in {:.1?}",
@@ -348,6 +351,12 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 if !o.excluded.deps.is_empty() {
                     let bytes: u64 = o.excluded.deps.iter().map(|d| d.entry.size).sum();
                     println!("  stored once: {} identical copies ({}) kept as reference files", o.excluded.deps.len(), human(bytes));
+                }
+                if let Some(old) = &o.superseded {
+                    println!("  archived before: the older archive was moved to {}", old.display());
+                }
+                if let Some(why) = &o.superseded_problem {
+                    println!("  archived before: the older archive was left in place: {why}");
                 }
             }
             Err(e) => {

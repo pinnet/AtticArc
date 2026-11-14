@@ -23,6 +23,26 @@ still change; 1.0 will mark them stable.
   command-line tool says "protected"), instead of as a failed check, and are never checked.
 - Policy from measurements: sevenz-bench `verify` and `faults` (D:\Dev\WIP\sevenz-bench).
 
+### Archive again
+- **↻** beside each folder under "Already archived" (New job) archives it again with the current
+  settings and exclusions, e.g. after adding an exclusion. `atticarc-cli archive` does the same for
+  a folder archived before. The new archive gets a name of its own (`Name (2).7z`); only once it is
+  verified, the older one is moved to `.atticarc\superseded` in the destination and drops out of
+  the Catalogue, Duplicates and Clean up. Nothing is deleted.
+
+### Settings window
+- The bottom of the sidebar is one **Settings** button. Its window holds Light / Dark, a choice of
+  colour for buttons and highlights (Teal, Amber, Sunset, Blue, Plum, Slate, as swatches like
+  Plugin²'s guide), a background (Stone, Paper, Mist, Sage, Blush, Snow: the page, the sidebar and,
+  in dark mode, the cards), Compatible graphics, Refresh window (F5 still works), the detailed log and
+  Open the log file. Every change is saved at once.
+
+### Progress log
+- The Progress page names the file being read now under "Now:".
+- **Detailed: every file** tick box on the log (kept between runs, can be switched mid-run): lists
+  each phase and every file as it is hashed, compressed and verified, with its size. The log keeps
+  the latest 20,000 lines and draws only those in view, so a big folder stays quick.
+
 ### Same name, different content
 - A folder whose archive name is taken (a folder with the same name archived before, or the same
   folder archived again) gets `Name (2).7z`, `Name (3).7z`… and a catalogue entry of its own, instead

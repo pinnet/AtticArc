@@ -99,6 +99,9 @@ cargo run --release -p atticarc-gui -- D:\Photos
 Starts on the given source folder (or the last one used).
 
 - **New job**: source and destination, compression level, threads, store mode and protected folders.
+  **↻** beside an already-archived folder archives it again with the current settings and
+  exclusions (say, after adding an exclusion); once the new archive is verified, the older one is
+  moved to `.atticarc\superseded` in the destination (not deleted) and drops out of every list.
   **Store identical files in a folder once** (off by default; `atticarc-cli archive --identical-once`):
   files of 64 KiB or more with exactly the same content in the folder are compressed once, and each
   later copy goes into the archive as a small `<name>.atticarcdep` reference file naming the first
@@ -185,7 +188,9 @@ Starts on the given source folder (or the last one used).
 - **Catalogue → a reference file** shows the file it stands for and where the original is:
   **Extract the original to…** follows it (checking the hash), **Show the original** opens it, and
   **Put the file back** rewrites the archive with the real file again, taken from the original.
-- **Dark mode / Light mode**: the button at the bottom of the sidebar switches colours; the choice is remembered.
+- **Settings** (bottom of the sidebar): Light or Dark, a colour for buttons and highlights (Teal,
+  Amber, Sunset, Blue, Plum or Slate), a background (Stone, Paper, Mist, Sage, Blush or Snow), Compatible graphics, Refresh window, the detailed Progress log
+  and the log file. Choices are remembered.
 
 ## Output
 
@@ -235,8 +240,8 @@ stop responding. Work in the background (archiving, checking, deleting) carries 
   asleep or changing mode (the likely cause of the freeze), and on Windows it uses DirectX 12, which
   copes with display changes better (set `WGPU_BACKEND` to choose another).
 - AtticARC notices when the display it is on changes and redraws itself at the new size and scale.
-- **Refresh window (F5)** in the sidebar does the same on demand.
-- If the window still freezes, tick **Compatible graphics** (bottom of the sidebar) and restart:
+- **Refresh window (F5)** in Settings does the same on demand.
+- If the window still freezes, tick **Compatible graphics** (in Settings) and restart:
   AtticARC then draws with OpenGL instead of the default renderer. The same can be chosen for one
   run with `atticarc --compatible-graphics` or `ATTICARC_RENDERER=glow`.
 - A log is kept at `%APPDATA%\atticarc\atticarc.log`: the renderer and graphics card used, display

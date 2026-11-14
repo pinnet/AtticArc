@@ -124,6 +124,8 @@ documentation. No change in behaviour: the existing tests prove each step.
 
 ### 1.8 Plugin-based structure
 
+The order of work for the whole of section 1, as one run: [docs/refactor-brief.md](docs/refactor-brief.md).
+
 Goal: each section of the app is a plugin behind a small trait, so any part can be replaced
 later without touching the rest. First up, progress: one progress plugin used everywhere in the
 GUI. Do this alongside 1.3–1.5 (it absorbs the `Loader<T>` and "busy, repaint me" items).
@@ -146,12 +148,30 @@ GUI. Do this alongside 1.3–1.5 (it absorbs the `Loader<T>` and "busy, repaint 
   - [ ] Progress / feedback (first, as the pattern for the rest).
   - [ ] Archive backend: 7-Zip now; a Rust compression routine later.
   - [ ] Metadata extractors: EXE version info, Macrium `.mrimg` reader (section 2).
+  - [ ] **File streams** (agreed Nov 2026): extra data kept *with each file inside the archive*,
+        whichever archive backend is plugged in, rather than only in the catalogue.
+        - Contract `FileStreams { read(file) -> Vec<Stream { name, bytes }>, restore(file,
+          &[Stream]) }`, plus which systems each plugin reads on and restores on.
+        - Plugins: `macos-xattr` (Finder tags `com.apple.metadata:_kMDItemUserTags`, old label in
+          `com.apple.FinderInfo`), `linux-xattr` (`user.xdg.tags`), `ntfs-streams` (alternate
+          streams, where a Mac's tags land on a Windows share). A `tags` decoder on top turns raw
+          streams into name + colour for the Catalogue ([colour labels](#colour-labels-and-file-tags)).
+        - In the archive: small streams in the file's manifest entry (read with the manifest,
+          its own quick block); big ones (a resource fork) as hidden entries
+          `.atticarc/streams/<path>/<name>`, compressed, hashed and verified like any file. Not
+          7-Zip's `file:stream` names, which 7-Zip may turn into NTFS streams or mangle.
+        - The catalogue only indexes what the plugins decode; Rebuild gets it back from the
+          manifests. Labels set *after* archiving can't go inside without a rewrite, so they stay
+          in `<archive>.labels.json`.
   - [ ] Storage / catalogue access.
   - [ ] AI review over MCP (section 2) as a plugin on the same contracts.
 - [ ] Write the contracts and the registry into `docs/architecture.md` and `DESIGN.md`.
 - Every step must leave the section 0.5 tests passing.
 
 ## 1.9 Other operating systems (after the refactor)
+
+Now part of the refactor run: three identical builds, interchangeable archives, streams on every
+system, similar speeds ([docs/refactor-brief.md](docs/refactor-brief.md), "The outcome").
 
 The core is plain Rust and mostly portable; the Windows-only parts sit behind a small platform
 layer after the refactor, one implementation per system:
@@ -164,6 +184,7 @@ layer after the refactor, one implementation per system:
 | Folder dialogs, modal | `rfd` with the window as parent | same | same |
 | Settings and log | `%APPDATA%\atticarc` | `~/Library/Application Support/atticarc` | `~/.config/atticarc` |
 | Delete permission, locked files | Windows rules | Unix permissions | Unix permissions |
+| File tags read and put back ([colour labels](#colour-labels-and-file-tags)) | streams a Mac left on an SMB share | `com.apple.metadata:_kMDItemUserTags` | `user.xdg.tags` |
 
 - On macOS and Linux, `ctime` changes with every write or metadata change and, unlike the
   modified time, can't be set back by ordinary tools, so it protects a snapshot as well as the
@@ -174,6 +195,36 @@ layer after the refactor, one implementation per system:
       the M1 MacBook; a Linux binary).
 
 ## 2. Features still open
+
+### Colour labels and file tags
+
+Agreed Nov 2026: the same on every system (Windows, macOS, Linux), so a label set on one machine
+means the same on another.
+
+- **One set of colours, Finder's seven** (with their Finder numbers: 1 grey, 2 green, 3 purple,
+  4 blue, 5 yellow, 6 red, 7 orange), plus none. Shown as coloured dots, like Plugin²'s labels.
+- [ ] **AtticARC's own labels** (set on any system): a colour and optional name on an archive, a
+      folder or a file in the Catalogue. Kept in the catalogue (a `labels` table keyed by archive
+      and path), and also in a small `<archive>.labels.json` beside the archive, so Rebuild from
+      archives keeps them. Not in the manifest: it is inside the archive, so changing a label
+      there would mean rewriting the whole archive.
+- [ ] **File tags kept per file**: when a folder is archived, each file's tags are read and saved
+      in its manifest entry (`tags: [{ name, colour }]`), and put back when a file is extracted
+      on a system that has them.
+      - macOS: the `com.apple.metadata:_kMDItemUserTags` extended attribute (a binary plist list
+        of `"Name\nN"`, N the colour number). Also `com.apple.FinderInfo`'s 3-bit label for files
+        with only an old-style label.
+      - Linux: `user.xdg.tags` (comma-separated names, as KDE Dolphin writes them; no colour, so
+        a name matching a Finder colour, "Red", takes that colour).
+      - Windows has no file tags. Folders a Mac tagged on a Windows share keep them as hidden
+        NTFS streams; read those if they are there. **Check on WinX first** what a Mac actually
+        leaves (stream names) before relying on it.
+      - exFAT/FAT drives from a Mac: the tags are in the `._name` AppleDouble files; read them
+        there and leave the `._` files out of the archive (a default discard rule).
+- [ ] Catalogue: dots per file and folder, filter and search by colour or tag name; tags count as
+      one of a file's details in Duplicates.
+- [ ] A tag change alone isn't a content change: the snapshot before a delete ignores it (macOS
+      `ctime` does change with it, so on macOS a re-tagged folder needs its check again; say so).
 
 - [ ] Skip locked files instead of failing the whole folder.
 - [ ] MD5 as an optional hash, for compatibility with the old tool.
@@ -186,6 +237,19 @@ layer after the refactor, one implementation per system:
       search, file info) and one `suggest` tool that records keep/rescue/drop suggestions for a new
       **Review** page; you approve, and anything deleted still goes through the usual check.
       Metadata only by default. Rust with `rmcp`; Claude Desktop or a local LLM on Proxmox as client.
+
+- [ ] **Versions of a folder (considered Nov 2026, parked).** Kept for now: a new folder with a
+      taken name gets `Name (2).7z`, `Name (3).7z`… beside the first, which is logical and copies
+      nothing. Two alternatives if the destination gets cluttered:
+  - *Earlier versions inside the newest* (`Name.7z` holding `.atticarc/previous/Name <date>.7z`,
+    stored like the set-aside archive): one file per name, but every new version copies all the
+    older ones (39 GB for `may 2024`), a scrub reads them twice, and one bad sector hits the whole
+    history.
+  - *A versions folder beside it* (newest as `Name.7z`, older moved to `Name.versions\`): the same
+    tidiness, instant on the same drive. The catalogue and Clean up would show them as versions of
+    one folder. The likelier choice.
+  - Open question: an *updated* folder (sharing files with the last version) as a new version with
+    the shared files stored once as references to the older archive.
 
 ## 3. Before calling it 1.0
 

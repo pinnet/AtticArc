@@ -29,6 +29,7 @@ impl App {
         let (done, verified, failed, n) = (b.done, b.verified, b.failed, b.folders.len());
         let label = b.settings_label.clone();
         let phase = b.progress.phase.lock().unwrap().clone();
+        let file = b.progress.current_file.lock().unwrap().clone();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -73,7 +74,12 @@ impl App {
                     stat(&mut c[3], "Verified", &format!("{verified} · {failed} failed"));
                 });
                 if !done && !phase.is_empty() {
-                    ui.label(RichText::new(format!("Now: {phase}{}", if stopping { " · stopping after this folder" } else { "" })).color(theme::muted()));
+                    let stop = if stopping { " · stopping after this folder" } else { "" };
+                    ui.label(RichText::new(format!("Now: {phase}{stop}")).color(theme::muted()));
+                    if !file.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(&file).monospace().color(theme::muted())).truncate())
+                            .on_hover_text(&file);
+                    }
                 }
             });
             ui.add_space(12.0);
@@ -113,6 +119,18 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Log").strong().size(16.0).color(egui::Color32::WHITE));
+                        ui.add_space(12.0);
+                        let mut detailed = self.saved.detailed_log;
+                        let tick = ui
+                            .checkbox(&mut detailed, RichText::new("Detailed: every file").color(theme::sidebar_text()))
+                            .on_hover_text("Lists each phase and every file as it is hashed, compressed and verified. Takes effect at once, and is kept for next time.");
+                        if tick.changed() {
+                            self.saved.detailed_log = detailed;
+                            settings::store(&self.saved);
+                            if let Some(b) = &self.jobs.batch {
+                                b.progress.detailed.store(detailed, Ordering::Relaxed);
+                            }
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add_enabled(size < LOG_TEXT_MAX, egui::Button::new("A+")).on_hover_text("Larger log text").clicked() {
                                 size = (size + 1.0).min(LOG_TEXT_MAX);
@@ -123,11 +141,21 @@ impl App {
                             }
                         });
                     });
-                    egui::ScrollArea::vertical().max_height(360.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
-                        for l in &self.jobs.log {
-                            ui.label(RichText::new(l).monospace().size(size).color(theme::sidebar_text()));
-                        }
-                    });
+                    // Only the rows in view are drawn, so a long detailed log stays quick.
+                    let row = ui.text_style_height(&egui::TextStyle::Monospace).max(size * 1.3);
+                    let log = &self.jobs.log;
+                    egui::ScrollArea::vertical().max_height(360.0).stick_to_bottom(true).auto_shrink([false, true]).show_rows(
+                        ui,
+                        row,
+                        log.len(),
+                        |ui, range| {
+                            for l in &log[range] {
+                                // One line each, so the rows stay even; the whole line shows on hover.
+                                ui.add(egui::Label::new(RichText::new(l).monospace().size(size).color(theme::sidebar_text())).truncate())
+                                    .on_hover_text(l);
+                            }
+                        },
+                    );
                 });
             if size != self.saved.log_text_size {
                 self.saved.log_text_size = size;

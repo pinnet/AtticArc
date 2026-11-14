@@ -81,6 +81,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let app = App::new(source_dir);
+            theme::set_accent(&cc.egui_ctx, &app.saved.accent);
+            theme::set_background(&cc.egui_ctx, &app.saved.background);
             theme::set_dark(&cc.egui_ctx, app.saved.dark_mode);
             Ok(Box::new(app))
         }),
@@ -134,6 +136,8 @@ pub struct App {
     last_display: Option<(Option<f32>, Option<egui::Vec2>)>,
     /// The size to go back to after a nudge, the frame after.
     unnudge: Option<egui::Vec2>,
+    /// The Settings window is open.
+    settings_open: bool,
 }
 
 impl App {
@@ -165,6 +169,7 @@ impl App {
             cleanup: cleanup::State::default(),
             last_display: None,
             unnudge: None,
+            settings_open: false,
         };
         app.reload();
         app
@@ -270,39 +275,112 @@ impl App {
             self.nav_button(ui, s);
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let mut compat = self.saved.compatible_graphics;
-            let tip = "Draw with OpenGL instead of the default. Try it if the window freezes or draws at the wrong size \
-                       after a display sleeps and wakes. Takes effect when AtticARC next starts.";
-            if ui
-                .checkbox(&mut compat, RichText::new("Compatible graphics").size(12.5).color(theme::sidebar_text()))
-                .on_hover_text(tip)
-                .changed()
-            {
-                self.saved.compatible_graphics = compat;
-                settings::store(&self.saved);
-            }
-            let refresh = egui::Button::new(RichText::new("Refresh window (F5)").size(13.0).color(theme::sidebar_text()))
-                .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
-                .corner_radius(CornerRadius::same(6))
-                .min_size(egui::vec2(ui.available_width(), 32.0));
-            if ui.add(refresh).on_hover_text("Redraws the window at the right size, if it looks wrong after a display wakes").clicked() {
-                self.heal_window(&ui.ctx().clone(), true);
-            }
-            ui.add_space(6.0);
-            let dark = self.saved.dark_mode;
-            let label = if dark { "Light mode" } else { "Dark mode" };
-            let button = egui::Button::new(RichText::new(label).size(15.0).color(theme::sidebar_text()))
-                .fill(Color32::TRANSPARENT)
+            let on = self.settings_open;
+            let button = egui::Button::new(RichText::new("⚙  Settings").size(15.0).color(if on { Color32::WHITE } else { theme::sidebar_text() }))
+                .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
                 .stroke(Stroke::new(1.0, theme::sidebar_text().gamma_multiply(0.4)))
                 .corner_radius(CornerRadius::same(6))
                 .min_size(egui::vec2(ui.available_width(), 40.0));
-            if ui.add(button).on_hover_text("Switch between light and dark colours").clicked() {
-                self.saved.dark_mode = !dark;
-                theme::set_dark(ui.ctx(), !dark);
-                settings::store(&self.saved);
+            if ui.add(button).on_hover_text("Light or dark, colour, graphics and the log file").clicked() {
+                self.settings_open = !on;
             }
         });
+    }
+
+    /// The Settings window: how AtticARC looks and draws, and its log file.
+    /// Each change is saved as it is made.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut refresh = false;
+        egui::Window::new(RichText::new("Settings").strong())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(214.0, -18.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::card())
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(caption("Appearance"));
+                ui.horizontal(|ui| {
+                    row_label(ui, "Mode");
+                    let mut dark = self.saved.dark_mode;
+                    ui.selectable_value(&mut dark, false, "Light");
+                    ui.selectable_value(&mut dark, true, "Dark");
+                    if dark != self.saved.dark_mode {
+                        self.saved.dark_mode = dark;
+                        theme::set_dark(ui.ctx(), dark);
+                        settings::store(&self.saved);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    row_label(ui, "Colour");
+                    let now = theme::accent_index(&self.saved.accent);
+                    for (i, a) in theme::ACCENTS.iter().enumerate() {
+                        if theme::swatch(ui, a.swatch_colour(), a.name, i == now).clicked() && i != now {
+                            self.saved.accent = a.name.to_string();
+                            theme::set_accent(ui.ctx(), a.name);
+                            settings::store(&self.saved);
+                        }
+                    }
+                    ui.label(RichText::new(theme::ACCENTS[now].name).color(theme::muted()));
+                });
+                ui.horizontal(|ui| {
+                    row_label(ui, "Background");
+                    let now = theme::background_index(&self.saved.background);
+                    for (i, b) in theme::BACKGROUNDS.iter().enumerate() {
+                        if theme::swatch(ui, b.swatch_colour(), b.name, i == now).clicked() && i != now {
+                            self.saved.background = b.name.to_string();
+                            theme::set_background(ui.ctx(), b.name);
+                            settings::store(&self.saved);
+                        }
+                    }
+                    ui.label(RichText::new(theme::BACKGROUNDS[now].name).color(theme::muted()));
+                });
+                ui.add_space(10.0);
+                ui.label(caption("Display"));
+                let mut compat = self.saved.compatible_graphics;
+                let tip = "Draw with OpenGL instead of the default. Try it if the window freezes or draws at the wrong size \
+                           after a display sleeps and wakes. Takes effect when AtticARC next starts.";
+                if ui.checkbox(&mut compat, "Compatible graphics (from the next start)").on_hover_text(tip).changed() {
+                    self.saved.compatible_graphics = compat;
+                    settings::store(&self.saved);
+                }
+                if ui.button("Refresh window (F5)").on_hover_text("Redraws the window at the right size, if it looks wrong after a display wakes").clicked() {
+                    refresh = true;
+                }
+                ui.add_space(10.0);
+                ui.label(caption("Log"));
+                let mut detailed = self.saved.detailed_log;
+                if ui
+                    .checkbox(&mut detailed, "Detailed: every file in the Progress log")
+                    .on_hover_text("Lists each phase and every file as it is hashed, compressed and verified.")
+                    .changed()
+                {
+                    self.saved.detailed_log = detailed;
+                    settings::store(&self.saved);
+                    if let Some(b) = &self.jobs.batch {
+                        b.progress.detailed.store(detailed, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if ui.button("Open the log file").on_hover_text(log_file::path().display().to_string()).clicked() {
+                    log_file::open();
+                }
+            });
+        if !open {
+            self.settings_open = false;
+        }
+        if refresh {
+            self.heal_window(ctx, true);
+        }
     }
 }
 
@@ -344,6 +422,7 @@ impl eframe::App for App {
                 Screen::Excluded => self.excluded(ui),
                 Screen::Cleanup => self.cleanup(ui),
             });
+        self.settings_window(&ctx);
         let settings = self.settings();
         self.jobs.dialogs(&ctx, &settings);
         if self.jobs.needs_repaint() || self.catalogue.busy() || self.excluded.busy() || self.duplicates.busy() || self.cleanup.busy() {
@@ -353,6 +432,15 @@ impl eframe::App for App {
 }
 
 // Shared drawing helpers.
+
+/// A label in a fixed-width cell, so the controls after it line up row by row.
+fn row_label(ui: &mut egui::Ui, text: &str) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(egui::vec2(92.0, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(92.0);
+        ui.label(text);
+    });
+}
 
 /// A white card with the mockups' border and radius.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
