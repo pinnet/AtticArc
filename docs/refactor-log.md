@@ -37,3 +37,19 @@ by Danny on WinX, and all three systems by CI once `docs/ci/check.yml` is moved 
 - **Not yet known:** whether the GUI builds on macOS and Linux as it stands. The first CI run
   will say; phase 3 is where it is made to.
 - Tests: unchanged, all passing (Linux).
+
+## Phase 2: the big files split
+
+- `archive.rs` (3,200 lines) is now `archive/`: `manifest`, `progress`, `walk`, `write`,
+  `again`, `dedupe`, `verify`, `extract`, `identity`, `rewrite`, `check`, `util`, with the tests
+  in `archive/tests.rs`. `archive/mod.rs` keeps the settings and re-exports everything, so every
+  `archive::…` path the CLI, GUI and tests use is unchanged.
+- `catalog.rs` is now `catalog/`: `schema` (where the catalogue is, its tables, added columns,
+  `connect`), `records` (what it holds and hands back) and `mod.rs` (the queries).
+- Moves only: a script compared every line before and after; the only differences are
+  visibility (`pub(super)` where modules now share a private item), each module's own `use`
+  lines, and rustfmt re-wrapping two lines. The same 52 public items in `archive`, and the same
+  in `catalog`.
+- Tests: unchanged, all passing (Linux). Clippy clean (core, CLI).
+- Soak: 5 minutes on the release CLI built from this phase (Linux, 0.3 GB of generated files);
+  result recorded under "Soak runs" below.
