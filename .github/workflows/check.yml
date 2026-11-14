@@ -32,6 +32,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # GitHub's Windows runner gives TEMP an 8.3 short name (C:\Users\RUNNER~1\...),
+      # which the tests' path comparisons don't expect; a desktop's temp folder
+      # rarely has one. The underlying spelling issue is in TODO.md, "Found during
+      # the refactor".
+      - name: Temp folder without short names (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "TMP=${{ runner.temp }}" >> $env:GITHUB_ENV
+          "TEMP=${{ runner.temp }}" >> $env:GITHUB_ENV
+
       - name: Desktop libraries (Linux)
         if: runner.os == 'Linux'
         run: |

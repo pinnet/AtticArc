@@ -280,6 +280,20 @@ stays free and open. Built in from the refactor onwards, so it isn't bolted on l
       included) add only optional fields it can safely ignore, never change what one means.
       `docs/formats.md` is the standard.
 
+## Found during the refactor
+
+Left as they were (the refactor changes no behaviour); each wants its own small fix and test.
+
+- [ ] **Paths written another way aren't recognised as the same** (found by the first CI run on
+      GitHub's Windows runner, 14 Nov 2026). Protected folders, source folders and archive paths
+      are compared as text after `canonicalize`, but a list entry typed with an 8.3 short name
+      (`C:\Users\RUNNER~1\...`), through a junction or a mapped drive isn't canonicalized first,
+      so it doesn't match the full spelling. The worst case: a protected folder entered as a
+      short name doesn't protect the folder. Fix: canonicalize every path from the settings and
+      the catalogue before comparing (falling back to the text for a path that isn't there), and
+      test with a short name on Windows. Until then, CI runs the tests with a temp folder that
+      has no short name.
+
 ## 3. Before calling it 1.0
 
 - [ ] Steps 1.1–1.8 done.

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Sample {
-    /// Physical memory in use (the working set on Windows, RSS on Linux).
+    /// Physical memory in use (the working set on Windows, RSS on macOS and Linux).
     pub resident: u64,
     /// Memory the process has committed for itself, which is what grows
     /// with a leak (private bytes on Windows, anonymous resident memory on Linux).
@@ -150,7 +150,44 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS has no /proc: `ps` (part of the system) gives memory and threads,
+/// `lsof` the open files. Slower than /proc, but sampled every few seconds.
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::Sample;
+    use std::process::Command;
+
+    fn run(cmd: &str, args: &[&str]) -> Option<String> {
+        let out = Command::new(cmd).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    pub fn sample(pid: Option<u32>) -> Option<Sample> {
+        let pid = pid.unwrap_or_else(std::process::id).to_string();
+        let rss_kb: u64 = run("ps", &["-o", "rss=", "-p", &pid])?.trim().parse().ok()?;
+        // One line per thread, after a header.
+        let threads = run("ps", &["-M", "-p", &pid]).map(|t| t.lines().count().saturating_sub(1) as u64).unwrap_or(0);
+        let handles = run("lsof", &["-p", &pid, "-Ff"]).map(|t| t.lines().filter(|l| l.starts_with('f')).count() as u64).unwrap_or(0);
+        // macOS reports no separate private figure here: resident memory stands in for it.
+        Some(Sample { resident: rss_kb * 1024, private: rss_kb * 1024, handles, threads })
+    }
+
+    pub fn processes() -> Vec<(u32, String)> {
+        run("ps", &["-axo", "pid=,comm="])
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| {
+                        let (pid, path) = l.trim().split_once(' ')?;
+                        let name = path.trim().rsplit('/').next()?.to_string();
+                        Some((pid.parse().ok()?, name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
     use super::Sample;
 
