@@ -19,7 +19,10 @@ checksums), makes the VM *AtticARC Linux test* (4 processors, 8 GB of memory, a 
 Ubuntu with the default choices, then take a checkpoint called *Fresh Ubuntu* (Hyper-V Manager →
 right-click the VM → Checkpoint), so a clean machine is always one click away.
 
-Other folder or size: `-Folder E:\VMs`, `-MemoryBytes 12GB`, `-Processors 6`.
+Another Ubuntu, e.g. 26.04.1 (newer, and Wayland only, so a better test of the GUI): download it
+yourself and give it with `-Iso D:\Downloads\ubuntu-26.04.1-desktop-amd64.iso`; the download
+and checksum steps are skipped. Other folder or size: `-Folder E:\VMs`, `-MemoryBytes 12GB`,
+`-Processors 6`.
 
 ## Each time: build and test
 

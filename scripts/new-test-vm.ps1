@@ -16,11 +16,17 @@
   Nothing is deleted. Running it again reuses the downloaded image and refuses to replace a
   VM that is already there.
 
+.PARAMETER Iso
+  An Ubuntu desktop image you already have (any version, e.g. 26.04.1). Skips the download;
+  you check its checksum yourself.
+    powershell -ExecutionPolicy Bypass -File scripts\new-test-vm.ps1 -Iso D:\Downloads\ubuntu-26.04.1-desktop-amd64.iso
+
 .PARAMETER Folder
   Where the image and the VM's disk go. D:\Dev\VMs by default (inside D:\Dev, but outside
   any repository; about 15 GB once Ubuntu is installed).
 #>
 param(
+  [string]$Iso = "",
   [string]$Name = "AtticARC Linux test",
   [string]$Folder = "D:\Dev\VMs",
   [int]$Processors = 4,
@@ -48,35 +54,43 @@ $switch = Get-VMSwitch -Name "Default Switch" -ErrorAction SilentlyContinue
 if (-not $switch) { Stop-With "Hyper-V's 'Default Switch' (the network) isn't there; make one in Hyper-V Manager → Virtual Switch Manager." }
 Ok "network: Default Switch"
 
-Say "2. The Ubuntu 24.04 Desktop image"
-$isoDir = Join-Path $Folder "iso"
-New-Item -ItemType Directory -Force $isoDir | Out-Null
-$base = "https://releases.ubuntu.com/noble"
-$list = (Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS").Content
-if ($list -is [byte[]]) { $list = [Text.Encoding]::ASCII.GetString($list) }
-# Newest first: 24.04.5.1 before 24.04.5 before 24.04.4.
-$sums = $list -split "`n" |
-  Where-Object { $_ -match '^([0-9a-f]{64}) \*?(ubuntu-[0-9.]+-desktop-amd64\.iso)\s*$' } |
-  ForEach-Object {
-    $parts = (($Matches[2] -replace '^ubuntu-|-desktop-amd64\.iso$', '').Split('.') + @('0', '0', '0'))[0..3]
-    [pscustomobject]@{ Hash = $Matches[1]; File = $Matches[2]; Version = [version]($parts -join '.') }
-  } |
-  Sort-Object Version -Descending
-if (-not $sums) { Stop-With "couldn't read the image list at $base/SHA256SUMS" }
-$image = $sums[0]
-$iso = Join-Path $isoDir $image.File
-if (Test-Path $iso) {
-  Ok "already downloaded: $($image.File)"
+if ($Iso) {
+  Say "2. The Ubuntu image"
+  if (-not (Test-Path -LiteralPath $Iso -PathType Leaf)) { Stop-With "$Iso isn't there (a path with spaces needs quotes)" }
+  if ($Iso -notmatch '\.iso$') { Stop-With "$Iso isn't an .iso" }
+  $isoPath = (Resolve-Path -LiteralPath $Iso).Path
+  Ok "using $isoPath (check its checksum against Ubuntu's SHA256SUMS yourself)"
 } else {
-  Write-Host "  Downloading $($image.File) (about 6 GB) to $isoDir ..."
-  Start-BitsTransfer -Source "$base/$($image.File)" -Destination $iso -DisplayName "Ubuntu image"
+  Say "2. The Ubuntu 24.04 Desktop image"
+  $isoDir = Join-Path $Folder "iso"
+  New-Item -ItemType Directory -Force $isoDir | Out-Null
+  $base = "https://releases.ubuntu.com/noble"
+  $list = (Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS").Content
+  if ($list -is [byte[]]) { $list = [Text.Encoding]::ASCII.GetString($list) }
+  # Newest first: 24.04.5.1 before 24.04.5 before 24.04.4.
+  $sums = $list -split "`n" |
+    Where-Object { $_ -match '^([0-9a-f]{64}) \*?(ubuntu-[0-9.]+-desktop-amd64\.iso)\s*$' } |
+    ForEach-Object {
+      $parts = (($Matches[2] -replace '^ubuntu-|-desktop-amd64\.iso$', '').Split('.') + @('0', '0', '0'))[0..3]
+      [pscustomobject]@{ Hash = $Matches[1]; File = $Matches[2]; Version = [version]($parts -join '.') }
+    } |
+    Sort-Object Version -Descending
+  if (-not $sums) { Stop-With "couldn't read the image list at $base/SHA256SUMS" }
+  $image = $sums[0]
+  $isoPath = Join-Path $isoDir $image.File
+  if (Test-Path $isoPath) {
+    Ok "already downloaded: $($image.File)"
+  } else {
+    Write-Host "  Downloading $($image.File) (about 6 GB) to $isoDir ..."
+    Start-BitsTransfer -Source "$base/$($image.File)" -Destination $isoPath -DisplayName "Ubuntu image"
+  }
+  Write-Host "  Checking it against Ubuntu's checksum ..."
+  $got = (Get-FileHash -Algorithm SHA256 $isoPath).Hash.ToLower()
+  if ($got -ne $image.Hash) {
+    Stop-With "$($image.File) doesn't match Ubuntu's checksum (a broken download). Delete it and run this again."
+  }
+  Ok "$($image.File) is intact"
 }
-Write-Host "  Checking it against Ubuntu's checksum ..."
-$got = (Get-FileHash -Algorithm SHA256 $iso).Hash.ToLower()
-if ($got -ne $image.Hash) {
-  Stop-With "$($image.File) doesn't match Ubuntu's checksum (a broken download). Delete it and run this again."
-}
-Ok "$($image.File) is intact"
 
 Say "3. The VM"
 $vmDir = Join-Path $Folder "vms"
@@ -88,7 +102,7 @@ Set-VMProcessor -VM $vm -Count $Processors
 Set-VMMemory -VM $vm -DynamicMemoryEnabled $true -MinimumBytes 2GB -StartupBytes $MemoryBytes -MaximumBytes ([math]::Max($MemoryBytes, 12GB))
 # Linux needs the Microsoft UEFI CA template, not the Windows one, to boot with Secure Boot on.
 Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority"
-$dvd = Add-VMDvdDrive -VM $vm -Path $iso -Passthru
+$dvd = Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru
 Set-VMFirmware -VM $vm -FirstBootDevice $dvd
 # Checkpoints by hand only (one after Ubuntu is installed is worth keeping).
 Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Standard
