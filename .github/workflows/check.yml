@@ -1,8 +1,6 @@
 # Checks every pull request and every push to main on Windows, macOS and Linux:
 # formatting, clippy and the whole test suite. The three must stay identical
 # (docs/refactor-brief.md, "The outcome"), so a failure on any one fails the run.
-#
-# Move this file to .github/workflows/check.yml.
 name: Check
 
 on:

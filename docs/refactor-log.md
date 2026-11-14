@@ -80,6 +80,15 @@ by Danny on WinX, and all three systems by CI once `docs/ci/check.yml` is moved 
   compiled (no Windows or macOS toolchain in the workspace). The Windows file is the old code
   moved, function by function; the macOS file is eight lines over `unix.rs`. WinX and CI will say.
 
+## Workflows on GitHub (14 Nov 2026, evening)
+
+- `docs/ci/check.yml` moved to `.github/workflows/check.yml` (as the handover asked).
+- `.github/workflows/mac-signed.yml`, `packaging/macos/Info.plist`,
+  `packaging/macos/set-secrets.sh` and `docs/mac-signing.md`: the signed, notarised
+  `AtticARC.app` in a `.dmg`, the same workflow as Plugin²'s with AtticARC's names. This is the
+  macOS part of phase 11, done early; the Windows and Linux release builds are still phase 11.
+- Branch pushed and a draft pull request opened, so `check.yml` runs on all three systems.
+
 ## Soak runs
 
 | Phase | Where | Run | Result |
