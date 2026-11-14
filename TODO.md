@@ -251,6 +251,35 @@ means the same on another.
   - Open question: an *updated* folder (sharing files with the last version) as a new version with
     the shared files stored once as references to the older archive.
 
+### AtticARC as Plugin²'s safety net (agreed 14 Nov 2026)
+
+Plugin² (pinnet/plugin-squared) will use `atticarc-core` as a library to archive every plugin
+folder before it changes anything, prove the archive good, and put everything back on request:
+"back to square one" for musicians who just want it to work. Both are MIT; the shared engine
+stays free and open. Built in from the refactor onwards, so it isn't bolted on later.
+
+- [ ] **Restore a whole folder** from its archive: `archive::restore_folder(archive, dest, sink)`,
+      `atticarc-cli restore <archive> <dest>`, and a button in the Catalogue.
+  - Unpacks into a temporary folder beside `dest`, checks every file against the manifest's
+    hashes, then swaps it in; what was at `dest` is moved aside, not deleted, until the swap
+    has worked.
+  - Puts back times, set-aside files (inside or beside the archive), and stored-once copies
+    (`.atticarcdep` references, in the same archive or another).
+  - A cancelled or failed restore leaves `dest` exactly as it was.
+- [ ] **What changed**: `archive::what_changed(folder, archive) -> Changes { added, removed,
+      changed }`, quick by snapshot, exact by hash on request. For Plugin²'s "3 plugins changed
+      since Tuesday", and useful in AtticARC's Clean up as the reason a check failed.
+- [ ] **Folders that need admin rights** to write (macOS `/Library/Audio/Plug-Ins`, Windows
+      `C:\Program Files\Common Files\VST3`): `platform` asks the system for rights just for the
+      restore step (a small privileged helper), never runs the whole app elevated.
+- [ ] **A library others build on**: `atticarc-core`'s public API documented with examples, kept
+      stable with semantic versioning from 1.0, and a Plugin²-shaped example
+      (`examples/safety_net.rs`: archive several folders, what changed, restore).
+- [ ] **A format version** in every manifest (`format: 1`), so a reader can say "made by a newer
+      AtticARC" instead of guessing. The open version is the reference: other builds (paid ones
+      included) add only optional fields it can safely ignore, never change what one means.
+      `docs/formats.md` is the standard.
+
 ## 3. Before calling it 1.0
 
 - [ ] Steps 1.1–1.8 done.
