@@ -32,16 +32,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # GitHub's Windows runner gives TEMP an 8.3 short name (C:\Users\RUNNER~1\...),
-      # which the tests' path comparisons don't expect; a desktop's temp folder
-      # rarely has one. The underlying spelling issue is in TODO.md, "Found during
-      # the refactor".
-      - name: Temp folder without short names (Windows)
+      # The runners' temp folders are spelt two ways: Windows gives an 8.3 short
+      # name (C:\Users\RUNNER~1\...), macOS a path behind a link (/var is
+      # /private/var). The tests' path comparisons trip on that, and so would
+      # AtticARC (TODO.md, "Found during the refactor"). Until it is fixed, the
+      # tests use a temp folder with one spelling. On Windows it stays on C:,
+      # whose change journal is on; the runner's D: has it off, which shows a
+      # second issue (same section of TODO.md).
+      - name: Temp folder with one spelling (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "TMP=${{ runner.temp }}" >> $env:GITHUB_ENV
-          "TEMP=${{ runner.temp }}" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force C:\atticarc-tmp | Out-Null
+          "TMP=C:\atticarc-tmp" >> $env:GITHUB_ENV
+          "TEMP=C:\atticarc-tmp" >> $env:GITHUB_ENV
+
+      - name: Temp folder with one spelling (macOS)
+        if: runner.os == 'macOS'
+        run: echo "TMPDIR=${{ runner.temp }}/" >> "$GITHUB_ENV"
 
       - name: Desktop libraries (Linux)
         if: runner.os == 'Linux'

@@ -291,8 +291,19 @@ Left as they were (the refactor changes no behaviour); each wants its own small 
       so it doesn't match the full spelling. The worst case: a protected folder entered as a
       short name doesn't protect the folder. Fix: canonicalize every path from the settings and
       the catalogue before comparing (falling back to the text for a path that isn't there), and
-      test with a short name on Windows. Until then, CI runs the tests with a temp folder that
-      has no short name.
+      test with a short name on Windows. macOS has the same through links: its temp folder
+      `/var/folders/...` is really `/private/var/folders/...`, and the same four tests fail
+      there. Until it is fixed, CI runs the tests with a temp folder that has one spelling.
+- [ ] **A drive with its change journal switched off still looks protected** (found by the same
+      CI run, on the runner's D: drive; 14 Nov 2026). There `FSCTL_READ_FILE_USN_DATA` still
+      answers, but with a change number that never moves (very likely 0), so `journal::file_usn`
+      returns a number, the folder snapshot is marked `usn:`, and the check is saved at archive
+      time as if any write would be caught. An edit that keeps a file's size and puts its time
+      back would then go unnoticed before a delete. **Fix first after the refactor's phase 3:**
+      ask the volume whether its journal is active (`FSCTL_QUERY_USN_JOURNAL`) once per
+      snapshot, and treat a missing or inactive journal as none (`meta:` snapshot, full check
+      needed). Test on a drive with the journal off (`fsutil usn deletejournal /d D:` on a
+      scratch drive, or the CI runner's D:).
 
 ## 3. Before calling it 1.0
 
