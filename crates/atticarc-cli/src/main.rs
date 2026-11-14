@@ -27,17 +27,27 @@ Usage:
   atticarc-cli archive <folder>...       Archive each folder to its own .7z and verify it,
                                   using the settings saved by the GUI.
         [--out DIR] [--level 5|9]  Override the output folder or level.
+        [--identical-once | --every-copy]
+                                  Store identical files (64 KiB or more) inside a folder once,
+                                  later copies as small .atticarcdep reference files; or keep
+                                  every copy. Overrides the GUI's setting.
   atticarc-cli search <words> [--out DIR] Search the catalogue in the output folder.
   atticarc-cli rebuild [--out DIR]       Add the archives in the output folder that the
                                   catalogue is missing, from their manifests.
   atticarc-cli cleanup <destination>     List archived folders still on disk and their checks.
-        [--check]                  Check each one not yet passed: every file against the
-                                  catalogue and hashed, the archive decoded. Deletes nothing.
-                                  Each result is saved as it finishes, so it can be stopped
-                                  (Ctrl+C) and carried on later, here or in the GUI.
-        [--recheck]                Check every one again, passed or not.
-        [--delete] [--yes]         Delete the ones that passed, each only if unchanged since
-                                  its check. Asks first unless --yes.
+                                  Folders archived on NTFS are checked when archived.
+        [--check]                  Full check of each one not yet passed: every file against
+                                  the catalogue and hashed, the archive decoded. Deletes
+                                  nothing. Each result is saved as it finishes, so it can be
+                                  stopped (Ctrl+C) and carried on later, here or in the GUI.
+        [--recheck]                Full check of every one again, passed or not.
+        [--scrub]                  Decode again every archive last decoded over 30 days ago,
+                                  to catch damage (reads only the archives).
+        [--scrub-all]              Decode every archive again.
+        [--delete] [--yes]         Delete the ones that passed, each only if it and its
+                                  archive are unchanged since its check (seconds; an archive
+                                  not decoded for 30 days is decoded first). Asks first
+                                  unless --yes.
   atticarc-cli soak --work DIR           Robustness test: archive, check, put back, de-duplicate
         [--hours H | --minutes M]  and rebuild in a loop (default 60 minutes), logging
         [--rounds N] [--gb G]      memory, handles and threads to a CSV in DIR. Uses G GB
@@ -259,14 +269,17 @@ struct ArchiveArgs {
     folders: Vec<PathBuf>,
     out: Option<PathBuf>,
     level: Option<u32>,
+    identical_once: Option<bool>,
 }
 
 fn parse_archive(args: &[String]) -> Result<ArchiveArgs, String> {
-    let mut a = ArchiveArgs { folders: Vec::new(), out: None, level: None };
+    let mut a = ArchiveArgs { folders: Vec::new(), out: None, level: None, identical_once: None };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--out" => a.out = Some(PathBuf::from(it.next().ok_or("--out needs a folder")?)),
+            "--identical-once" => a.identical_once = Some(true),
+            "--every-copy" => a.identical_once = Some(false),
             "--level" => {
                 let n = it.next().ok_or("--level needs 5 or 9")?;
                 match n.as_str() {
@@ -306,6 +319,9 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
         if let Some(level) = a.level {
             s.level = level;
         }
+        if let Some(once) = a.identical_once {
+            s.identical_once = once;
+        }
         println!("Archiving {} to {} ({}, {} threads)", folder.display(), s.out_dir.display(), s.engine_label(), s.threads);
         let started = std::time::Instant::now();
         match archive::archive_folder(folder, &s, &Arc::new(Progress::default())) {
@@ -328,6 +344,10 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 }
                 if !o.excluded.discarded.is_empty() {
                     println!("  discarded: {}", names(&o.excluded.discarded));
+                }
+                if !o.excluded.deps.is_empty() {
+                    let bytes: u64 = o.excluded.deps.iter().map(|d| d.entry.size).sum();
+                    println!("  stored once: {} identical copies ({}) kept as reference files", o.excluded.deps.len(), human(bytes));
                 }
             }
             Err(e) => {
@@ -456,7 +476,10 @@ fn run_cleanup(args: &[String]) -> ExitCode {
         eprintln!("cleanup needs the destination folder (where the archives and catalogue are)\n\n{USAGE}");
         return ExitCode::from(2);
     };
-    if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !["--check", "--recheck", "--delete", "--yes"].contains(&a.as_str())) {
+    if let Some(bad) = args
+        .iter()
+        .find(|a| a.starts_with("--") && !["--check", "--recheck", "--delete", "--yes", "--scrub", "--scrub-all"].contains(&a.as_str()))
+    {
         eprintln!("Unknown option '{bad}'\n\n{USAGE}");
         return ExitCode::from(2);
     }
@@ -467,7 +490,7 @@ fn run_cleanup(args: &[String]) -> ExitCode {
         s.out_dir = dest.clone();
         s
     };
-    let load = || cleanup::candidates(&dest, &Default::default());
+    let load = || cleanup::candidates(&dest, &Default::default(), &saved.protected);
     let (mut items, missing) = match load() {
         Ok(x) => x,
         Err(e) => {
@@ -476,14 +499,21 @@ fn run_cleanup(args: &[String]) -> ExitCode {
         }
     };
     let status = |c: &cleanup::Candidate| match &c.check {
+        _ if c.protected => "protected (never deleted)".to_string(),
         Some(k) if k.passed => {
             let journal = if c.journal_checked() { ", change journal" } else { "" };
-            format!("passed {}{journal}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
+            let decode = if c.needs_decode() { ", archive decoded again before deleting" } else { "" };
+            format!("passed {}{journal}{decode}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
         }
         Some(k) => format!("FAILED: {}", k.detail.lines().next().unwrap_or("")),
         None => "not checked".to_string(),
     };
-    println!("{} archived folders still on disk:", items.len());
+    let protected = items.iter().filter(|c| c.protected).count();
+    if protected > 0 {
+        println!("{} archived folders still on disk ({protected} protected):", items.len());
+    } else {
+        println!("{} archived folders still on disk:", items.len());
+    }
     for c in &items {
         println!("  {:<60} {:>10}  {}", c.source.display(), human(c.bytes), status(c));
     }
@@ -492,8 +522,49 @@ fn run_cleanup(args: &[String]) -> ExitCode {
     }
     let mut failed = 0;
 
+    if flag("--scrub") || flag("--scrub-all") {
+        let todo = match cleanup::scrub_list(&dest, !flag("--scrub-all")) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Can't read the catalogue in {}: {e:#}", dest.display());
+                return ExitCode::from(1);
+            }
+        };
+        println!();
+        if todo.is_empty() {
+            println!("No archive is due a scrub (all decoded within {} days).", cleanup::DECODE_AGE_DAYS);
+        }
+        let mut s = saved.settings_for(&dest);
+        s.out_dir = dest.clone();
+        for (n, item) in todo.iter().enumerate() {
+            let progress = Arc::new(Progress::default());
+            let done = Arc::new(AtomicBool::new(false));
+            let ticker = {
+                let (p, d, name) = (progress.clone(), done.clone(), item.name.clone());
+                let (n, total) = (n + 1, todo.len());
+                std::thread::spawn(move || {
+                    while !d.load(Ordering::Relaxed) {
+                        eprint!("\r  Decoding {n} of {total}: {name} — {:.0}%   ", p.fraction() * 100.0);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                })
+            };
+            let result = cleanup::scrub_one(item, &s, &progress);
+            done.store(true, Ordering::Relaxed);
+            let _ = ticker.join();
+            eprint!("\r{:100}\r", "");
+            match result {
+                Ok(()) => println!("  decoded OK  {} ({})", item.name, human(item.archive_bytes)),
+                Err(e) => {
+                    failed += 1;
+                    println!("  DAMAGED     {}: {e:#}", item.name);
+                }
+            }
+        }
+    }
+
     if check || recheck {
-        let todo: Vec<_> = items.iter().filter(|c| recheck || !c.passed()).cloned().collect();
+        let todo: Vec<_> = items.iter().filter(|c| !c.protected && (recheck || !c.passed())).cloned().collect();
         println!();
         for (n, c) in todo.iter().enumerate() {
             let progress = Arc::new(Progress::default());
@@ -529,7 +600,7 @@ fn run_cleanup(args: &[String]) -> ExitCode {
     }
 
     if delete {
-        let ready: Vec<_> = items.iter().filter(|c| c.passed()).cloned().collect();
+        let ready: Vec<_> = items.iter().filter(|c| !c.protected && c.passed()).cloned().collect();
         println!();
         if ready.is_empty() {
             println!("Nothing to delete: no folder has passed a check. Run with --check first.");

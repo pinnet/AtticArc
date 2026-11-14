@@ -4,6 +4,40 @@ AtticARC uses [Semantic Versioning](https://semver.org). Until 1.0, the formats 
 (the archive layout and its manifest, the catalogue database, `.atticarcdep` reference files) may
 still change; 1.0 will mark them stable.
 
+## Unreleased
+
+### Clean up: seconds, not hours
+- A folder's check is now done when it is archived: every file is hashed as it is compressed and the
+  archive decoded against those hashes, and if the folder's NTFS change-journal snapshot is the same
+  before and after, a passed check is saved then. Such folders can be deleted straight away.
+- Before each delete: the folder's snapshot, the archive's size and modified time, and the archive's
+  header (every recorded file listed, same size). Seconds, instead of hashing the folder and decoding
+  the archive again (on a USB HDD, per 4 TB: about 59 hours with both on one disk).
+- An archive last decoded more than 30 days ago is decoded again before its folder is deleted.
+- **Check archives for damage** (`atticarc-cli cleanup --scrub` / `--scrub-all`): decodes archives
+  again to catch damage since they were made, reading only the archives. Each archive's last decode is
+  recorded.
+- The full check (**1. Check**) stays for folders without a check: archived before this, on drives
+  without a change journal (exFAT), or changed while archiving.
+- Folders in the protected list show as **protected · never deleted** (a lock, no tick box; the
+  command-line tool says "protected"), instead of as a failed check, and are never checked.
+- Policy from measurements: sevenz-bench `verify` and `faults` (D:\Dev\WIP\sevenz-bench).
+
+### Same name, different content
+- A folder whose archive name is taken (a folder with the same name archived before, or the same
+  folder archived again) gets `Name (2).7z`, `Name (3).7z`… and a catalogue entry of its own, instead
+  of a time-stamped name.
+
+### Duplicates: show only, and stored once within a folder
+- Copies inside archives are listed with the space they take, never removed: **Replace duplicates…**
+  is switched off, since each archive rewrite took hours.
+- **Store identical files in a folder once** (New job, off by default; `atticarc-cli archive
+  --identical-once` / `--every-copy`): when a folder is archived, files of 64 KiB or more with the
+  same size and BLAKE3 hash are compressed once, and each later copy goes into the same archive as a
+  small `.atticarcdep` reference file to the first. Only files sharing a size are read beforehand.
+  The folder on disk isn't changed, and its check before a delete still compares every copy with its
+  hash. The Catalogue's **Extract the original to…** and **Put back** bring a copy back.
+
 ## 0.9.0 (2026-11-11): first MVP
 
 Archives folders to verified 7-Zip archives with a searchable catalogue, finds and replaces

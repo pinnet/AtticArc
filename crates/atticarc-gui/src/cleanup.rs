@@ -43,6 +43,8 @@ struct Outcome {
 enum Pass {
     Check,
     Delete,
+    /// Decoding archives again to catch damage (reads only the archives).
+    Scrub,
 }
 
 struct Running {
@@ -60,6 +62,10 @@ enum Msg {
     Log(String),
     Checked(SavedCheck),
     Deleted(i64, Outcome),
+    /// How many archives a scrub will decode, once it has listed them.
+    Total(usize),
+    /// One archive decoded again: its name and what was found.
+    Scrubbed(String, Result<(), String>),
     Done,
 }
 
@@ -98,6 +104,8 @@ pub struct State {
     show_log: bool,
     /// Set when folders were deleted, so other pages reload.
     pub changed: bool,
+    /// Archives a scrub found damaged this session: name and what was wrong.
+    damaged: Vec<(String, String)>,
 }
 
 impl State {
@@ -111,8 +119,9 @@ impl State {
         self.running.is_some() || self.loading.is_some() || self.searching.is_some()
     }
 
+    /// Ticked folders; a protected folder can't be ticked, and doesn't count if it was.
     fn ticked_items(&self) -> Vec<Candidate> {
-        self.items.iter().filter(|i| self.ticked.contains(&i.archive_id)).cloned().collect()
+        self.items.iter().filter(|i| !i.protected && self.ticked.contains(&i.archive_id)).cloned().collect()
     }
 
     /// Ticked folders that passed their check, each with that check.
@@ -213,6 +222,54 @@ impl State {
         self.running = Some(run);
     }
 
+    /// Decodes archives again to catch damage: those last decoded more than
+    /// [`clean::DECODE_AGE_DAYS`] days ago, or with `all`, every one. Reads
+    /// only the archives; each one's date is saved as it passes, so a stopped
+    /// run carries on where it left off.
+    fn start_scrub(&mut self, settings: archive::Settings, all: bool) {
+        let (tx, rx) = channel();
+        let run = Self::new_run(Pass::Scrub, 0, rx);
+        let (p, cur) = (run.progress.clone(), run.current.clone());
+        std::thread::spawn(move || {
+            let todo = match clean::scrub_list(&settings.out_dir, !all) {
+                Ok(t) => t,
+                Err(e) => {
+                    say(&tx, format!("Can't read the catalogue: {e:#}"));
+                    let _ = tx.send(Msg::Done);
+                    return;
+                }
+            };
+            let total = todo.len();
+            let _ = tx.send(Msg::Total(total));
+            if total == 0 {
+                say(&tx, format!("No archive is due: all decoded within {} days", clean::DECODE_AGE_DAYS));
+            } else {
+                say(&tx, format!("Decoding {} again (reads only the archives)", archives(total)));
+            }
+            for (n, item) in todo.into_iter().enumerate() {
+                if p.cancel.load(Ordering::Relaxed) {
+                    say(&tx, "Stopped, as asked".to_string());
+                    break;
+                }
+                *cur.lock().unwrap() = format!("{} ({} of {total})", item.name, n + 1);
+                say(&tx, format!("{} of {total}: {} ({})", n + 1, item.archive_path.display(), human(item.archive_bytes)));
+                let result = clean::scrub_one(&item, &settings, &p).map_err(|e| format!("{e:#}"));
+                if result.is_err() && p.cancel.load(Ordering::Relaxed) {
+                    say(&tx, "Stopped, as asked (that archive wasn't finished, so its date is unchanged)".to_string());
+                    break;
+                }
+                say(&tx, match &result {
+                    Ok(()) => "   ✓ decoded and matched".to_string(),
+                    Err(e) => format!("   ✗ DAMAGED: {e}"),
+                });
+                let _ = tx.send(Msg::Scrubbed(item.name.clone(), result));
+            }
+            say(&tx, "Archive check finished".to_string());
+            let _ = tx.send(Msg::Done);
+        });
+        self.running = Some(run);
+    }
+
     /// Looks, in the background, for the folders no longer where they were.
     fn start_search(&mut self, out: PathBuf) {
         let gone = self.gone.clone();
@@ -244,10 +301,10 @@ impl State {
 }
 
 /// Reads, in the background, the archived folders and their saved checks.
-fn load(out: PathBuf, renamed: BTreeMap<i64, PathBuf>) -> Receiver<Result<Loaded, String>> {
+fn load(out: PathBuf, renamed: BTreeMap<i64, PathBuf>, protected: Vec<PathBuf>) -> Receiver<Result<Loaded, String>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let res = clean::candidates(&out, &renamed).and_then(|(c, m)| Ok((c, m, clean::ticked(&out)?)));
+        let res = clean::candidates(&out, &renamed, &protected).and_then(|(c, m)| Ok((c, m, clean::ticked(&out)?)));
         let _ = tx.send(res.map_err(|e| format!("{e:#}")));
     });
     rx
@@ -292,6 +349,19 @@ impl App {
                         r.done += 1;
                     }
                 }
+                Msg::Total(n) => {
+                    if let Some(r) = &mut st.running {
+                        r.total = n;
+                    }
+                }
+                Msg::Scrubbed(name, result) => {
+                    if let Err(e) = result {
+                        st.damaged.push((name, e));
+                    }
+                    if let Some(r) = &mut st.running {
+                        r.done += 1;
+                    }
+                }
                 Msg::Deleted(id, o) => {
                     if o.result.is_ok() {
                         st.checks.remove(&id);
@@ -307,6 +377,10 @@ impl App {
         }
         if let Some(pass) = finished {
             st.running = None;
+            if pass == Pass::Scrub {
+                // Dates changed: the "decoded again before deleting" notes follow.
+                st.loaded = false;
+            }
             if pass == Pass::Delete {
                 if st.outcomes.iter().any(|o| o.result.is_ok()) {
                     st.changed = true;
@@ -329,7 +403,7 @@ impl App {
         if !st.loaded && st.loading.is_none() && st.running.is_none() {
             st.loaded = true;
             st.error = None;
-            st.loading = Some(load(out.clone(), st.renamed.clone()));
+            st.loading = Some(load(out.clone(), st.renamed.clone(), settings.protected.clone()));
         }
         if let Some(rx) = &st.loading
             && let Ok(res) = rx.try_recv()
@@ -339,7 +413,8 @@ impl App {
                 Ok((items, gone, saved_ticks)) => {
                     let ids: BTreeSet<i64> = items.iter().map(|i| i.archive_id).collect();
                     // The saved ticks are the record: they survive a restart.
-                    st.ticked = saved_ticks.into_iter().filter(|id| ids.contains(id)).collect();
+                    let protected: BTreeSet<i64> = items.iter().filter(|i| i.protected).map(|i| i.archive_id).collect();
+                    st.ticked = saved_ticks.into_iter().filter(|id| ids.contains(id) && !protected.contains(id)).collect();
                     st.saved_ticks = st.ticked.clone();
                     // The catalogue's saved checks are the record: they survive a restart.
                     st.checks = items.iter().filter_map(|i| i.check.clone().map(|c| (i.archive_id, c))).collect();
@@ -380,7 +455,9 @@ impl App {
             heading(
                 ui,
                 "Clean up",
-                "Archived folders still on disk. Tick the ones to delete, check them, then delete the ones that pass. Nothing is deleted until every ticked folder has been checked.",
+                "Archived folders still on disk. Folders archived on NTFS are checked as they are archived, so they can be deleted \
+                 straight away: just before each delete, AtticARC makes sure the folder and its archive haven't changed (seconds). \
+                 Others need step 1, the full check. Nothing is deleted without a passed check.",
             );
             ui.add_space(10.0);
             if let Some(e) = &st.error {
@@ -397,6 +474,7 @@ impl App {
                 ui.add_space(10.0);
             }
             gone(ui, st, &out, others_busy);
+            scrub_row(ui, st, &settings, others_busy);
 
             if st.items.is_empty() {
                 if st.loading.is_none() && st.error.is_none() {
@@ -416,7 +494,7 @@ impl App {
             let failed = ticked.iter().filter(|i| st.checks.get(&i.archive_id).is_some_and(|c| !c.passed)).count();
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Tick all")).clicked() {
-                    st.ticked = st.items.iter().map(|i| i.archive_id).collect();
+                    st.ticked = st.items.iter().filter(|i| !i.protected).map(|i| i.archive_id).collect();
                 }
                 if ui.add_enabled(idle, egui::Button::new("Untick all")).clicked() {
                     st.ticked.clear();
@@ -424,7 +502,12 @@ impl App {
                 if ui.add_enabled(st.running.is_none() && st.loading.is_none(), egui::Button::new("Refresh")).clicked() {
                     st.loaded = false;
                 }
-                ui.label(RichText::new(format!("{} of {} ticked · {}", ticked.len(), st.items.len(), human(ticked_bytes))).strong());
+                let protected = st.items.iter().filter(|i| i.protected).count();
+                ui.label(RichText::new(format!("{} of {} ticked · {}", ticked.len(), st.items.len() - protected, human(ticked_bytes))).strong());
+                if protected > 0 {
+                    ui.label(RichText::new(format!("· {protected} protected")).color(theme::muted()))
+                        .on_hover_text("Folders in the protected list (New job page) are never checked or deleted.");
+                }
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -487,12 +570,44 @@ impl App {
     }
 }
 
+/// Checking the archives themselves for damage, and what earlier runs found.
+fn scrub_row(ui: &mut egui::Ui, st: &mut State, settings: &archive::Settings, others_busy: bool) {
+    let idle = st.running.is_none() && st.searching.is_none() && !others_busy;
+    ui.horizontal(|ui| {
+        let tip = format!(
+            "Decodes again every archive last decoded more than {} days ago and checks each file against the catalogue, \
+             to catch damage since it was made (a bad sector, bit rot). Reads only the archives; can be stopped and carried on.",
+            clean::DECODE_AGE_DAYS
+        );
+        if ui.add_enabled(idle, egui::Button::new("Check archives for damage")).on_hover_text(tip).clicked() {
+            st.start_scrub(settings.clone(), false);
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new("…all of them"))
+            .on_hover_text("Decodes every archive again, however recently it was decoded")
+            .clicked()
+        {
+            st.start_scrub(settings.clone(), true);
+        }
+    });
+    if !st.damaged.is_empty() {
+        card(ui, |ui| {
+            ui.colored_label(theme::danger(), format!("{} damaged: keep the folders they came from.", archives(st.damaged.len())));
+            for (name, e) in &st.damaged {
+                ui.label(format!("{name}: {}", e.lines().next().unwrap_or("")));
+            }
+        });
+    }
+    ui.add_space(8.0);
+}
+
 /// The run in progress: which pass, which folder, and how far.
 fn running(ui: &mut egui::Ui, run: &Running, show_log: &mut bool) {
     card(ui, |ui| {
         let what = match run.pass {
             Pass::Check => "Checking (nothing is deleted)",
             Pass::Delete => "Deleting",
+            Pass::Scrub => "Checking archives for damage (reads only the archives)",
         };
         ui.horizontal(|ui| {
             ui.spinner();
@@ -507,10 +622,19 @@ fn running(ui: &mut egui::Ui, run: &Running, show_log: &mut bool) {
             egui::ProgressBar::new(run.done as f32 / run.total.max(1) as f32)
                 .desired_height(8.0)
                 .fill(theme::accent())
-                .text(format!("{} of {} folders", run.done, run.total)),
+                .text(if run.pass == Pass::Scrub {
+                    format!("{} of {}", run.done, archives(run.total))
+                } else {
+                    format!("{} of {} folders", run.done, run.total)
+                }),
         );
         let stopping = run.progress.cancel.load(Ordering::Relaxed);
-        let label = if stopping { "Stopping after this folder…" } else { "Stop after this folder" };
+        let label = match (stopping, run.pass == Pass::Scrub) {
+            (true, true) => "Stopping…",
+            (false, true) => "Stop",
+            (true, false) => "Stopping after this folder…",
+            (false, false) => "Stop after this folder",
+        };
         ui.horizontal(|ui| {
             if ui.add_enabled(!stopping, egui::Button::new(label)).clicked() {
                 run.progress.cancel.store(true, Ordering::Relaxed);
@@ -577,7 +701,8 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
     let groups = st.tree();
     card(ui, |ui| {
         for (parent, items) in groups {
-            let ids: Vec<i64> = items.iter().map(|i| i.archive_id).collect();
+            // A protected folder has no tick box, so the parent's box leaves it out.
+            let ids: Vec<i64> = items.iter().filter(|i| !i.protected).map(|i| i.archive_id).collect();
             let n_on = ids.iter().filter(|id| st.ticked.contains(id)).count();
             let open = !st.folded.contains(&parent);
             ui.horizontal(|ui| {
@@ -589,9 +714,9 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                         st.folded.remove(&parent);
                     }
                 }
-                let mut on = n_on == ids.len();
+                let mut on = !ids.is_empty() && n_on == ids.len();
                 let cb = egui::Checkbox::without_text(&mut on).indeterminate(n_on > 0 && n_on < ids.len());
-                if ui.add_enabled(idle, cb).on_hover_text("Tick or untick every folder in here").changed() {
+                if ui.add_enabled(idle && !ids.is_empty(), cb).on_hover_text("Tick or untick every folder in here").changed() {
                     for id in &ids {
                         if on {
                             st.ticked.insert(*id);
@@ -609,12 +734,18 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                     for i in &items {
                         ui.horizontal(|ui| {
                             ui.add_space(34.0);
-                            let mut on = st.ticked.contains(&i.archive_id);
-                            if ui.add_enabled(idle, egui::Checkbox::without_text(&mut on)).changed() {
-                                if on {
-                                    st.ticked.insert(i.archive_id);
-                                } else {
-                                    st.ticked.remove(&i.archive_id);
+                            if i.protected {
+                                // Same width as a tick box, so the names line up.
+                                ui.add_enabled(false, egui::Button::new("🔒").frame(false))
+                                    .on_disabled_hover_text("Protected: never checked or deleted. Change the list on the New job page.");
+                            } else {
+                                let mut on = st.ticked.contains(&i.archive_id);
+                                if ui.add_enabled(idle, egui::Checkbox::without_text(&mut on)).changed() {
+                                    if on {
+                                        st.ticked.insert(i.archive_id);
+                                    } else {
+                                        st.ticked.remove(&i.archive_id);
+                                    }
                                 }
                             }
                             ui.label(RichText::new(short(&i.source)).monospace()).on_hover_text(i.source.display().to_string());
@@ -626,6 +757,10 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                         ui.label(RichText::new(format!("→ {} · archived {}", i.archive_name(), i.archived)).color(theme::muted()))
                             .on_hover_text(i.archive_path.display().to_string());
                         match st.checks.get(&i.archive_id) {
+                            _ if i.protected => {
+                                ui.label(RichText::new("protected · never deleted").color(theme::muted()))
+                                    .on_hover_text("In one of the protected folders (New job → Protected folders). Take it off that list to check and delete it.");
+                            }
                             Some(c) if c.passed => {
                                 let mut t = format!("✓ passed {}", when(&c.checked_utc));
                                 if c.snapshot.as_deref().is_some_and(archive::snapshot_used_journal) {
@@ -775,6 +910,10 @@ fn log_window(ctx: &egui::Context, st: &mut State) {
 /// A folder's own name.
 fn short(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+fn archives(n: usize) -> String {
+    if n == 1 { "1 archive".to_string() } else { format!("{n} archives") }
 }
 
 fn folders(n: usize) -> String {

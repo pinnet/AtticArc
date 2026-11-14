@@ -11,6 +11,44 @@ before the next.
 - [ ] Attach the Windows programs, from `D:\Dev\WIP\AtticArc` after `cargo build --release`:
       `gh release upload v0.9.0 target\release\atticarc.exe target\release\atticarc-cli.exe`
 
+## 0.1 Fixes before more use (agreed Nov 2026)
+
+- [x] **Clean up: stop checking twice.** Today the check before deleting hashes the whole folder and
+      decodes the whole archive again, though both were done when archiving (one run: still going
+      ~18 hours later). Measured with sevenz-bench `verify` / `faults` (Nov 2026,
+      D:\Dev\WIP\sevenz-bench, verify_table.txt and faults_table.txt), USB HDD, per 4 TB:
+      fingerprint + index + change-journal snapshot: **seconds**; archive decode: 14.5 h;
+      folder re-hash: 14.8 h; today's full check (both on one disk): 59 h.
+      What each catches: the change-journal snapshot catches every folder change the full re-hash
+      does (even a byte changed with its timestamp put back), no false alarms; only decoding the
+      archive catches silent damage inside it (bit rot, a byte flipped with time put back).
+  - [x] At archive time: take the change-journal snapshot (before and after hashing, so the
+        hashes belong to an unchanging folder) and record the archive's size, modified time and
+        "decoded OK" date. The decode already happens at archive time.
+  - [x] Before deleting: archive fingerprint + archive index + folder snapshot. All match =
+        delete (seconds). Anything different = refuse, offer the full check.
+  - [x] Drop the folder re-hash from the delete check altogether: the snapshot covers it.
+  - [x] Archive scrub: decode archives again in the background (one disk at a time, cancellable,
+        resumable), recording the date. Before deleting, if the archive's last decode is older
+        than a setting (e.g. 30 days), scrub it first. Catches bit rot without making every delete
+        wait.
+  - [x] Volumes without a change journal (exFAT, FAT32, network): the metadata snapshot misses
+        "byte changed, time put back"; there, no archive-time check is saved, so the full check is
+        needed.
+  - [ ] The scrub age (30 days) as a setting.
+- [x] **Same name, different content.** A folder with the same name as an archived one but
+      different files is renamed with a number ("Name (2)", "Name (3)"…) and archived as its own
+      entry. Test: archive a folder, swap in different content under the same name, archive
+      again: it comes out as "Name (2)" and both archives are intact.
+- [x] **Duplicates: remove only within folders.** Removing a duplicate inside an archive means
+      rewriting the archive (five took about eight hours). Duplicates inside archives are only
+      listed, with the space they waste; never removed. Done as "Replace duplicates…" switched off.
+  - [x] Duplicates *within a folder*, at archive time: **Store identical files in a folder once**
+        (New job; `atticarc-cli archive --identical-once`). Files of 64 KiB or more with the same
+        size and BLAKE3 hash are archived once; later copies go in as `.atticarcdep` reference files
+        to the first, in the same archive. The folder on disk is untouched. Off by default.
+  - [ ] Try it on a real folder of songs on WinX, then decide whether it should be on by default.
+
 ## 0.5 Pin down the logic first (before refactoring)
 
 The logic was settled by testing on live data (PRs #1 to #25). Before restructuring anything,
@@ -84,7 +122,36 @@ documentation. No change in behaviour: the existing tests prove each step.
 - [ ] `docs/guide/`: a short page per screen (New job, Progress, Duplicates, Excluded, Clean up,
       Catalogue).
 
-## 1.8 Other operating systems (after the refactor)
+### 1.8 Plugin-based structure
+
+Goal: each section of the app is a plugin behind a small trait, so any part can be replaced
+later without touching the rest. First up, progress: one progress plugin used everywhere in the
+GUI. Do this alongside 1.3–1.5 (it absorbs the `Loader<T>` and "busy, repaint me" items).
+
+- **Three roles, kept apart:**
+  - *Contract*: a small, stable trait in `core`, e.g. `Progress { begin(task, total),
+    report(done, message), end(result) }`. Nothing else in the app knows a concrete type.
+  - *Producers*: archive, verify, hash, duplicate scan and clean up only emit through the trait.
+    They never know what is shown.
+  - *Views*: progress bar, ETA/throughput label, taskbar badge, log line, later an MCP status
+    feed. Each is its own implementation; several can listen to one task.
+- **Reuse:** the same view plugin appears wherever a job runs; each instance just subscribes to a
+  different task.
+- **One registry** wires plugins together at startup (config or simple registration). Plugins
+  never look each other up directly.
+- **Events over direct calls:** jobs push progress events onto a channel/bus, so the GUI can
+  attach and detach while a long background job keeps running (fits "leave it running").
+- **Small contracts:** keep each trait narrow so a replacement only implements a few methods.
+- **Seams only where change is likely** (don't make constants or core models pluggable):
+  - [ ] Progress / feedback (first, as the pattern for the rest).
+  - [ ] Archive backend: 7-Zip now; a Rust compression routine later.
+  - [ ] Metadata extractors: EXE version info, Macrium `.mrimg` reader (section 2).
+  - [ ] Storage / catalogue access.
+  - [ ] AI review over MCP (section 2) as a plugin on the same contracts.
+- [ ] Write the contracts and the registry into `docs/architecture.md` and `DESIGN.md`.
+- Every step must leave the section 0.5 tests passing.
+
+## 1.9 Other operating systems (after the refactor)
 
 The core is plain Rust and mostly portable; the Windows-only parts sit behind a small platform
 layer after the refactor, one implementation per system:
@@ -122,7 +189,7 @@ layer after the refactor, one implementation per system:
 
 ## 3. Before calling it 1.0
 
-- [ ] Steps 1.1–1.7 done.
+- [ ] Steps 1.1–1.8 done.
 - [ ] Use 0.9.x on real data for a while with no format changes needed.
 - [ ] Freeze the formats in `docs/formats.md`; from then on, a change that can't read older
       archives or catalogues is a 2.0.

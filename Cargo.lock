@@ -455,6 +455,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "walkdir",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -464,7 +465,9 @@ dependencies = [
  "anyhow",
  "atticarc-core",
  "eframe",
+ "log",
  "mimalloc",
+ "raw-window-handle",
  "rfd",
 ]
 
@@ -1033,6 +1036,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",

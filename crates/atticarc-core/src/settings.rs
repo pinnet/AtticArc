@@ -23,6 +23,8 @@ pub struct Saved {
     pub protected: Vec<PathBuf>,
     /// Files to leave out of archives.
     pub exclusions: Vec<Rule>,
+    /// Store identical files inside a folder once ([`Settings::identical_once`]).
+    pub identical_once: bool,
     /// GUI colour scheme.
     pub dark_mode: bool,
     /// Source folders used before, most recent first (at most [`RECENT_MAX`]).
@@ -95,6 +97,7 @@ impl Default for Saved {
             threads: Threads::All,
             protected: vec![r"C:\7ztest".into(), r"D:\7ztest".into(), r"W:\7ztest".into()],
             exclusions: exclude::default_rules(),
+            identical_once: false,
             dark_mode: false,
             recent_sources: Vec::new(),
             recent_dests: Vec::new(),
@@ -114,6 +117,7 @@ impl Saved {
             threads: self.threads.count(),
             protected: self.protected.clone(),
             exclusions: self.exclusions.clone(),
+            identical_once: self.identical_once,
         }
     }
 }

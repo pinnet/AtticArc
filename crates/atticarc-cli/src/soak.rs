@@ -212,6 +212,7 @@ fn soak(a: &SoakArgs) -> Result<bool> {
         store_mode: saved.store_mode,
         threads: saved.threads.count(),
         protected: saved.protected.clone(),
+        identical_once: saved.identical_once,
         exclusions: if synthetic {
             vec![
                 Rule { pattern: "*.tmp".into(), action: Action::SetAside, ..Rule::default() },
@@ -581,6 +582,7 @@ mod tests {
             store_mode: true,
             threads: 2,
             protected: vec![],
+            identical_once: false,
             exclusions: vec![
                 Rule { pattern: "*.tmp".into(), action: Action::SetAside, ..Rule::default() },
                 Rule { pattern: "*.lnk".into(), action: Action::Discard, ..Rule::default() },

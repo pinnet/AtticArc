@@ -149,6 +149,12 @@ impl App {
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
                     ui.checkbox(&mut self.saved.store_mode, "Store already-compressed files (zip, jpg, mp4…) without recompressing");
+                    ui.checkbox(&mut self.saved.identical_once, "Store identical files in a folder once").on_hover_text(
+                        "Files of 64 KiB or more with exactly the same content (same size and BLAKE3 hash) inside \
+                         the folder are archived once; each later copy goes in as a small .atticarcdep reference \
+                         file to the first. The folder on disk is not changed. The Catalogue's \"Extract the \
+                         original\" and \"Put back\" bring a copy back; 7-Zip on its own extracts the reference file.",
+                    );
                     ui.label(RichText::new("Every archive is decoded and checked against its hashes after writing.").color(theme::muted()));
                 });
             });
