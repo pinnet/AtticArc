@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use super::*;
+use crate::platform::hide;
 
 pub const CATALOG_FILE: &str = "catalog.db";
 
@@ -34,25 +35,6 @@ pub(super) fn make_data_dir(dir: &Path) -> Result<()> {
     hide(&data);
     Ok(())
 }
-
-/// Sets the Hidden attribute on Windows if it isn't set. Best effort: a
-/// folder that stays visible does no harm.
-#[cfg(windows)]
-pub(super) fn hide(path: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::process::CommandExt;
-    const HIDDEN: u32 = 0x2;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & HIDDEN != 0) {
-        return;
-    }
-    // attrib doesn't understand \\?\ paths.
-    let _ =
-        std::process::Command::new("attrib").arg("+h").arg(crate::settings::strip_verbatim(path)).creation_flags(CREATE_NO_WINDOW).status();
-}
-
-#[cfg(not(windows))]
-pub(super) fn hide(_path: &Path) {}
 
 /// Moves a catalogue from where earlier versions kept it, loose in the
 /// output folder, into `.atticarc`.

@@ -181,3 +181,49 @@ fn a_folder_that_does_not_fit_is_refused_before_anything_is_written() {
     // The worst case allowed for is the folder's size plus a little, never less.
     assert!(disk::archive_worst_case(1_000_000) > 1_000_000);
 }
+
+/// Where the system has change markers (NTFS, macOS, Linux), a folder
+/// snapshot catches an edit that keeps a file's size and puts its modified
+/// time back, which no timestamp comparison could.
+#[test]
+fn a_snapshot_catches_an_edit_with_the_same_size_and_the_time_put_back() {
+    use atticarc_core::platform;
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("Folder");
+    plain_tree(&src);
+    let before = archive::folder_snapshot(&src).unwrap();
+    assert_eq!(archive::folder_snapshot(&src).unwrap(), before, "taking a snapshot changes nothing");
+    if !archive::snapshot_used_journal(&before) {
+        eprintln!("no change markers on this drive: only sizes and times are compared here");
+        return;
+    }
+    assert!(before.starts_with(&format!("{}:", platform::CHANGE_MARKER)));
+    let f = src.join("sub/random.dat");
+    let modified = std::fs::metadata(&f).unwrap().modified().unwrap();
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[0] ^= 1;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    std::fs::write(&f, &bytes).unwrap();
+    platform::set_times(&f, Some(modified), None, false);
+    assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), modified);
+    assert_ne!(archive::folder_snapshot(&src).unwrap(), before);
+}
+
+/// On a drive with change markers, the check is saved as the folder is
+/// archived, so it can be deleted without a second read of everything.
+#[test]
+fn where_there_are_change_markers_a_folder_is_ready_to_delete_once_archived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out) = (tmp.path().join("Ready"), tmp.path().join("out"));
+    plain_tree(&src);
+    let (s, p) = (settings(&out), progress());
+    let markers = archive::snapshot_used_journal(&archive::folder_snapshot(&src).unwrap());
+    archive_folder(&src, &s, &p).unwrap();
+    let (items, _) = cleanup::candidates(&out, &BTreeMap::new(), &[]).unwrap();
+    assert_eq!(items[0].passed(), markers);
+    assert_eq!(items[0].journal_checked(), markers);
+    if markers {
+        cleanup::delete(&items[0], &s, &p).unwrap();
+        assert!(!src.exists() && out.join("Ready.7z").is_file());
+    }
+}

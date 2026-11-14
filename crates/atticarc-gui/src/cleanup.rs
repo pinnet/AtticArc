@@ -769,7 +769,7 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                             Some(c) if c.passed => {
                                 let mut t = format!("✓ passed {}", when(&c.checked_utc));
                                 if c.snapshot.as_deref().is_some_and(archive::snapshot_used_journal) {
-                                    t.push_str(" · change journal");
+                                    t.push_str(&format!(" · {}", atticarc_core::platform::CHANGE_MARKER_LABEL));
                                 }
                                 if c.discarded > 0 {
                                     t.push_str(&format!(" · {} discarded files go with it", c.discarded));

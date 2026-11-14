@@ -77,7 +77,8 @@ impl Candidate {
         days_since(&self.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS)
     }
 
-    /// Whether its saved check also covered the NTFS change journal, so even
+    /// Whether its saved check also covered change markers (the NTFS change
+    /// journal, or status change times on macOS and Linux), so even
     /// an edit with its timestamps set back would be caught before deleting.
     pub fn journal_checked(&self) -> bool {
         self.check.as_ref().and_then(|c| c.snapshot.as_deref()).is_some_and(archive::snapshot_used_journal)
@@ -339,8 +340,9 @@ mod tests {
         only(out)
     }
 
-    /// Whether this machine's temp folder keeps an NTFS change journal (the
-    /// archive-time check needs one).
+    /// Whether this machine's temp folder has change markers (the NTFS change
+    /// journal, or status change times on macOS and Linux): the archive-time
+    /// check needs them.
     fn journal_here(src: &Path) -> bool {
         archive::snapshot_used_journal(&archive::folder_snapshot(src).unwrap())
     }

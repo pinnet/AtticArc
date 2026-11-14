@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::platform::hide;
+
 mod records;
 mod schema;
 

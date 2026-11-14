@@ -134,6 +134,42 @@ fn the_fixture_archives_still_verify_check_scrub_and_rebuild() {
     assert!(m.entries.iter().any(|e| e.rel_path == "junk.tmp"));
 }
 
+/// A destination carried to another machine or system: the catalogue still
+/// names the archives where they were, so none is found; they are relinked
+/// by what they hold, not added twice, and work from then on.
+#[test]
+fn a_destination_carried_elsewhere_is_relinked_by_what_it_holds() {
+    let (tmp, out) = fixture();
+    // The fixture's catalogue names the folder it was made in, which is gone
+    // on any machine but the one that made it; make sure of that here too.
+    let mut cat = Catalog::open_existing(&out).unwrap();
+    for a in cat.archives().unwrap() {
+        let name = Path::new(&a.archive_path).file_name().unwrap().to_owned();
+        cat.relink(a.id, &tmp.path().join("another machine").join(name).to_string_lossy()).unwrap();
+    }
+    assert!(cat.archives().unwrap().iter().all(|a| !Path::new(&a.archive_path).is_file()));
+    drop(cat);
+    let r = archive::relink_missing(&out).unwrap();
+    assert_eq!((r.relinked.len(), r.missing.len()), (4, 0), "{r:?}");
+    let cat = Catalog::open_existing(&out).unwrap();
+    let archives = cat.archives().unwrap();
+    assert_eq!(archives.len(), 4);
+    let p = progress();
+    for a in &archives {
+        assert!(Path::new(&a.archive_path).is_file(), "{}", a.archive_path);
+        check_index(Path::new(&a.archive_path), &cat.entries(a.id).unwrap()).unwrap();
+    }
+    // The folders they were made from are somewhere else too: none is a candidate for clean up, none is lost.
+    let (found, missing) = atticarc_core::cleanup::candidates(&out, &Default::default(), &[]).unwrap();
+    assert_eq!((found.len(), missing.len()), (0, 4));
+    // A rebuild finds nothing new.
+    let r = rebuild_catalog(&out).unwrap();
+    assert_eq!((r.added, r.already_there), (0, 4), "{r:?}");
+    let plain = archives.iter().find(|a| a.name == "Plain").unwrap();
+    let m = read_manifest(Path::new(&plain.archive_path)).unwrap();
+    check_before_delete(&tmp.path().join("Plain"), Path::new(&plain.archive_path), &m.entries, 2, &p).unwrap();
+}
+
 /// The same folder archived now gives the same record as it did then, and a
 /// manifest with the same fields: nothing added, dropped or renamed. (Times,
 /// paths and the engine's name are the machine's and the day's, not the format's.)
@@ -169,7 +205,8 @@ fn shape(v: &serde_json::Value) -> serde_json::Value {
     match v {
         Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), shape(v))).collect()),
         Value::Array(a) => Value::Array(a.iter().map(shape).collect()),
-        Value::Null => Value::Null,
+        // A value is a value, set or not: whether a drive records a file's
+        // created time is the drive's business, not the format's.
         _ => Value::Bool(true),
     }
 }
@@ -191,11 +228,15 @@ fn timeless(mut v: serde_json::Value) -> serde_json::Value {
                         inner[k] = Value::Null;
                     }
                 }
-                // A reference file holds the time it was made, so its hashes move too.
+                // A reference file holds the times of the file it stands for and of its
+                // making, so its size and hashes move too, and the folder's total with them.
                 if m.get("method").and_then(Value::as_str) == Some("dep") {
                     for k in ["size", "blake3", "sha256"] {
                         m.insert(k.into(), Value::Null);
                     }
+                }
+                if m.contains_key("input_bytes") {
+                    m.insert("input_bytes".into(), Value::Null);
                 }
                 m.values_mut().for_each(strip);
             }

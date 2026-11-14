@@ -24,7 +24,7 @@ pub fn archive_worst_case(input: u64) -> u64 {
 /// instead. `None` if it can't be found out.
 pub fn free_bytes(dir: &Path) -> Option<u64> {
     let dir = existing_ancestor(dir)?;
-    free_bytes_at(&crate::settings::strip_verbatim(&dir))
+    crate::platform::free_bytes(&crate::settings::strip_verbatim(&dir))
 }
 
 /// Fails with a plain message if the drive holding `dir` has less than
@@ -49,29 +49,6 @@ pub fn ensure_free(dir: &Path, needed: u64, what: &str) -> Result<()> {
 fn existing_ancestor(dir: &Path) -> Option<PathBuf> {
     let abs = std::path::absolute(dir).ok()?;
     abs.ancestors().find(|p| p.is_dir()).map(Path::to_path_buf)
-}
-
-#[cfg(windows)]
-fn free_bytes_at(dir: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    let mut free = 0u64;
-    // SAFETY: a NUL-terminated path and an out-pointer to a local; the other
-    // out-pointers are optional and passed as null.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
-    };
-    (ok != 0).then_some(free)
-}
-
-#[cfg(not(windows))]
-fn free_bytes_at(dir: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().nth(1)?.split_whitespace().nth(3)?.parse::<u64>().ok().map(|k| k * 1024)
 }
 
 /// Bytes as KB, MB, GB or TB (powers of 1024), for messages.

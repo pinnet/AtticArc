@@ -5,8 +5,12 @@ Every rule the code keeps, one line each, with the test that holds it. The refac
 unchanged at every step. Where a rule and the code disagree, the code as of `1767fdd` (14 Nov
 2026) is right and this file is wrong.
 
+One rule has widened on purpose since then (phase 3): the check saved at archive time, once
+NTFS only, now also happens on macOS and Linux, where status change times do the change
+journal's job. Nothing changed on Windows.
+
 Tests are in `crates/atticarc-core`: `archive::`, `cleanup::`, `scan::`, `disk::`, `exclude::`,
-`settings::`, `journal::` are unit tests in `src/`; `workflow::` and `fixtures::` are in `tests/`.
+`settings::`, `journal::`, `platform::` are unit tests in `src/`; `workflow::` and `fixtures::` are in `tests/`.
 `soak::` is in `crates/atticarc-cli`.
 
 ## Archiving
@@ -53,7 +57,8 @@ Tests are in `crates/atticarc-core`: `archive::`, `cleanup::`, `scan::`, `disk::
 |---|---|
 | A folder is deleted only if its saved check passed | `cleanup::an_unchecked_folder_is_never_deleted`, `workflow::…` |
 | The full check: every file on disk is in the archive's record with the same size and hash, and every file in the archive decodes to its hash | `archive::check_passes_then_delete`, `archive::check_fails_when_a_file_changed`, `archive::check_fails_when_a_file_was_added`, `archive::check_fails_when_the_archive_is_damaged` |
-| On a drive with a change journal, the check is saved when the folder is archived, and the folder can be deleted in one step | `cleanup::a_folder_is_checked_when_archived_and_deleted_in_one_step` (NTFS only) |
+| On a drive with change markers (NTFS; any drive on macOS and Linux), the check is saved when the folder is archived, and the folder can be deleted in one step | `cleanup::a_folder_is_checked_when_archived_and_deleted_in_one_step`, `workflow::where_there_are_change_markers_a_folder_is_ready_to_delete_once_archived` |
+| A snapshot catches an edit that keeps a file's size and puts its modified time back | `workflow::a_snapshot_catches_an_edit_with_the_same_size_and_the_time_put_back`, `platform::a_change_marker_moves_when_a_file_is_written_even_with_its_time_put_back` |
 | Before a delete: the folder's snapshot is unchanged since its check | `cleanup::a_folder_changed_after_its_check_is_left_alone`, `archive::a_folder_snapshot_changes_when_the_folder_does`, `workflow::…` |
 | Before a delete: the archive's size, modified time and header are unchanged | `cleanup::a_changed_archive_is_left_alone`, `archive::index_and_scrub_catch_what_they_should` |
 | An archive last decoded more than 30 days ago is decoded again before its folder is deleted | `cleanup::an_archive_not_decoded_lately_is_decoded_before_deleting` |
@@ -73,6 +78,15 @@ Tests are in `crates/atticarc-core`: `archive::`, `cleanup::`, `scan::`, `disk::
 | A renamed source folder is found by its files | `archive::a_renamed_source_folder_is_found_by_its_files` |
 | A catalogue left loose by earlier versions moves into `.atticarc` | `archive::old_catalogue_moves_into_its_folder` |
 | Search finds files by words of their names | `archive::search_duplicates_and_extract`, `workflow::…` |
+
+## The three systems
+
+| Rule | Test |
+|---|---|
+| Every system answers every question in `platform` (free space, change markers, settings folder, hiding, setting times) | `platform::every_system_answers`, `platform::times_are_set_on_files_and_folders` |
+| A destination carried to another machine or system is relinked by what its archives hold, not added twice; its source folders are not candidates for clean up there | `fixtures::a_destination_carried_elsewhere_is_relinked_by_what_it_holds` |
+
+What each system does underneath is in [platforms.md](platforms.md).
 
 ## Formats (frozen)
 

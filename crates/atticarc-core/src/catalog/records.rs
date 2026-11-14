@@ -188,7 +188,7 @@ pub fn path_key(p: &Path) -> String {
     let s = p.to_string_lossy().to_string();
     // canonicalize gives \\?\C:\... on Windows; store the plain form.
     let s = s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s);
-    if cfg!(windows) { s.to_lowercase() } else { s }
+    if crate::platform::PATHS_IGNORE_CASE { s.to_lowercase() } else { s }
 }
 
 pub fn now_utc() -> String {

@@ -53,3 +53,79 @@ by Danny on WinX, and all three systems by CI once `docs/ci/check.yml` is moved 
 - Tests: unchanged, all passing (Linux). Clippy clean (core, CLI).
 - Soak: 5 minutes on the release CLI built from this phase (Linux, 0.3 GB of generated files);
   result recorded under "Soak runs" below.
+
+## Phase 3: the platform layer
+
+- New `crates/atticarc-core/src/platform/`: `mod.rs` (the questions), `windows.rs`, `macos.rs`,
+  `linux.rs`, with `unix.rs` shared by the last two. It answers: free space, change marker,
+  settings folder, hiding, setting times, the system's name, whether paths ignore case.
+- Moved behind it, unchanged on Windows: free space (`disk.rs`, and the soak test's own copy),
+  hiding `.atticarc` (`catalog/schema.rs`), setting times on extracted files
+  (`archive/util.rs`), the settings folder (`settings.rs`), lower-casing path keys
+  (`catalog/records.rs`). `journal.rs` (the NTFS reader) is untouched; Windows' change marker
+  calls it.
+- **One widening, on purpose:** folder snapshots on macOS and Linux now use status change times
+  (`ctime:` snapshots), so the check saved at archive time happens there too, as on NTFS. On
+  Windows snapshots are byte for byte what they were (`usn:` / `meta:`). The words beside a
+  check come from the platform ("change journal" on Windows, "change time" elsewhere): one line
+  each in the CLI and in the GUI's Clean up page.
+- New tests: 3 in `platform`, 2 in `workflow` (a same-size edit with its time put back is
+  caught; a folder is ready to delete once archived), 1 in `fixtures` (a destination carried
+  elsewhere is relinked by what it holds). The fixture comparison no longer depends on whether a
+  drive records created times.
+- `docs/platforms.md`: what each system does underneath, and what isn't the same yet.
+- Tests: 63 unit + 9 integration + 1 soak, all passing (Linux), four runs in a row. Clippy clean
+  (core, CLI). `cargo fmt --check` clean.
+- **Not checked by the run:** `platform/windows.rs` and `platform/macos.rs` have never been
+  compiled (no Windows or macOS toolchain in the workspace). The Windows file is the old code
+  moved, function by function; the macOS file is eight lines over `unix.rs`. WinX and CI will say.
+
+## Soak runs
+
+| Phase | Where | Run | Result |
+|---|---|---|---|
+| 2 | Linux, release CLI | 5 minutes, 0.3 GB generated, 2 rounds | passed (too few rounds to judge memory growth) |
+| 3 | Linux, release CLI | 7 rounds, 0.1 GB generated | passed: memory flat (167 MB after warm-up, 167 MB at the end), handles 5, threads 2 |
+
+## Stop after phase 3: handover
+
+The first run stops here, as the brief says. Branch `refactor-plugins`, four commits on top of
+`main` (`1767fdd`): phases 0, 1, 2, 3.
+
+**For Danny, on WinX (and the M1):**
+
+1. `cargo test --workspace`, then `cargo build --release --workspace` and a look round the GUI:
+   nothing should look or behave differently. Clean up should still say "change journal" beside
+   a check made on NTFS.
+2. `cargo fmt --all --check` and `cargo clippy -p atticarc-core -p atticarc-cli --all-targets --
+   -D warnings` should both be clean. `cargo clippy -p atticarc-gui` will list the GUI's
+   warnings (never run before): clear them, or paste them back.
+3. Move `docs/ci/check.yml` to `.github/workflows/check.yml` and push the branch: the first run
+   shows whether all three systems build and pass. Expect the GUI on macOS and Linux to be the
+   part that needs attention, if anything does.
+4. Optional: make a second fixture on WinX (see phase 0), so a catalogue made on NTFS, with
+   archive-time checks in it, is covered for good.
+
+**No speed readings yet.** `atticarc-cli bench` comes in phase 11; the soak timings above are
+from a small Linux container and say nothing about the three systems against each other.
+
+**What phase 4 onwards will touch:**
+
+- Phase 4 (constants, `Loader<T>`): `limits.rs` in core; the GUI's Catalogue, Duplicates and
+  Clean up pages. GUI work, so it needs a machine that builds the GUI at every step.
+- Phase 5 (progress contract): `archive/progress.rs` and every producer; the GUI's Progress
+  page and the CLI's tickers.
+- Phase 6 (archive backend): `archive/write.rs`, `verify.rs`, `extract.rs`, `rewrite.rs`,
+  `manifest.rs` are where `sevenz_turbo::` is used today.
+- Phases 7 to 9 (registry and settings, streams and tags, metadata and store): new modules, the
+  manifest, the Settings window.
+
+**Changes to the plan these phases showed are needed:**
+
+- The run can't build the GUI or anything for Windows or macOS. From phase 4 on, most steps
+  touch the GUI. Either run the next phases where the GUI builds (Claude Code on WinX itself), or
+  get the three-system CI green first and let it be the check after each push. The second is
+  the better use of the CI this run wrote.
+- Ground rule 2 ("green on WinX at every step") was met only as "green for core and CLI on
+  Linux". Each phase is one commit, so a failure on WinX can be traced to its phase.
+- `df` was kept for free space on macOS and Linux instead of `statvfs`, to add no dependency.

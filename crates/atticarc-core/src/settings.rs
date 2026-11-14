@@ -132,7 +132,7 @@ impl Saved {
 }
 
 fn config_dir() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    crate::platform::config_dir()
 }
 
 pub fn settings_file() -> PathBuf {

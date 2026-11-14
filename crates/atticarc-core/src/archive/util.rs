@@ -34,32 +34,7 @@ pub(super) fn parse_utc(t: Option<&str>) -> Option<SystemTime> {
 
 /// Sets a file's or folder's times where the system allows; best effort.
 pub(super) fn set_times(path: &Path, modified: Option<SystemTime>, created: Option<SystemTime>, is_dir: bool) {
-    let mut times = std::fs::FileTimes::new();
-    if let Some(m) = modified {
-        times = times.set_modified(m);
-    }
-    #[cfg(windows)]
-    if let Some(c) = created {
-        use std::os::windows::fs::FileTimesExt;
-        times = times.set_created(c);
-    }
-    #[cfg(not(windows))]
-    let _ = created;
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true);
-    #[cfg(windows)]
-    if is_dir {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        open.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    }
-    #[cfg(not(windows))]
-    if is_dir {
-        open.write(false).read(true);
-    }
-    if let Ok(f) = open.open(path) {
-        let _ = f.set_times(times);
-    }
+    crate::platform::set_times(path, modified, created, is_dir)
 }
 
 pub(super) fn check_hash(path: &Path, rec: &EntryRecord) -> Result<()> {

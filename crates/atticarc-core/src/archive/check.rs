@@ -152,11 +152,12 @@ pub(super) fn hash_folder_against(now: &Scan, rec: &BTreeMap<&str, &EntryRecord>
 /// Deletes `source` for good. Read-only files are made writable first,
 /// because Windows refuses to delete them otherwise.
 /// A fingerprint of a folder as it is now, without reading file contents:
-/// every file's path, size and modified time, and, on NTFS, its change
-/// journal number ([`crate::journal`]), which changes with any write even if
-/// the timestamps are set back. Taken when a folder passes its check, and
+/// every file's path, size and modified time, and its change marker
+/// ([`crate::platform::change_marker`]: the NTFS change journal number, or
+/// the status change time on macOS and Linux), which moves with any write
+/// even if the timestamps are set back. Taken when a folder passes its check, and
 /// again just before it is deleted, so a folder changed in between is
-/// caught. Starts `usn:` if the journal numbers were used, `meta:` if not.
+/// caught. Starts `usn:` or `ctime:` if change markers were used, `meta:` if not.
 pub fn folder_snapshot(source: &Path) -> Result<String> {
     folder_snapshot_with(source, &Progress::default())
 }
@@ -166,12 +167,12 @@ pub fn folder_snapshot_with(source: &Path, progress: &Progress) -> Result<String
     let s = scan(source)?;
     progress.total.store(s.files.len() as u64, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
-    // A volume without a journal answers no file; stop asking after a few.
+    // A drive without change markers answers no file; stop asking after a few.
     let mut journal = true;
     let mut misses = 0;
     let mut rows: Vec<String> = Vec::with_capacity(s.files.len());
     for f in &s.files {
-        let usn = if journal { crate::journal::file_usn(&f.abs) } else { None };
+        let usn = if journal { crate::platform::change_marker(&f.abs) } else { None };
         if usn.is_none() && journal {
             misses += 1;
             if misses >= 8 && rows.len() < misses * 2 {
@@ -190,12 +191,14 @@ pub fn folder_snapshot_with(source: &Path, progress: &Progress) -> Result<String
         h.update(r.as_bytes());
         h.update(b"\n");
     }
-    Ok(format!("{}:{}", if used_journal { "usn" } else { "meta" }, h.finalize().to_hex()))
+    Ok(format!("{}:{}", if used_journal { crate::platform::CHANGE_MARKER } else { "meta" }, h.finalize().to_hex()))
 }
 
-/// Whether a snapshot from [`folder_snapshot`] used the change journal.
+/// Whether a snapshot from [`folder_snapshot`] used change markers (the
+/// NTFS change journal, or status change times on macOS and Linux), so it
+/// can be trusted to catch any write.
 pub fn snapshot_used_journal(snapshot: &str) -> bool {
-    snapshot.starts_with("usn:")
+    snapshot.starts_with("usn:") || snapshot.starts_with("ctime:")
 }
 
 pub fn delete_folder(source: &Path) -> Result<()> {

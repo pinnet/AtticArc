@@ -503,7 +503,7 @@ fn run_cleanup(args: &[String]) -> ExitCode {
     let status = |c: &cleanup::Candidate| match &c.check {
         _ if c.protected => "protected (never deleted)".to_string(),
         Some(k) if k.passed => {
-            let journal = if c.journal_checked() { ", change journal" } else { "" };
+            let journal = if c.journal_checked() { format!(", {}", atticarc_core::platform::CHANGE_MARKER_LABEL) } else { String::new() };
             let decode = if c.needs_decode() { ", archive decoded again before deleting" } else { "" };
             format!("passed {}{journal}{decode}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
         }
