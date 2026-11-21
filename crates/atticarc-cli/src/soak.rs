@@ -163,23 +163,8 @@ fn free_gb(dir: &Path) -> f64 {
     free_bytes(dir).map_or(-1.0, |b| b as f64 / 1e9)
 }
 
-#[cfg(windows)]
 fn free_bytes(dir: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    let mut free = 0u64;
-    // SAFETY: a NUL-terminated path and out-pointers to locals.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
-    };
-    (ok != 0).then_some(free)
-}
-
-#[cfg(not(windows))]
-fn free_bytes(dir: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().nth(1)?.split_whitespace().nth(3)?.parse::<u64>().ok().map(|k| k * 1024)
+    atticarc_core::disk::free_bytes(dir)
 }
 
 fn soak(a: &SoakArgs) -> Result<bool> {

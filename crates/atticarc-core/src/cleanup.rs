@@ -77,7 +77,8 @@ impl Candidate {
         days_since(&self.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS)
     }
 
-    /// Whether its saved check also covered the NTFS change journal, so even
+    /// Whether its saved check also covered change markers (the NTFS change
+    /// journal, or status change times on macOS and Linux), so even
     /// an edit with its timestamps set back would be caught before deleting.
     pub fn journal_checked(&self) -> bool {
         self.check.as_ref().and_then(|c| c.snapshot.as_deref()).is_some_and(archive::snapshot_used_journal)
@@ -269,10 +270,7 @@ pub fn scrub_list(out_dir: &Path, due_only: bool) -> Result<Vec<ScrubItem>> {
         return Ok(Vec::new());
     }
     let all = Catalog::open_existing(out_dir)?.scrub_list()?;
-    Ok(all
-        .into_iter()
-        .filter(|s| !due_only || days_since(&s.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS))
-        .collect())
+    Ok(all.into_iter().filter(|s| !due_only || days_since(&s.decoded_utc).is_none_or(|d| d > DECODE_AGE_DAYS)).collect())
 }
 
 /// Decodes one archive again and checks every file against the catalogue,
@@ -305,7 +303,15 @@ mod tests {
     use crate::archive::archive_folder;
 
     fn settings(out: &Path) -> Settings {
-        Settings { out_dir: out.to_path_buf(), level: 1, store_mode: true, threads: 2, protected: vec![], exclusions: vec![], identical_once: false }
+        Settings {
+            out_dir: out.to_path_buf(),
+            level: 1,
+            store_mode: true,
+            threads: 2,
+            protected: vec![],
+            exclusions: vec![],
+            identical_once: false,
+        }
     }
 
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -334,8 +340,9 @@ mod tests {
         only(out)
     }
 
-    /// Whether this machine's temp folder keeps an NTFS change journal (the
-    /// archive-time check needs one).
+    /// Whether this machine's temp folder has change markers (the NTFS change
+    /// journal, or status change times on macOS and Linux): the archive-time
+    /// check needs them.
     fn journal_here(src: &Path) -> bool {
         archive::snapshot_used_journal(&archive::folder_snapshot(src).unwrap())
     }

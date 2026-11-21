@@ -7,9 +7,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
-use raw_window_handle::{
-    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
-};
+use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle};
 
 thread_local! {
     /// The window's handles, set at the start of every frame on the UI thread.

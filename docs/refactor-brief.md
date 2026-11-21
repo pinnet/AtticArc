@@ -162,6 +162,13 @@ The **registry** (`Plugins`) is built in one place, `Plugins::default_for_this_s
 handed to whatever needs it (with `Settings` or a small `Context`). Plugins never look each
 other up.
 
+### Built for Plugin² too
+
+`atticarc-core` will be a library Plugin² depends on (TODO 2, "AtticARC as Plugin²'s safety
+net"). So its public API is a product, not an inside detail: keep it small, documented and
+stable, keep everything Plugin² needs reachable without the GUI, and give `platform` room for
+one more question later (asking for admin rights to write a protected folder).
+
 ## Phases
 
 Each phase is one or more commits; each ends green (ground rule 2) and with a short entry in
@@ -179,7 +186,7 @@ Each phase is one or more commits; each ends green (ground rule 2) and with a sh
 | 7 | **Registry and module settings**: `Plugins`, `SettingSpec`, settings under `plugins.<id>`, the Settings window drawing a section per module, plugins and options recorded in the manifest | today's options (level, threads, store mode, stored once, detailed log) come from their modules; old settings files load |
 | 8 | **FileStreams and tags**: contract, the three stream plugins, the `tags` decoder, manifest field, restore on extract, streams in the check before a delete, Catalogue shows tags as coloured dots | the **interchange test** (below) passes: streams made on each system come back on the systems that can hold them |
 | 9 | **MetadataExtractor, CatalogStore**: contracts and registry slots; pages tested against an in-memory store | no SQL outside `catalog/` |
-| 10 | **Fluent API where touched** (TODO 1.5): `Archive::folder(src).to(out).run(&sink)`, `ArchiveId`, `Bytes` | callers read like the UI; no behaviour change |
+| 10 | **Fluent API where touched** (TODO 1.5): `Archive::folder(src).to(out).run(&sink)`, `ArchiveId`, `Bytes`; and the **library API for Plugin²** (TODO 2, "AtticARC as Plugin²'s safety net"): `restore_folder`, `what_changed`, `format` in the manifest, `examples/safety_net.rs` | callers read like the UI; restore round-trips every fixture archive; the example runs in CI |
 | 11 | **Release builds for three systems**: `docs/ci/release.yml` building and attaching all three on a tag (Windows zip, macOS `.app` in a signed, notarised `.dmg` as Plugin² does, Linux tar.gz); `atticarc-cli bench` (below) | a tag produces three working downloads |
 | 12 | **Docs** (TODO 1.7): `DESIGN.md`, `docs/architecture.md` (with a diagram), `docs/formats.md` (archive layout, manifest with streams and plugin records, schema, `.atticarcdep`: what 1.0 freezes), `docs/platforms.md` (what each system does underneath, and which streams it can hold), rustdoc on public items | `cargo doc` clean; TODO 1.x items ticked |
 

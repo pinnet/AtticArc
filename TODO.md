@@ -233,10 +233,17 @@ means the same on another.
 - [ ] Macrium `.mrimg` reader: catalogue the image collection on the NAS to find repeated data.
 - [ ] Tree view of an archive's contents in the Catalogue browser (Clean up has the tree; the
       Catalogue browser was left as it is).
-- [ ] AI review over MCP: an `atticarc-mcp` server with read-only catalogue tools (list, summarise,
-      search, file info) and one `suggest` tool that records keep/rescue/drop suggestions for a new
-      **Review** page; you approve, and anything deleted still goes through the usual check.
-      Metadata only by default. Rust with `rmcp`; Claude Desktop or a local LLM on Proxmox as client.
+- [ ] **Review page and advisor plugins** (revised 21 Nov 2026). An `Advisor` plugin contract:
+      an advisor reads the catalogue (metadata only) and returns keep / rescue / drop suggestions,
+      each with a reason and a confidence, shown on a new **Review** page: a plain list,
+      sortable and filterable, worked through by hand.
+  - **Suggestions only, always**: no advisor deletes or changes anything. You approve on the
+    Review page, and anything deleted still goes through the usual check.
+  - **Built-in rules advisor** (in the open build): patterns for known throwaway Windows / macOS /
+    Linux folders (`$Recycle.Bin`, temp, browser and installer caches, an old `Windows`), with no
+    AI and no network.
+  - Other advisors plug in through the same contract and registry; the open build makes no
+    network connections for reviews.
 
 - [ ] **Versions of a folder (considered Nov 2026, parked).** Kept for now: a new folder with a
       taken name gets `Name (2).7z`, `Name (3).7z`… beside the first, which is logical and copies
@@ -251,12 +258,129 @@ means the same on another.
   - Open question: an *updated* folder (sharing files with the last version) as a new version with
     the shared files stored once as references to the older archive.
 
+### AtticARC as Plugin²'s safety net (agreed 14 Nov 2026)
+
+Plugin² (pinnet/plugin-squared) will use `atticarc-core` as a library to archive every plugin
+folder before it changes anything, prove the archive good, and put everything back on request:
+"back to square one" for musicians who just want it to work. Both are MIT; the shared engine
+stays free and open. Built in from the refactor onwards, so it isn't bolted on later.
+
+- [ ] **Restore a whole folder** from its archive: `archive::restore_folder(archive, dest, sink)`,
+      `atticarc-cli restore <archive> <dest>`, and a button in the Catalogue.
+  - Unpacks into a temporary folder beside `dest`, checks every file against the manifest's
+    hashes, then swaps it in; what was at `dest` is moved aside, not deleted, until the swap
+    has worked.
+  - Puts back times, set-aside files (inside or beside the archive), and stored-once copies
+    (`.atticarcdep` references, in the same archive or another).
+  - A cancelled or failed restore leaves `dest` exactly as it was.
+- [ ] **What changed**: `archive::what_changed(folder, archive) -> Changes { added, removed,
+      changed }`, quick by snapshot, exact by hash on request. For Plugin²'s "3 plugins changed
+      since Tuesday", and useful in AtticARC's Clean up as the reason a check failed.
+- [ ] **Folders that need admin rights** to write (macOS `/Library/Audio/Plug-Ins`, Windows
+      `C:\Program Files\Common Files\VST3`): `platform` asks the system for rights just for the
+      restore step (a small privileged helper), never runs the whole app elevated.
+- [ ] **A library others build on**: `atticarc-core`'s public API documented with examples, kept
+      stable with semantic versioning from 1.0, and a Plugin²-shaped example
+      (`examples/safety_net.rs`: archive several folders, what changed, restore).
+- [ ] **A format version** in every manifest (`format: 1`), so a reader can say "made by a newer
+      AtticARC" instead of guessing. The open version is the reference: other builds (paid ones
+      included) add only optional fields it can safely ignore, never change what one means.
+      `docs/formats.md` is the standard.
+
+### Disk sets: roll archives out to drives, with optional parity
+
+Agreed Nov 2026; design in `docs/disk-sets.md`. After the refactor, as plugins.
+
+- [ ] **`SetPlanner` plugin**: pack the destination's archives onto disks of a chosen size
+      (500 GB / 1 TB / custom, real capacity less a margin); strategies first-fit decreasing,
+      keep together, in order; split archives bigger than a disk into 7-Zip volumes. Plan shown
+      before writing.
+- [ ] **`SetWriter` plugin**: plain exFAT (or NTFS) disks, one at a time, verified, resumable;
+      `ATTICARC-SET.json` on every disk with the whole set's map; map in the catalogue too.
+- [ ] **`ParityEngine` plugin, swappable**: none, native Reed–Solomon (k data + m parity, any m
+      disks lost; per-block BLAKE3 checksums; built and rebuilt one disk at a time), PAR2 per
+      disk, SnapRAID. GPL tools run as separate programs only.
+- [ ] Planner and parity independent: any strategy with any engine, each with its own Settings
+      section; a set records which made it.
+
+### Disk capture: a whole disk as a set of files
+
+Agreed Nov 2026; design in `docs/disk-capture.md`. After the refactor, as a plugin; open formats
+only, no other backup product.
+
+- [ ] **Capture**: read a whole disk via the privileged helper (from a VSS / APFS snapshot if live),
+      used blocks only where the file system is understood (NTFS first), content-defined chunks
+      (FastCDC), each stored once as a zstd file named by its BLAKE3 hash; a small `.atticimg`
+      index per capture. Repeat captures share chunks.
+- [ ] **Restore and export**: restore to a disk; export to VHDX, QCOW2 or raw `.img`.
+- [ ] **Store upkeep**: reference-counted chunk removal, scrub, catalogue shows new vs shared data;
+      the store rolls out to disk sets like any files.
+
+## Found during the refactor
+
+Left as they were (the refactor changes no behaviour); each wants its own small fix and test.
+
+- [ ] **Paths written another way aren't recognised as the same** (found by the first CI run on
+      GitHub's Windows runner, 14 Nov 2026). Protected folders, source folders and archive paths
+      are compared as text after `canonicalize`, but a list entry typed with an 8.3 short name
+      (`C:\Users\RUNNER~1\...`), through a junction or a mapped drive isn't canonicalized first,
+      so it doesn't match the full spelling. The worst case: a protected folder entered as a
+      short name doesn't protect the folder. Fix: canonicalize every path from the settings and
+      the catalogue before comparing (falling back to the text for a path that isn't there), and
+      test with a short name on Windows. macOS has the same through links: its temp folder
+      `/var/folders/...` is really `/private/var/folders/...`, and the same four tests fail
+      there. Until it is fixed, CI runs the tests with a temp folder that has one spelling.
+- [ ] **A drive with its change journal switched off still looks protected** (found by the same
+      CI run, on the runner's D: drive; 14 Nov 2026). There `FSCTL_READ_FILE_USN_DATA` still
+      answers, but with a change number that never moves (very likely 0), so `journal::file_usn`
+      returns a number, the folder snapshot is marked `usn:`, and the check is saved at archive
+      time as if any write would be caught. An edit that keeps a file's size and puts its time
+      back would then go unnoticed before a delete. **Fix first after the refactor's phase 3:**
+      ask the volume whether its journal is active (`FSCTL_QUERY_USN_JOURNAL`) once per
+      snapshot, and treat a missing or inactive journal as none (`meta:` snapshot, full check
+      needed). Test on a drive with the journal off (`fsutil usn deletejournal /d D:` on a
+      scratch drive, or the CI runner's D:).
+
 ## 3. Before calling it 1.0
 
 - [ ] Steps 1.1–1.8 done.
 - [ ] Use 0.9.x on real data for a while with no format changes needed.
 - [ ] Freeze the formats in `docs/formats.md`; from then on, a change that can't read older
       archives or catalogues is a 2.0.
+
+### Hardened free 1.0 (agreed 21 Nov 2026)
+
+Goal: a hardened, fully working free build that is a viable product on its own, before any AI
+is added. "Fully tested" means every behaviour proved, not a coverage number chased: 100% line
+coverage is required only where a bug can lose data, and measured everywhere else.
+
+- [ ] **Coverage measured in CI** (`cargo llvm-cov`) on Windows, macOS and Linux, report kept
+      with each run. `atticarc-core`: 90% lines or more overall. **100% (lines and branches) on
+      the paths that can lose data**: anything that deletes, the check before deleting, archive
+      write and verify, rebuild from archives. Every uncovered line in core is either tested or
+      has a one-line reason in `docs/coverage.md`.
+- [ ] **Every rule in `docs/behaviour.md` has a named test**, checked by CI (a script fails the
+      build if a rule names a test that doesn't exist or doesn't run).
+- [ ] **Mutation testing** (`cargo mutants`) on the data-loss paths: any surviving mutant is a
+      missing test. Run before each release, not on every push.
+- [ ] **Property and fuzz tests**: `proptest` round trips for manifest, catalogue and
+      `.atticarcdep`; paths with Unicode, very long names, reserved Windows names, case-only
+      differences; `cargo fuzz` on every parser that reads files from disk.
+- [ ] **Fault injection** through the platform module: disk full, drive unplugged mid-archive,
+      process killed at every step (archive, verify, delete, rebuild), read-only destination,
+      locked files, corrupt or truncated archives. The rule tested every time: **the source is
+      never deleted unless its archive is verified**, and a rerun picks up cleanly.
+- [ ] **Interchange**: archives made on each system verified, extracted and rebuilt on the other
+      two in CI (artifacts passed between jobs).
+- [ ] **Old formats**: fixtures made by 0.9.0 stay in the repo and are opened, verified,
+      scrubbed and rebuilt by every later version.
+- [ ] **Scale and soak**: a catalogue of millions of files; the existing 4-hour soak on all three
+      systems; one multi-TB real run on WinX per release.
+- [ ] **Extension points proved in the open repo**: the `Advisor` contract and a GUI plugin slot
+      (a plugin can add a page and Review entries), each exercised by a small test plugin that
+      lives in the repo, so the hook works before any outside plugin exists.
+- [ ] **Release gate**: all of the above green, `cargo fmt`, `clippy -D warnings`, signed macOS
+      build, then the real-data run; only then tag.
 
 ## Notes from the 0.9.0 testing
 
