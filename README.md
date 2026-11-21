@@ -216,9 +216,29 @@ atticarc-cli scan <folder> [--top N]                  Possible duplicates by siz
 atticarc-cli archive <folder>... [--out DIR] [--level 5|9]   Archive and verify, exit 0 if all verified
 atticarc-cli search <words> [--out DIR]               Search the catalogue
 atticarc-cli rebuild [--out DIR]                      Add archives missing from the catalogue
+atticarc-cli compare <source> <copy> [--strict] [--quick] [--all]   Is the copy complete? (below)
 atticarc-cli soak --work DIR [--hours H] [--gb G] [--source FOLDER]   Robustness test (below)
 atticarc-cli watch [atticarc|PID] [--every S]         Log the window's memory until it exits
 ```
+
+### Checking a copy is complete
+
+`atticarc-cli compare <source> <copy>` proves a copy finished (an `rclone copy`, a drag-and-drop,
+a restore) before you rely on it or delete the original. Every source file must be in the copy
+with the same contents; both sides are hashed (BLAKE3), each file's two sides read at once.
+
+- **Fails it:** a file missing, a different size or contents, something unreadable.
+- **Listed, doesn't fail it:** files only in the copy (`rclone copy` never deletes from the
+  destination), modified times more than 2 seconds apart, empty folders the copy lacks (rclone
+  skips them unless `--create-empty-src-dirs`), and links in the source (not followed).
+- **Skipped on both sides:** the system's own folders and files on a drive (`.Spotlight-V100`,
+  `.fseventsd`, `.Trashes`, `.DS_Store`, `System Volume Information`, `$RECYCLE.BIN`, the page
+  file, `lost+found`...). Nothing can copy them properly and nothing needs to; `--include-system`
+  compares them anyway.
+- `--strict`: the folders must be identical, so extras and missing empty folders fail it too.
+- `--quick`: sizes only, reading nothing. Fast, but not proof.
+- Exit code 0 means complete, 1 not complete, 2 the folders couldn't be compared, so it can
+  gate a script: `rclone copy A B && atticarc-cli compare A B && echo safe`.
 
 ### Confirming duplicates before archiving
 

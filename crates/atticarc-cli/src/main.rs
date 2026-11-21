@@ -1,3 +1,4 @@
+mod compare;
 mod mem;
 mod soak;
 
@@ -50,6 +51,18 @@ Usage:
                                   archive are unchanged since its check (seconds; an archive
                                   not decoded for 30 days is decoded first). Asks first
                                   unless --yes.
+  atticarc-cli compare <source> <copy>   Check the copy holds every file of the source, byte for
+                                  byte (both sides hashed): e.g. that an rclone copy finished.
+                                  Files only in the copy, different times and empty folders
+                                  the copy lacks are listed but don't fail it.
+        [--strict]                 Identical: also fail on anything only in the copy, or on
+                                  empty folders it lacks.
+        [--quick]                  Sizes only, reading no contents: fast, not proof.
+        [--all]                    List every line, not the first 20 of each kind.
+        [--include-system]         Also compare the system's own folders and files
+                                  (.Spotlight-V100, .DS_Store, System Volume Information,
+                                  $RECYCLE.BIN...), skipped by default.
+                                  Exit code 0: complete; 1: not; 2: couldn't compare.
   atticarc-cli soak --work DIR           Robustness test: archive, check, put back, de-duplicate
         [--hours H | --minutes M]  and rebuild in a loop (default 60 minutes), logging
         [--rounds N] [--gb G]      memory, handles and threads to a CSV in DIR. Uses G GB
@@ -95,6 +108,13 @@ fn main() -> ExitCode {
             }
         },
         Some("cleanup") => run_cleanup(&args[1..]),
+        Some("compare") => match compare::parse(&args[1..]) {
+            Ok(a) => compare::run(a),
+            Err(msg) => {
+                eprintln!("{msg}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("soak") => match soak::parse_soak(&args[1..]) {
             Ok(a) => soak::run_soak(a),
             Err(msg) => {

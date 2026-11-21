@@ -11,11 +11,13 @@
 //!    archives, with a full-text index for searching and hash indexes for duplicates.
 //! 5. Delete a source folder only after re-hashing it and the archive against the catalogue.
 //!
-//! [`settings`] holds what the GUI and CLI remember between runs.
+//! [`settings`] holds what the GUI and CLI remember between runs. [`compare`] checks a copy of a
+//! folder (an rclone copy, a restore) holds everything the source does, byte for byte.
 
 pub mod archive;
 pub mod catalog;
 pub mod cleanup;
+pub mod compare;
 pub mod disk;
 pub mod exclude;
 pub mod journal;
