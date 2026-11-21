@@ -348,6 +348,40 @@ Left as they were (the refactor changes no behaviour); each wants its own small 
 - [ ] Freeze the formats in `docs/formats.md`; from then on, a change that can't read older
       archives or catalogues is a 2.0.
 
+### Hardened free 1.0 (agreed 21 Nov 2026)
+
+Goal: a hardened, fully working free build that is a viable product on its own, before any AI
+is added. "Fully tested" means every behaviour proved, not a coverage number chased: 100% line
+coverage is required only where a bug can lose data, and measured everywhere else.
+
+- [ ] **Coverage measured in CI** (`cargo llvm-cov`) on Windows, macOS and Linux, report kept
+      with each run. `atticarc-core`: 90% lines or more overall. **100% (lines and branches) on
+      the paths that can lose data**: anything that deletes, the check before deleting, archive
+      write and verify, rebuild from archives. Every uncovered line in core is either tested or
+      has a one-line reason in `docs/coverage.md`.
+- [ ] **Every rule in `docs/behaviour.md` has a named test**, checked by CI (a script fails the
+      build if a rule names a test that doesn't exist or doesn't run).
+- [ ] **Mutation testing** (`cargo mutants`) on the data-loss paths: any surviving mutant is a
+      missing test. Run before each release, not on every push.
+- [ ] **Property and fuzz tests**: `proptest` round trips for manifest, catalogue and
+      `.atticarcdep`; paths with Unicode, very long names, reserved Windows names, case-only
+      differences; `cargo fuzz` on every parser that reads files from disk.
+- [ ] **Fault injection** through the platform module: disk full, drive unplugged mid-archive,
+      process killed at every step (archive, verify, delete, rebuild), read-only destination,
+      locked files, corrupt or truncated archives. The rule tested every time: **the source is
+      never deleted unless its archive is verified**, and a rerun picks up cleanly.
+- [ ] **Interchange**: archives made on each system verified, extracted and rebuilt on the other
+      two in CI (artifacts passed between jobs).
+- [ ] **Old formats**: fixtures made by 0.9.0 stay in the repo and are opened, verified,
+      scrubbed and rebuilt by every later version.
+- [ ] **Scale and soak**: a catalogue of millions of files; the existing 4-hour soak on all three
+      systems; one multi-TB real run on WinX per release.
+- [ ] **Extension points proved in the open repo**: the `Advisor` contract and a GUI plugin slot
+      (a plugin can add a page and Review entries), each exercised by a small test plugin that
+      lives in the repo, so the hook works before any outside plugin exists.
+- [ ] **Release gate**: all of the above green, `cargo fmt`, `clippy -D warnings`, signed macOS
+      build, then the real-data run; only then tag.
+
 ## Notes from the 0.9.0 testing
 
 - Live run: 56 folders, 858.6 GB, about 64 MB/s with source and destination on different disks
