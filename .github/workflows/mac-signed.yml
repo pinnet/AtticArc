@@ -1,0 +1,133 @@
+# Builds AtticARC.app for Apple Silicon, signs it with the Developer ID
+# certificate, notarises it with Apple and attaches AtticARC-<version>.dmg to the
+# release. Runs on tags like v0.9.0, or by hand (Actions → "Signed Mac app"
+# → Run workflow), which keeps the .dmg as a build artifact only.
+#
+# Needs the repository secrets in docs/mac-signing.md. Without them the build
+# still runs and the step summary says what's missing; nothing is signed.
+name: Signed Mac app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Are the signing secrets set?
+        id: secrets
+        run: |
+          missing=""
+          for s in MACOS_CERT_P12 MACOS_CERT_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            [ -n "${!s}" ] || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "### Not signed: missing secrets:$missing (see docs/mac-signing.md)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Make AtticARC.app
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          app="AtticARC.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/atticarc target/release/atticarc-cli "$app/Contents/MacOS/"
+          # CFBundleShortVersionString must be numbers only: 0.9.0-rc.1 → 0.9.0
+          sed -e "s/@VERSION@/${version%%-*}/" -e "s/@BUILD@/${{ github.run_number }}/" \
+            packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      - name: Load the certificate into a temporary keychain
+        if: steps.secrets.outputs.sign == 'true'
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$kc"
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          identity=$(security find-identity -v -p codesigning "$kc" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)"/\1/')
+          [ -n "$identity" ] || { echo "No 'Developer ID Application' certificate in MACOS_CERT_P12"; exit 1; }
+          echo "IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Sign the app
+        if: steps.secrets.outputs.sign == 'true'
+        run: |
+          # Inside out: the command-line tool, then the app (which signs atticarc).
+          codesign --force --timestamp --options runtime --sign "$IDENTITY" "$APP/Contents/MacOS/atticarc-cli"
+          codesign --force --timestamp --options runtime --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Make the .dmg
+        run: |
+          dmg="AtticARC-${VERSION}-macos-arm64.dmg"
+          mkdir dmg
+          cp -R "$APP" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "AtticARC" -srcfolder dmg -ov -format UDZO "$dmg"
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+
+      - name: Sign, notarise and staple the .dmg
+        if: steps.secrets.outputs.sign == 'true'
+        run: |
+          codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait --timeout 30m --output-format json | tee notary.json
+          status=$(python3 -c 'import json; print(json.load(open("notary.json"))["status"])')
+          if [ "$status" != "Accepted" ]; then
+            id=$(python3 -c 'import json; print(json.load(open("notary.json"))["id"])')
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose "$DMG"
+          echo "### Signed and notarised: $DMG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the temporary keychain
+        if: always() && steps.secrets.outputs.sign == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-dmg
+          path: ${{ env.DMG }}
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v') && steps.secrets.outputs.sign == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DMG }}
+          prerelease: ${{ contains(github.ref_name, '-') }}

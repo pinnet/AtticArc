@@ -10,235 +10,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 
-pub const CATALOG_FILE: &str = "catalog.db";
+use crate::platform::hide;
 
-/// The hidden folder AtticARC keeps its own files in: inside the output
-/// folder for the catalogue, and inside each archive for its manifest.
-pub const DATA_DIR: &str = ".atticarc";
+mod records;
+mod schema;
 
-/// Where the catalogue for the output folder `dir` lives.
-pub fn db_path(dir: &Path) -> PathBuf {
-    dir.join(DATA_DIR).join(CATALOG_FILE)
-}
-
-/// Whether `dir` has a catalogue, in its current or its old place.
-pub fn exists(dir: &Path) -> bool {
-    db_path(dir).is_file() || dir.join(CATALOG_FILE).is_file()
-}
-
-/// Creates `dir/.atticarc` if needed and makes sure it is hidden on Windows
-/// (the dot hides it elsewhere).
-fn make_data_dir(dir: &Path) -> Result<()> {
-    let data = dir.join(DATA_DIR);
-    if !data.is_dir() {
-        std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
-    }
-    hide(&data);
-    Ok(())
-}
-
-/// Sets the Hidden attribute on Windows if it isn't set. Best effort: a
-/// folder that stays visible does no harm.
-#[cfg(windows)]
-fn hide(path: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::process::CommandExt;
-    const HIDDEN: u32 = 0x2;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & HIDDEN != 0) {
-        return;
-    }
-    // attrib doesn't understand \\?\ paths.
-    let _ = std::process::Command::new("attrib")
-        .arg("+h")
-        .arg(crate::settings::strip_verbatim(path))
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
-}
-
-#[cfg(not(windows))]
-fn hide(_path: &Path) {}
-
-/// Moves a catalogue from where earlier versions kept it, loose in the
-/// output folder, into `.atticarc`.
-fn move_old_catalog(dir: &Path) -> Result<()> {
-    let old = dir.join(CATALOG_FILE);
-    if !old.is_file() || db_path(dir).is_file() {
-        return Ok(());
-    }
-    make_data_dir(dir)?;
-    for suffix in ["", "-wal", "-shm"] {
-        let from = PathBuf::from(format!("{}{suffix}", old.display()));
-        if from.is_file() {
-            let to = PathBuf::from(format!("{}{suffix}", db_path(dir).display()));
-            std::fs::rename(&from, &to).with_context(|| format!("move {} into {DATA_DIR}", from.display()))?;
-        }
-    }
-    Ok(())
-}
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS archives (
-    id              INTEGER PRIMARY KEY,
-    name            TEXT NOT NULL,
-    archive_path    TEXT NOT NULL,
-    source_path     TEXT NOT NULL,
-    created_utc     TEXT NOT NULL,
-    engine          TEXT NOT NULL,
-    level           INTEGER NOT NULL,
-    threads         INTEGER NOT NULL,
-    input_bytes     INTEGER NOT NULL,
-    archive_bytes   INTEGER NOT NULL,
-    file_count      INTEGER NOT NULL,
-    dir_count       INTEGER NOT NULL,
-    status          TEXT NOT NULL,
-    source_deleted_utc TEXT
-);
-CREATE INDEX IF NOT EXISTS archives_source ON archives(source_path);
-
-CREATE TABLE IF NOT EXISTS entries (
-    id              INTEGER PRIMARY KEY,
-    archive_id      INTEGER NOT NULL REFERENCES archives(id),
-    rel_path        TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    ext             TEXT NOT NULL,
-    kind            TEXT NOT NULL,
-    size            INTEGER NOT NULL,
-    modified_utc    TEXT,
-    created_utc     TEXT,
-    blake3          TEXT,
-    sha256          TEXT,
-    method          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS entries_archive ON entries(archive_id);
-CREATE INDEX IF NOT EXISTS entries_blake3 ON entries(blake3);
-CREATE INDEX IF NOT EXISTS entries_size ON entries(size);
-CREATE INDEX IF NOT EXISTS entries_ext ON entries(ext);
-CREATE INDEX IF NOT EXISTS entries_modified ON entries(modified_utc);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(name, rel_path, content='entries', content_rowid='id');
-
-CREATE TABLE IF NOT EXISTS runs (
-    id              INTEGER PRIMARY KEY,
-    archive_id      INTEGER,
-    action          TEXT NOT NULL,
-    source_path     TEXT NOT NULL,
-    started_utc     TEXT NOT NULL,
-    finished_utc    TEXT NOT NULL,
-    outcome         TEXT NOT NULL,
-    detail          TEXT NOT NULL
-);
-
--- Files the exclusions left out of an archive: set aside in a second
--- archive (aside_archive is its file name beside the main archive, or
--- .atticarc/excluded.7z when it is inside) or discarded.
-CREATE TABLE IF NOT EXISTS excluded (
-    archive_id      INTEGER NOT NULL REFERENCES archives(id),
-    rel_path        TEXT NOT NULL,
-    size            INTEGER NOT NULL,
-    action          TEXT NOT NULL,
-    aside_archive   TEXT
-);
-CREATE INDEX IF NOT EXISTS excluded_archive ON excluded(archive_id);
-
--- Duplicates replaced inside an archive by a .atticarcdep reference file:
--- the replaced file's path, the reference file's path, and where the
--- original is (archive file name, path inside it). record is the whole
--- manifest record as JSON.
-CREATE TABLE IF NOT EXISTS deps (
-    archive_id       INTEGER NOT NULL REFERENCES archives(id),
-    rel_path         TEXT NOT NULL,
-    dep_path         TEXT NOT NULL,
-    original_archive TEXT NOT NULL,
-    original_path    TEXT NOT NULL,
-    record           TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS deps_archive ON deps(archive_id);
-CREATE INDEX IF NOT EXISTS deps_original ON deps(original_archive, original_path);
--- Earlier file names of archives renamed outside AtticARC, so reference
--- files that name an original's archive by its old name still resolve.
--- Clean up's checks of archived folders, kept so a check survives a restart:
--- the folder checked, whether it passed (with a snapshot of it then, to
--- compare with just before deleting) or why not, and when.
-CREATE TABLE IF NOT EXISTS cleanup_checks (
-    archive_id  INTEGER PRIMARY KEY REFERENCES archives(id),
-    source_path TEXT NOT NULL,
-    passed      INTEGER NOT NULL,
-    snapshot    TEXT,
-    discarded   INTEGER NOT NULL DEFAULT 0,
-    detail      TEXT NOT NULL DEFAULT '',
-    checked_utc TEXT NOT NULL
-);
--- Folders ticked on the Clean up page, so the ticks survive a restart.
-CREATE TABLE IF NOT EXISTS cleanup_ticked (
-    archive_id INTEGER PRIMARY KEY REFERENCES archives(id)
-);
-CREATE TABLE IF NOT EXISTS archive_aliases (
-    old_name   TEXT NOT NULL,
-    archive_id INTEGER NOT NULL REFERENCES archives(id)
-);
-CREATE INDEX IF NOT EXISTS archive_aliases_name ON archive_aliases(old_name);
-"#;
-
-/// Adds `column` to `table` if it isn't there yet.
-fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
-    let has: bool = conn.query_row(
-        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-        params![column],
-        |r| r.get::<_, i64>(0).map(|n| n > 0),
-    )?;
-    if !has {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
-    }
-    Ok(())
-}
-
-/// One file or folder as recorded in the catalog and the manifest.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EntryRecord {
-    /// Path inside the archive, `/` separated, relative to the archived folder.
-    pub rel_path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified_utc: Option<String>,
-    pub created_utc: Option<String>,
-    pub blake3: Option<String>,
-    pub sha256: Option<String>,
-    /// `lzma2`, `copy` or `none` for folders.
-    pub method: String,
-}
-
-/// An archive as recorded in the catalog and the manifest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArchiveRecord {
-    pub name: String,
-    pub archive_path: String,
-    /// Lookup key for the source folder: canonical, and lower case on Windows.
-    pub source_path: String,
-    /// The source folder as it is spelled on disk, for showing to people.
-    /// Missing in manifests written before it was added.
-    #[serde(default)]
-    pub source_display: String,
-    pub created_utc: String,
-    pub engine: String,
-    pub level: u32,
-    pub threads: u32,
-    pub input_bytes: u64,
-    pub archive_bytes: u64,
-    pub file_count: u64,
-    pub dir_count: u64,
-}
-
-/// A verified archive of a folder, as the folder list needs it.
-#[derive(Clone, Debug)]
-pub struct ArchivedFolder {
-    pub archive_id: i64,
-    pub archive_path: PathBuf,
-    pub created_utc: String,
-    pub archive_bytes: u64,
-}
+pub use records::*;
+pub use schema::*;
 
 pub struct Catalog {
     conn: Connection,
@@ -263,27 +42,6 @@ impl Catalog {
         move_old_catalog(dir)?;
         hide(&dir.join(DATA_DIR));
         Self::connect(&db_path(dir))
-    }
-
-    fn connect(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        // Columns added after the first release.
-        for (table, column, kind) in [
-            // The source folder as spelled on disk.
-            ("archives", "source_display", "TEXT"),
-            // When the archive last decoded and matched its record (a full
-            // check or a scrub); NULL means only when it was made.
-            ("archives", "decoded_utc", "TEXT"),
-            // The archive's size and modified time when the check passed, so
-            // a changed archive is caught before deleting.
-            ("cleanup_checks", "archive_len", "INTEGER"),
-            ("cleanup_checks", "archive_modified", "INTEGER"),
-        ] {
-            add_column(&conn, table, column, kind)?;
-        }
-        Ok(Self { conn })
     }
 
     /// Records a verified archive and all its entries in one transaction.
@@ -316,13 +74,7 @@ impl Catalog {
 
     /// Replaces what is recorded for archive `id` after it was rewritten:
     /// its sizes and counts, its entries and what was left out of it.
-    pub fn replace_contents(
-        &mut self,
-        id: i64,
-        a: &ArchiveRecord,
-        entries: &[EntryRecord],
-        ex: &crate::archive::Excluded,
-    ) -> Result<()> {
+    pub fn replace_contents(&mut self, id: i64, a: &ArchiveRecord, entries: &[EntryRecord], ex: &crate::archive::Excluded) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE archives SET input_bytes = ?2, archive_bytes = ?3, file_count = ?4, dir_count = ?5 WHERE id = ?1",
@@ -436,9 +188,8 @@ impl Catalog {
     pub fn insert_excluded(&mut self, archive_id: i64, ex: &crate::archive::Excluded) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut q = tx.prepare(
-                "INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
+            let mut q =
+                tx.prepare("INSERT INTO excluded (archive_id, rel_path, size, action, aside_archive) VALUES (?1, ?2, ?3, ?4, ?5)")?;
             // The archive beside (older archives), or the one inside.
             let aside = ex.set_aside_archive.as_deref().or(ex.set_aside_inside.as_ref().map(|_| crate::archive::EXCLUDED_ENTRY));
             for e in &ex.set_aside {
@@ -495,9 +246,8 @@ impl Catalog {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
-        let mut files = self.conn.prepare(
-            "SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path",
-        )?;
+        let mut files =
+            self.conn.prepare("SELECT rel_path, size, action, aside_archive FROM excluded WHERE archive_id = ?1 ORDER BY rel_path")?;
         for f in &mut out {
             let rows = files.query_map(params![f.archive.archive_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
@@ -678,8 +428,10 @@ impl Catalog {
         };
         // The oldest copy is the original.
         let first: i64 = self.conn.query_row(
-            &format!("SELECT e2.id FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
-              WHERE e2.blake3 = ?1 AND e2.size = ?2 AND {COPY} ORDER BY a2.created_utc, a2.id, e2.rel_path LIMIT 1"),
+            &format!(
+                "SELECT e2.id FROM entries e2 JOIN archives a2 ON a2.id = e2.archive_id
+              WHERE e2.blake3 = ?1 AND e2.size = ?2 AND {COPY} ORDER BY a2.created_utc, a2.id, e2.rel_path LIMIT 1"
+            ),
             params![blake3, size],
             |r| r.get(0),
         )?;
@@ -766,10 +518,7 @@ impl Catalog {
     }
 
     pub fn mark_source_deleted(&self, archive_id: i64, when_utc: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1",
-            params![archive_id, when_utc],
-        )?;
+        self.conn.execute("UPDATE archives SET source_deleted_utc = ?2 WHERE id = ?1", params![archive_id, when_utc])?;
         self.conn.execute("DELETE FROM cleanup_checks WHERE archive_id = ?1", params![archive_id])?;
         self.conn.execute("DELETE FROM cleanup_ticked WHERE archive_id = ?1", params![archive_id])?;
         Ok(())
@@ -832,11 +581,7 @@ impl Catalog {
     pub fn decoded_utc(&self, archive_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT COALESCE(decoded_utc, created_utc) FROM archives WHERE id = ?1",
-                params![archive_id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COALESCE(decoded_utc, created_utc) FROM archives WHERE id = ?1", params![archive_id], |r| r.get(0))
             .optional()?)
     }
 
@@ -939,11 +684,8 @@ impl Catalog {
     /// `holi 2014` finds `Holiday-Cornwall/2014/IMG_1.jpg`.
     /// `archive_id` limits the search to one archive.
     pub fn search(&self, text: &str, archive_id: Option<i64>, limit: usize) -> Result<Vec<FoundFile>> {
-        let words: Vec<String> = text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("\"{w}\"*"))
-            .collect();
+        let words: Vec<String> =
+            text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| format!("\"{w}\"*")).collect();
         if words.is_empty() {
             return Ok(Vec::new());
         }
@@ -1002,9 +744,7 @@ impl Catalog {
                  ORDER BY e.size * (n - 1) DESC
                  LIMIT ?1",
             )?;
-            let rows = q.query_map(params![limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })?;
+            let rows = q.query_map(params![limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
             for row in rows {
                 let (blake3, size) = row?;
                 groups.push(DuplicateGroup { blake3, size, copies: Vec::new() });
@@ -1030,86 +770,6 @@ impl Catalog {
 const COPY: &str = "e2.kind = 'file' AND e2.size > 0 AND e2.blake3 IS NOT NULL AND e2.method != 'dep'
      AND a2.status = 'verified' AND a2.source_path NOT LIKE '%|excluded'";
 
-/// An archive in the duplicates tree.
-#[derive(Clone, Debug)]
-pub struct TreeArchive {
-    pub id: i64,
-    pub name: String,
-    pub archive_path: String,
-    pub source_path: String,
-    pub created_utc: String,
-    pub file_count: u64,
-    /// A set-aside archive, whose files are never originals or leaves.
-    pub set_aside: bool,
-    /// Files already replaced by reference files.
-    pub replaced: u64,
-    /// Files here that reference files in other archives point to.
-    pub referenced: u64,
-    /// Files whose oldest copy is in this archive.
-    pub originals: u64,
-    /// Later copies in this archive, by path.
-    pub leaves: Vec<TreeLeaf>,
-}
-
-/// A later copy of a file, and the original it duplicates.
-#[derive(Clone, Debug)]
-pub struct TreeLeaf {
-    pub entry_id: i64,
-    pub rel_path: String,
-    pub size: u64,
-    pub modified_utc: Option<String>,
-    pub blake3: String,
-    pub sha256: Option<String>,
-    pub original_entry_id: i64,
-    pub original_archive_id: i64,
-    pub original_archive: String,
-    pub original_path: String,
-}
-
-/// A duplicate to replace, as [`crate::archive::replace_duplicates`] needs it.
-#[derive(Clone, Debug)]
-pub struct DedupeLeaf {
-    pub archive_id: i64,
-    pub archive_name: String,
-    pub archive_path: PathBuf,
-    pub archive_created: String,
-    pub entry: EntryRecord,
-    pub original_archive_path: PathBuf,
-    pub original_path: String,
-}
-
-/// An archive as the catalogue screen lists it.
-#[derive(Clone, Debug)]
-pub struct ArchiveSummary {
-    pub id: i64,
-    pub name: String,
-    pub archive_path: String,
-    pub source_path: String,
-    pub created_utc: String,
-    pub input_bytes: u64,
-    pub archive_bytes: u64,
-    pub file_count: u64,
-    pub source_deleted_utc: Option<String>,
-}
-
-/// A file found in the catalogue.
-#[derive(Clone, Debug)]
-pub struct FoundFile {
-    pub entry_id: i64,
-    pub archive_id: i64,
-    pub archive_name: String,
-    /// The folder that was archived.
-    pub source_path: String,
-    /// Path inside the archive, `/` separated.
-    pub rel_path: String,
-    pub size: u64,
-    pub modified_utc: Option<String>,
-    pub blake3: Option<String>,
-    pub sha256: Option<String>,
-    /// How many catalogued files share this file's size and hash, itself included.
-    pub copies: u64,
-}
-
 fn insert_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64, entries: &[EntryRecord]) -> Result<()> {
     let mut ins = tx.prepare(
         "INSERT INTO entries (archive_id, rel_path, name, ext, kind, size, modified_utc,
@@ -1119,11 +779,7 @@ fn insert_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64, entries: &[En
     let mut fts = tx.prepare("INSERT INTO entries_fts (rowid, name, rel_path) VALUES (?1, ?2, ?3)")?;
     for e in entries {
         let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
-        let ext = if e.is_dir {
-            String::new()
-        } else {
-            name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default()
-        };
+        let ext = if e.is_dir { String::new() } else { name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default() };
         ins.execute(params![
             archive_id,
             e.rel_path,
@@ -1153,58 +809,6 @@ fn delete_entries(tx: &rusqlite::Transaction<'_>, archive_id: i64) -> Result<()>
     Ok(())
 }
 
-/// Where a catalogued file is.
-#[derive(Clone, Debug)]
-pub struct EntryLocation {
-    pub archive_path: PathBuf,
-    pub rel_path: String,
-    pub blake3: Option<String>,
-    pub size: u64,
-}
-
-/// A folder some of whose files the exclusions left out of its archive.
-#[derive(Clone, Debug)]
-pub struct ExcludedFolder {
-    /// The folder's main archive.
-    pub archive: ArchivedFolder,
-    pub name: String,
-    /// The folder that was archived, as spelled on disk.
-    pub source: PathBuf,
-    pub source_deleted_utc: Option<String>,
-    /// The second archive beside the main one holding the set-aside files,
-    /// for archives made before those went inside.
-    pub aside_archive: Option<PathBuf>,
-    /// Whether the set-aside files are in an archive inside the main one.
-    pub aside_inside: bool,
-    /// (path inside the folder, size) of each set-aside file.
-    pub set_aside: Vec<(String, u64)>,
-    /// (path inside the folder, size) of each discarded file.
-    pub discarded: Vec<(String, u64)>,
-}
-
-/// What one archive holds, as recorded in the catalogue.
-#[derive(Clone, Debug, Default)]
-pub struct ArchiveContents {
-    pub files: Vec<FoundFile>,
-    /// Folder paths inside the archive, `/` separated.
-    pub folders: Vec<String>,
-}
-
-/// Catalogued files that share one size and BLAKE3 hash.
-#[derive(Clone, Debug)]
-pub struct DuplicateGroup {
-    pub blake3: String,
-    pub size: u64,
-    pub copies: Vec<FoundFile>,
-}
-
-impl DuplicateGroup {
-    /// Space that removing all but one copy would free.
-    pub fn reclaimable(&self) -> u64 {
-        self.size * (self.copies.len() as u64).saturating_sub(1)
-    }
-}
-
 fn found_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FoundFile> {
     Ok(FoundFile {
         entry_id: r.get(0)?,
@@ -1218,79 +822,4 @@ fn found_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FoundFile> {
         sha256: r.get(8)?,
         copies: r.get::<_, i64>(9)? as u64,
     })
-}
-
-/// The form a source folder's path is stored and looked up in.
-pub fn path_key(p: &Path) -> String {
-    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let s = p.to_string_lossy().to_string();
-    // canonicalize gives \\?\C:\... on Windows; store the plain form.
-    let s = s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s);
-    if cfg!(windows) { s.to_lowercase() } else { s }
-}
-
-pub fn now_utc() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// Local wall-clock time as `HH:MM:SS`, for logs shown to people.
-pub fn local_hhmmss() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
-}
-
-/// Local wall-clock time as `HH:MM`, for logs shown to people.
-pub fn local_hhmm() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
-}
-
-/// An archive's identity, independent of its file name: a BLAKE3 hash of
-/// its creation time and every entry's path, kind, size and hash. The
-/// catalogue and the manifest inside the archive give the same value, so a
-/// renamed archive can be matched to its record without hashing the file.
-pub fn fingerprint(created_utc: &str, entries: &[EntryRecord]) -> String {
-    let mut rows: Vec<&EntryRecord> = entries.iter().collect();
-    rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    let mut h = blake3::Hasher::new();
-    h.update(created_utc.as_bytes());
-    h.update(b"\n");
-    for e in rows {
-        h.update(e.rel_path.as_bytes());
-        h.update(if e.is_dir { b"\0d\0" } else { b"\0f\0" });
-        h.update(e.size.to_string().as_bytes());
-        h.update(b"\0");
-        h.update(e.blake3.as_deref().unwrap_or("").as_bytes());
-        h.update(b"\n");
-    }
-    h.finalize().to_hex().to_string()
-}
-
-/// A Clean up check of an archived folder, as recorded in the catalogue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SavedCheck {
-    pub archive_id: i64,
-    /// The folder that was checked (it may have been renamed since archiving).
-    pub source_path: String,
-    pub passed: bool,
-    /// For a folder that passed: its snapshot then, from `archive::folder_snapshot`.
-    pub snapshot: Option<String>,
-    /// Files a discard rule left out of the archive, deleted with the folder.
-    pub discarded: usize,
-    /// Why it failed; empty if it passed.
-    pub detail: String,
-    pub checked_utc: String,
-    /// The archive's size and modified time (Unix nanoseconds) when the check
-    /// passed. Missing for checks saved before these were recorded.
-    pub archive_len: Option<u64>,
-    pub archive_modified: Option<i64>,
-}
-
-/// An archive due for a scrub (decoding it again to catch damage).
-#[derive(Clone, Debug)]
-pub struct ScrubItem {
-    pub archive_id: i64,
-    pub name: String,
-    pub archive_path: PathBuf,
-    /// When it last decoded and matched its record.
-    pub decoded_utc: String,
-    pub archive_bytes: u64,
 }

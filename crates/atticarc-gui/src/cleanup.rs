@@ -209,10 +209,13 @@ impl State {
                 say(&tx, format!("{} of {total}: {} ({})", n + 1, item.source.display(), human(item.bytes)));
                 let discarded = item.check.as_ref().map_or(0, |c| c.discarded);
                 let result = clean::delete(&item, &settings, &p).map_err(|e| format!("{e:#}"));
-                say(&tx, match &result {
-                    Ok(()) => "   ✓ deleted".to_string(),
-                    Err(e) => format!("   ✗ left alone: {e}"),
-                });
+                say(
+                    &tx,
+                    match &result {
+                        Ok(()) => "   ✓ deleted".to_string(),
+                        Err(e) => format!("   ✗ left alone: {e}"),
+                    },
+                );
                 let _ = tx.send(Msg::Deleted(item.archive_id, Outcome { source: item.source.clone(), discarded, result }));
             }
             say(&tx, "Delete finished".to_string());
@@ -258,10 +261,13 @@ impl State {
                     say(&tx, "Stopped, as asked (that archive wasn't finished, so its date is unchanged)".to_string());
                     break;
                 }
-                say(&tx, match &result {
-                    Ok(()) => "   ✓ decoded and matched".to_string(),
-                    Err(e) => format!("   ✗ DAMAGED: {e}"),
-                });
+                say(
+                    &tx,
+                    match &result {
+                        Ok(()) => "   ✓ decoded and matched".to_string(),
+                        Err(e) => format!("   ✗ DAMAGED: {e}"),
+                    },
+                );
                 let _ = tx.send(Msg::Scrubbed(item.name.clone(), result));
             }
             say(&tx, "Archive check finished".to_string());
@@ -618,16 +624,13 @@ fn running(ui: &mut egui::Ui, run: &Running, show_log: &mut bool) {
         let phase = if t > 0 { format!("{phase}: {d} of {t}") } else { format!("{phase}…") };
         ui.label(RichText::new(phase).color(theme::muted()));
         ui.add(egui::ProgressBar::new(run.progress.fraction()).desired_height(8.0).fill(theme::accent()));
-        ui.add(
-            egui::ProgressBar::new(run.done as f32 / run.total.max(1) as f32)
-                .desired_height(8.0)
-                .fill(theme::accent())
-                .text(if run.pass == Pass::Scrub {
-                    format!("{} of {}", run.done, archives(run.total))
-                } else {
-                    format!("{} of {} folders", run.done, run.total)
-                }),
-        );
+        ui.add(egui::ProgressBar::new(run.done as f32 / run.total.max(1) as f32).desired_height(8.0).fill(theme::accent()).text(
+            if run.pass == Pass::Scrub {
+                format!("{} of {}", run.done, archives(run.total))
+            } else {
+                format!("{} of {} folders", run.done, run.total)
+            },
+        ));
         let stopping = run.progress.cancel.load(Ordering::Relaxed);
         let label = match (stopping, run.pass == Pass::Scrub) {
             (true, true) => "Stopping…",
@@ -727,7 +730,9 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                 }
                 ui.label(RichText::new(parent.display().to_string()).monospace().strong());
                 let bytes: u64 = items.iter().map(|i| i.bytes).sum();
-                ui.label(RichText::new(format!("{} · {} · {n_on} ticked", folders(items.len()), human(bytes))).size(12.5).color(theme::muted()));
+                ui.label(
+                    RichText::new(format!("{} · {} · {n_on} ticked", folders(items.len()), human(bytes))).size(12.5).color(theme::muted()),
+                );
             });
             if open {
                 egui::Grid::new(("cleanup", parent.clone())).num_columns(4).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
@@ -764,7 +769,7 @@ fn tree(ui: &mut egui::Ui, st: &mut State, idle: bool) {
                             Some(c) if c.passed => {
                                 let mut t = format!("✓ passed {}", when(&c.checked_utc));
                                 if c.snapshot.as_deref().is_some_and(archive::snapshot_used_journal) {
-                                    t.push_str(" · change journal");
+                                    t.push_str(&format!(" · {}", atticarc_core::platform::CHANGE_MARKER_LABEL));
                                 }
                                 if c.discarded > 0 {
                                     t.push_str(&format!(" · {} discarded files go with it", c.discarded));
@@ -843,7 +848,11 @@ fn outcomes(ui: &mut egui::Ui, list: &[Outcome], finished: bool) {
     let ok = list.iter().filter(|o| o.result.is_ok()).count();
     let failed = list.len() - ok;
     card(ui, |ui| {
-        let title = if finished { format!("Deleted {} · {failed} left alone", folders(ok)) } else { format!("So far: deleted {} · {failed} left alone", folders(ok)) };
+        let title = if finished {
+            format!("Deleted {} · {failed} left alone", folders(ok))
+        } else {
+            format!("So far: deleted {} · {failed} left alone", folders(ok))
+        };
         ui.label(RichText::new(title).strong());
         for o in list {
             let name = o.source.display().to_string();

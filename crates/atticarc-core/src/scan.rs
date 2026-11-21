@@ -48,11 +48,8 @@ impl ScanResult {
         for f in self.files.iter().filter(|f| f.size > 0) {
             by_size.entry(f.size).or_default().push(f);
         }
-        let mut groups: Vec<SizeGroup<'_>> = by_size
-            .into_iter()
-            .filter(|(_, v)| v.len() > 1)
-            .map(|(size, files)| SizeGroup { size, files })
-            .collect();
+        let mut groups: Vec<SizeGroup<'_>> =
+            by_size.into_iter().filter(|(_, v)| v.len() > 1).map(|(size, files)| SizeGroup { size, files }).collect();
         groups.sort_by(|a, b| b.potential_waste().cmp(&a.potential_waste()).then(a.size.cmp(&b.size)));
         groups
     }

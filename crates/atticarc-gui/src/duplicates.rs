@@ -376,7 +376,13 @@ fn tree_view(ui: &mut egui::Ui, st: &mut State) {
                     let visible = a.leaves.iter().any(|l| st.big_enough(l));
                     let resp = row_frame(ui, stripe, on, 0.0, |ui| {
                         let open = st.expanded.contains(&a.id);
-                        let arrow = if !visible { " " } else if open { "⏷" } else { "⏵" };
+                        let arrow = if !visible {
+                            " "
+                        } else if open {
+                            "⏷"
+                        } else {
+                            "⏵"
+                        };
                         ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(arrow).color(theme::muted())).selectable(false));
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
@@ -502,7 +508,10 @@ fn archive_summary(a: &TreeArchive, st: &State) -> String {
         parts.push(format!("{} already replaced", a.replaced));
     }
     if a.referenced > 0 {
-        parts.push(format!("{} referenced from later archives", if a.referenced == 1 { "1 original".into() } else { format!("{} originals", a.referenced) }));
+        parts.push(format!(
+            "{} referenced from later archives",
+            if a.referenced == 1 { "1 original".into() } else { format!("{} originals", a.referenced) }
+        ));
     }
     parts.join(" · ")
 }
@@ -543,7 +552,9 @@ fn details(ui: &mut egui::Ui, st: &mut State) {
             let locked = st.running.is_some();
             if ui
                 .add_enabled(!locked, egui::Checkbox::new(&mut on, "Replace this copy"))
-                .on_hover_text("Tick to replace this copy with a reference file when the duplicates are replaced; unticked, it stays as it is")
+                .on_hover_text(
+                    "Tick to replace this copy with a reference file when the duplicates are replaced; unticked, it stays as it is",
+                )
                 .changed()
             {
                 if on {
@@ -552,7 +563,11 @@ fn details(ui: &mut egui::Ui, st: &mut State) {
                     st.chosen.remove(&k);
                 }
             }
-            if ui.button(format!("Show {}.7z", l.original_archive)).on_hover_text("Open the archive holding the original in the tree").clicked() {
+            if ui
+                .button(format!("Show {}.7z", l.original_archive))
+                .on_hover_text("Open the archive holding the original in the tree")
+                .clicked()
+            {
                 st.show_archive(l.original_archive_id);
             }
         }
@@ -704,49 +719,67 @@ fn review_list(ui: &mut egui::Ui, st: &mut State, height: f32, locked: bool) {
     }
     let mut flip: Option<(Vec<Key>, bool)> = None;
     let row_h = 26.0;
-    egui::ScrollArea::vertical().id_salt("dup-review").max_height(height).auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
-        for row in &rows[range] {
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                match *row {
-                    Row::Archive(i) => {
-                        let a = &st.tree[i];
-                        let keys: Vec<Key> = a.leaves.iter().filter(|l| st.big_enough(l)).map(|l| key(a, l)).collect();
-                        let n_on = keys.iter().filter(|k| st.chosen.contains(*k)).count();
-                        let mut on = n_on == keys.len();
-                        let cb = egui::Checkbox::without_text(&mut on).indeterminate(n_on > 0 && n_on < keys.len());
-                        if ui.add_enabled(!locked, cb).on_hover_text("Tick or untick every copy in this archive").changed() {
-                            flip = Some((keys.clone(), on));
+    egui::ScrollArea::vertical().id_salt("dup-review").max_height(height).auto_shrink([false, false]).show_rows(
+        ui,
+        row_h,
+        rows.len(),
+        |ui, range| {
+            for row in &rows[range] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| match *row {
+                        Row::Archive(i) => {
+                            let a = &st.tree[i];
+                            let keys: Vec<Key> = a.leaves.iter().filter(|l| st.big_enough(l)).map(|l| key(a, l)).collect();
+                            let n_on = keys.iter().filter(|k| st.chosen.contains(*k)).count();
+                            let mut on = n_on == keys.len();
+                            let cb = egui::Checkbox::without_text(&mut on).indeterminate(n_on > 0 && n_on < keys.len());
+                            if ui.add_enabled(!locked, cb).on_hover_text("Tick or untick every copy in this archive").changed() {
+                                flip = Some((keys.clone(), on));
+                            }
+                            ui.label(RichText::new(format!("{}.7z", a.name)).strong());
+                            ui.label(
+                                RichText::new(format!("{} · {} of {} ticked", date(&a.created_utc), n_on, keys.len()))
+                                    .size(12.5)
+                                    .color(theme::muted()),
+                            );
                         }
-                        ui.label(RichText::new(format!("{}.7z", a.name)).strong());
-                        ui.label(RichText::new(format!("{} · {} of {} ticked", date(&a.created_utc), n_on, keys.len())).size(12.5).color(theme::muted()));
-                    }
-                    Row::Leaf(i, j) => {
-                        let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
-                        let k = key(a, l);
-                        let mut on = st.chosen.contains(&k);
-                        ui.add_space(22.0);
-                        if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
-                            flip = Some((vec![k.clone()], on));
-                        }
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width() * 0.55, row_h),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                path_label(ui, &l.rel_path, !on);
-                            },
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(human(l.size)).size(12.5).color(theme::muted()));
-                            let text = format!("→ {}.7z › {}", l.original_archive, l.original_path);
-                            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(if on { theme::accent_text() } else { theme::muted() })).truncate())
+                        Row::Leaf(i, j) => {
+                            let (a, l) = (&st.tree[i], &st.tree[i].leaves[j]);
+                            let k = key(a, l);
+                            let mut on = st.chosen.contains(&k);
+                            ui.add_space(22.0);
+                            if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
+                                flip = Some((vec![k.clone()], on));
+                            }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width() * 0.55, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    path_label(ui, &l.rel_path, !on);
+                                },
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(human(l.size)).size(12.5).color(theme::muted()));
+                                let text = format!("→ {}.7z › {}", l.original_archive, l.original_path);
+                                ui.add(
+                                    egui::Label::new(RichText::new(text).size(12.5).color(if on {
+                                        theme::accent_text()
+                                    } else {
+                                        theme::muted()
+                                    }))
+                                    .truncate(),
+                                )
                                 .on_hover_text(format!("Original: {}.7z › {}", l.original_archive, l.original_path));
-                        });
-                    }
-                }
-            });
-        }
-    });
+                            });
+                        }
+                    },
+                );
+            }
+        },
+    );
     if let Some((keys, on)) = flip {
         for k in keys {
             if on {

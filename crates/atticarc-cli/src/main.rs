@@ -310,10 +310,7 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
     warn_if_job_may_not_fit(&a, &saved);
     let mut failed = 0;
     for folder in &a.folders {
-        let source_dir = std::fs::canonicalize(folder)
-            .ok()
-            .and_then(|p| p.parent().map(settings::strip_verbatim))
-            .unwrap_or_default();
+        let source_dir = std::fs::canonicalize(folder).ok().and_then(|p| p.parent().map(settings::strip_verbatim)).unwrap_or_default();
         let mut s = saved.settings_for(&source_dir);
         if let Some(out) = &a.out {
             s.out_dir = out.clone();
@@ -339,9 +336,8 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
                 if !o.skipped_links.is_empty() {
                     println!("  links not followed: {}", o.skipped_links.join(", "));
                 }
-                let names = |v: &[atticarc_core::catalog::EntryRecord]| {
-                    v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ")
-                };
+                let names =
+                    |v: &[atticarc_core::catalog::EntryRecord]| v.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>().join(", ");
                 if !o.excluded.set_aside.is_empty() {
                     println!("  set aside inside the archive ({}): {}", archive::EXCLUDED_ENTRY, names(&o.excluded.set_aside));
                 }
@@ -374,10 +370,7 @@ fn run_archive(a: ArchiveArgs) -> ExitCode {
 fn warn_if_job_may_not_fit(a: &ArchiveArgs, saved: &settings::Saved) {
     let mut by_out: Vec<(PathBuf, u64)> = Vec::new();
     for folder in &a.folders {
-        let source_dir = std::fs::canonicalize(folder)
-            .ok()
-            .and_then(|p| p.parent().map(settings::strip_verbatim))
-            .unwrap_or_default();
+        let source_dir = std::fs::canonicalize(folder).ok().and_then(|p| p.parent().map(settings::strip_verbatim)).unwrap_or_default();
         let out = a.out.clone().unwrap_or_else(|| saved.settings_for(&source_dir).out_dir);
         let (bytes, _) = archive::quick_size(folder);
         match by_out.iter_mut().find(|(o, _)| *o == out) {
@@ -387,17 +380,17 @@ fn warn_if_job_may_not_fit(a: &ArchiveArgs, saved: &settings::Saved) {
     }
     for (out, bytes) in by_out {
         let needed = disk::archive_worst_case(bytes).saturating_add(disk::MARGIN);
-        if let Some(free) = disk::free_bytes(&out) {
-            if free < needed {
-                eprintln!(
-                    "warning: {} is free on {}, but these folders total {} before compression. \
-                     Each folder is checked before it starts: any that doesn't fit fails with a \
-                     not-enough-space error and the rest carry on.",
-                    human(free),
-                    out.display(),
-                    human(bytes)
-                );
-            }
+        if let Some(free) = disk::free_bytes(&out)
+            && free < needed
+        {
+            eprintln!(
+                "warning: {} is free on {}, but these folders total {} before compression. \
+                 Each folder is checked before it starts: any that doesn't fit fails with a \
+                 not-enough-space error and the rest carry on.",
+                human(free),
+                out.display(),
+                human(bytes)
+            );
         }
     }
 }
@@ -510,7 +503,7 @@ fn run_cleanup(args: &[String]) -> ExitCode {
     let status = |c: &cleanup::Candidate| match &c.check {
         _ if c.protected => "protected (never deleted)".to_string(),
         Some(k) if k.passed => {
-            let journal = if c.journal_checked() { ", change journal" } else { "" };
+            let journal = if c.journal_checked() { format!(", {}", atticarc_core::platform::CHANGE_MARKER_LABEL) } else { String::new() };
             let decode = if c.needs_decode() { ", archive decoded again before deleting" } else { "" };
             format!("passed {}{journal}{decode}", k.checked_utc.get(..16).unwrap_or(&k.checked_utc))
         }

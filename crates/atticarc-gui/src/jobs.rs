@@ -181,16 +181,11 @@ impl Jobs {
 
     /// Lists the folders in `source_dir` and looks each one up in the catalogue.
     pub fn reload(&mut self, source_dir: &Path, out_dir: &Path) {
-        let previous: std::collections::HashMap<PathBuf, bool> =
-            self.rows.iter().map(|r| (r.path.clone(), r.ticked)).collect();
+        let previous: std::collections::HashMap<PathBuf, bool> = self.rows.iter().map(|r| (r.path.clone(), r.ticked)).collect();
         self.rows.clear();
         self.load_error = None;
         let out_key = catalog::path_key(out_dir);
-        let cat = if catalog::exists(out_dir) {
-            Catalog::open_existing(out_dir).map(Some).map_err(|e| format!("{e:#}"))
-        } else {
-            Ok(None)
-        };
+        let cat = if catalog::exists(out_dir) { Catalog::open_existing(out_dir).map(Some).map_err(|e| format!("{e:#}")) } else { Ok(None) };
         let dirs = match std::fs::read_dir(source_dir) {
             Ok(d) => d,
             Err(e) => {
@@ -609,10 +604,11 @@ impl Jobs {
                     });
                     ui.label(RichText::new(p.display().to_string()).monospace());
                     ui.add_space(6.0);
-                    ui.label(format!("Still deleting after {}. This can take a while for a large folder.", crate::duration(started.elapsed().as_secs_f64())));
-                    ui.label(
-                        RichText::new("Leave the drive connected and AtticARC open until this says it's done.").color(theme::muted()),
-                    );
+                    ui.label(format!(
+                        "Still deleting after {}. This can take a while for a large folder.",
+                        crate::duration(started.elapsed().as_secs_f64())
+                    ));
+                    ui.label(RichText::new("Leave the drive connected and AtticARC open until this says it's done.").color(theme::muted()));
                 }
                 Dialog::Message(title, body) => {
                     ui.heading(title);
