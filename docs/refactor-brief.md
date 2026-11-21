@@ -140,7 +140,7 @@ Each is small. Sketches only; the run settles the exact signatures, keeping them
    which it can put back. A file whose streams change counts as changed for the check before a
    delete. With every stream plugin off, manifests are byte-identical to today.
 4. **MetadataExtractor**: `fn extract(file) -> Option<Metadata>` for the catalogue (EXE version
-   info, Macrium `.mrimg` later). Contract and registry slot only; no extractor yet.
+   info first). Contract and registry slot only; no extractor yet.
 5. **CatalogStore**: the queries the GUI and CLI call, as a trait the SQLite catalogue
    implements, so pages can be tested against an in-memory store. Keep it to what is used.
 6. **Platform** (not a plugin, one implementation per system, chosen at build time):

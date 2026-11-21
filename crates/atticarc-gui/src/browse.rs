@@ -310,7 +310,7 @@ pub fn file_type(name: &str) -> String {
         "gz" | "tgz" => "Gzip archive",
         "tar" => "Tar archive",
         "iso" => "Disc image",
-        "mrimg" => "Macrium image",
+        "mrimg" => "Backup image",
         "exe" => "Application",
         "msi" => "Windows installer",
         "dll" => "Application extension",
