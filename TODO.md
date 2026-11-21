@@ -280,6 +280,22 @@ stays free and open. Built in from the refactor onwards, so it isn't bolted on l
       included) add only optional fields it can safely ignore, never change what one means.
       `docs/formats.md` is the standard.
 
+### Disk sets: roll archives out to drives, with optional parity
+
+Agreed Nov 2026; design in `docs/disk-sets.md`. After the refactor, as plugins.
+
+- [ ] **`SetPlanner` plugin**: pack the destination's archives onto disks of a chosen size
+      (500 GB / 1 TB / custom, real capacity less a margin); strategies first-fit decreasing,
+      keep together, in order; split archives bigger than a disk into 7-Zip volumes. Plan shown
+      before writing.
+- [ ] **`SetWriter` plugin**: plain exFAT (or NTFS) disks, one at a time, verified, resumable;
+      `ATTICARC-SET.json` on every disk with the whole set's map; map in the catalogue too.
+- [ ] **`ParityEngine` plugin, swappable**: none, native Reed–Solomon (k data + m parity, any m
+      disks lost; per-block BLAKE3 checksums; built and rebuilt one disk at a time), PAR2 per
+      disk, SnapRAID. GPL tools run as separate programs only.
+- [ ] Planner and parity independent: any strategy with any engine, each with its own Settings
+      section; a set records which made it.
+
 ## Found during the refactor
 
 Left as they were (the refactor changes no behaviour); each wants its own small fix and test.
