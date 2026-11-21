@@ -1,0 +1,489 @@
+//! Checks that a copy holds everything a source folder does, byte for byte: for
+//! proving a copy finished (an `rclone copy`, a drag-and-drop, a restore) before
+//! trusting it.
+//!
+//! What fails the check, because the copy is not complete:
+//! - a source file missing from the copy, or something else (a folder) in its place;
+//! - a file whose size or contents differ (both sides are hashed with BLAKE3);
+//! - a file that couldn't be read on either side.
+//!
+//! What is reported but doesn't fail it, because a correct copy can have it:
+//! - files only in the copy (`rclone copy` never deletes from the destination);
+//! - modified times more than [`TIME_TOLERANCE`] apart;
+//! - empty source folders the copy lacks (`rclone` skips them unless
+//!   `--create-empty-src-dirs`);
+//! - links in the source, which aren't followed or compared.
+//!
+//! [`Options::strict`] asks for the two folders to be identical: then files only in the
+//! copy and missing empty folders fail it too.
+//!
+//! Paths are matched the way the system matches them, so on Windows and macOS a
+//! copy that spells a name with different capitals still counts as the same file.
+
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// Modified times closer than this count as the same: FAT keeps times to 2 seconds,
+/// and some rclone remotes to 1.
+pub const TIME_TOLERANCE: Duration = Duration::from_secs(2);
+
+const BUFFER: usize = 1 << 20;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Compare sizes only, without reading the files: fast, but doesn't prove the contents.
+    pub quick: bool,
+    /// The folders must be identical: also fail on anything only in the copy, and on
+    /// empty source folders the copy lacks.
+    pub strict: bool,
+}
+
+/// Which side of the comparison something is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Source,
+    Copy,
+}
+
+/// Why a source file doesn't count as copied.
+#[derive(Debug)]
+pub enum Problem {
+    Missing,
+    /// The copy has a folder (or other non-file) where the source has a file.
+    NotAFile,
+    SizeDiffers {
+        source: u64,
+        copy: u64,
+    },
+    ContentDiffers,
+    Unreadable {
+        side: Side,
+        error: io::Error,
+    },
+}
+
+#[derive(Debug)]
+pub struct Finding {
+    /// Relative to both folders.
+    pub path: PathBuf,
+    pub problem: Problem,
+}
+
+#[derive(Debug, Default)]
+pub struct Comparison {
+    /// Source files found the same in the copy (by contents, or by size if quick).
+    pub files_matched: u64,
+    pub bytes_matched: u64,
+    /// Bytes read from both sides while hashing.
+    pub bytes_read: u64,
+    /// Everything that makes the copy incomplete, in path order.
+    pub problems: Vec<Finding>,
+    /// Files and folders only in the copy (a folder is listed, not everything in it).
+    pub extra: Vec<PathBuf>,
+    /// Same contents, modified times further apart than [`TIME_TOLERANCE`].
+    pub times_differ: Vec<PathBuf>,
+    /// Empty source folders the copy doesn't have.
+    pub empty_folders_missing: Vec<PathBuf>,
+    /// Links in the source, not followed or compared.
+    pub links_skipped: Vec<PathBuf>,
+    /// The progress callback asked to stop; the result covers only what was done.
+    pub stopped: bool,
+}
+
+impl Comparison {
+    /// Whether the copy holds everything the source does (and, if `strict`, is identical).
+    pub fn is_complete(&self, strict: bool) -> bool {
+        !self.stopped && self.problems.is_empty() && (!strict || (self.extra.is_empty() && self.empty_folders_missing.is_empty()))
+    }
+}
+
+/// Compares `copy` against `source`. Errors only if either folder can't be opened at
+/// all; anything unreadable inside them is a [`Problem`] in the result.
+///
+/// `progress` hears the bytes read so far and returns `false` to stop.
+pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl FnMut(u64) -> bool) -> io::Result<Comparison> {
+    for (root, side) in [(source, "source"), (copy, "copy")] {
+        let meta = fs::metadata(root).map_err(|e| io::Error::new(e.kind(), format!("the {side} {}: {e}", root.display())))?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the {side} {} is not a folder", root.display())));
+        }
+    }
+    let mut result = Comparison::default();
+    let mut buffers = (vec![0u8; BUFFER], vec![0u8; BUFFER]);
+
+    // The source: every file must be in the copy.
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let entries = match read_dir_sorted(&source.join(&rel)) {
+            Ok(e) => e,
+            Err(error) => {
+                result.problems.push(Finding { path: rel, problem: Problem::Unreadable { side: Side::Source, error } });
+                continue;
+            }
+        };
+        if entries.is_empty() && !rel.as_os_str().is_empty() && fs::symlink_metadata(copy.join(&rel)).is_err() {
+            result.empty_folders_missing.push(rel.clone());
+        }
+        // Pushed in reverse, so folders are visited in name order.
+        let mut subfolders = Vec::new();
+        for (name, meta) in entries {
+            let path = rel.join(&name);
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                result.links_skipped.push(path);
+            } else if ft.is_dir() {
+                subfolders.push(path);
+            } else if ft.is_file() && !compare_file(source, copy, path, &meta, options, &mut buffers, &mut result, &mut progress) {
+                result.stopped = true;
+                break;
+            }
+        }
+        if result.stopped {
+            break;
+        }
+        stack.extend(subfolders.into_iter().rev());
+    }
+
+    // The copy: what's there that the source doesn't have.
+    if !result.stopped {
+        let mut stack = vec![PathBuf::new()];
+        while let Some(rel) = stack.pop() {
+            let Ok(entries) = read_dir_sorted(&copy.join(&rel)) else { continue };
+            let mut subfolders = Vec::new();
+            for (name, meta) in entries {
+                let path = rel.join(&name);
+                // Asked of the system, so a name differing only in capitals matches where the system says it does.
+                match fs::symlink_metadata(source.join(&path)) {
+                    Err(_) => result.extra.push(path),
+                    Ok(src) if src.is_dir() && meta.is_dir() => subfolders.push(path),
+                    Ok(_) => {}
+                }
+            }
+            stack.extend(subfolders.into_iter().rev());
+        }
+    }
+
+    result.problems.sort_by(|a, b| a.path.cmp(&b.path));
+    for list in [&mut result.extra, &mut result.times_differ, &mut result.empty_folders_missing, &mut result.links_skipped] {
+        list.sort();
+    }
+    Ok(result)
+}
+
+/// Compares one source file with the copy's. Returns `false` if progress asked to stop.
+#[allow(clippy::too_many_arguments)]
+fn compare_file(
+    source: &Path,
+    copy: &Path,
+    path: PathBuf,
+    src_meta: &Metadata,
+    options: Options,
+    buffers: &mut (Vec<u8>, Vec<u8>),
+    result: &mut Comparison,
+    progress: &mut impl FnMut(u64) -> bool,
+) -> bool {
+    let problem = |problem| Finding { path: path.clone(), problem };
+    let copy_meta = match fs::metadata(copy.join(&path)) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            result.problems.push(problem(Problem::Missing));
+            return true;
+        }
+        Err(error) => {
+            result.problems.push(problem(Problem::Unreadable { side: Side::Copy, error }));
+            return true;
+        }
+    };
+    if !copy_meta.is_file() {
+        result.problems.push(problem(Problem::NotAFile));
+        return true;
+    }
+    let (src_size, copy_size) = (src_meta.len(), copy_meta.len());
+    if src_size != copy_size {
+        result.problems.push(problem(Problem::SizeDiffers { source: src_size, copy: copy_size }));
+        return true;
+    }
+    if !options.quick {
+        // Both sides at once: a source and its copy are usually on different drives.
+        let (a, b) = (source.join(&path), copy.join(&path));
+        let (buf_a, buf_b) = (&mut buffers.0, &mut buffers.1);
+        let (ha, hb) = std::thread::scope(|s| {
+            let t = s.spawn(|| hash(&b, buf_b));
+            (hash(&a, buf_a), t.join().unwrap_or_else(|_| Err(io::Error::other("hashing thread failed"))))
+        });
+        match (ha, hb) {
+            (Ok((ha, na)), Ok((hb, nb))) => {
+                result.bytes_read += na + nb;
+                if ha != hb {
+                    result.problems.push(problem(Problem::ContentDiffers));
+                    return progress(result.bytes_read);
+                }
+            }
+            (Err(error), _) => {
+                result.problems.push(problem(Problem::Unreadable { side: Side::Source, error }));
+                return true;
+            }
+            (_, Err(error)) => {
+                result.problems.push(problem(Problem::Unreadable { side: Side::Copy, error }));
+                return true;
+            }
+        }
+    }
+    result.files_matched += 1;
+    result.bytes_matched += src_size;
+    if let (Ok(a), Ok(b)) = (src_meta.modified(), copy_meta.modified())
+        && apart(a, b) > TIME_TOLERANCE
+    {
+        result.times_differ.push(path);
+    }
+    progress(result.bytes_read)
+}
+
+fn apart(a: SystemTime, b: SystemTime) -> Duration {
+    a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap_or_default()
+}
+
+/// BLAKE3 of the whole file, and how many bytes that took.
+fn hash(path: &Path, buf: &mut [u8]) -> io::Result<(blake3::Hash, u64)> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut n = 0u64;
+    loop {
+        let k = file.read(buf)?;
+        if k == 0 {
+            return Ok((hasher.finalize(), n));
+        }
+        hasher.update(&buf[..k]);
+        n += k as u64;
+    }
+}
+
+/// A folder's entries with their own metadata (links described, not followed), by name.
+fn read_dir_sorted(dir: &Path) -> io::Result<Vec<(std::ffi::OsString, Metadata)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        out.push((entry.file_name(), fs::symlink_metadata(entry.path())?));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    struct Pair {
+        root: PathBuf,
+    }
+
+    impl Pair {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("atticarc-compare-{name}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::create_dir_all(root.join("copy")).unwrap();
+            Pair { root }
+        }
+        fn src(&self) -> PathBuf {
+            self.root.join("src")
+        }
+        fn copy(&self) -> PathBuf {
+            self.root.join("copy")
+        }
+        /// Writes the same file on both sides.
+        fn both(&self, rel: &str, data: &[u8]) {
+            self.write(&self.src(), rel, data);
+            self.write(&self.copy(), rel, data);
+        }
+        fn write(&self, root: &Path, rel: &str, data: &[u8]) {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, data).unwrap();
+        }
+        fn run(&self, options: Options) -> Comparison {
+            compare(&self.src(), &self.copy(), options, |_| true).unwrap()
+        }
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn kinds(c: &Comparison) -> Vec<(String, &'static str)> {
+        c.problems
+            .iter()
+            .map(|f| {
+                let k = match f.problem {
+                    Problem::Missing => "missing",
+                    Problem::NotAFile => "not a file",
+                    Problem::SizeDiffers { .. } => "size",
+                    Problem::ContentDiffers => "content",
+                    Problem::Unreadable { .. } => "unreadable",
+                };
+                (f.path.to_string_lossy().replace('\\', "/"), k)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_copy_is_complete() {
+        let p = Pair::new("exact");
+        p.both("a.txt", b"hello");
+        p.both("deep/er/b.bin", &vec![7u8; 3 * BUFFER + 11]);
+        p.both("empty-file", b"");
+        let c = p.run(Options::default());
+        assert!(c.is_complete(true), "{c:?}");
+        assert_eq!(c.files_matched, 3);
+        assert_eq!(c.bytes_matched, 5 + 3 * BUFFER as u64 + 11);
+        assert_eq!(c.bytes_read, 2 * c.bytes_matched, "both sides were read");
+    }
+
+    #[test]
+    fn missing_different_and_wrong_type_fail_it() {
+        let p = Pair::new("fail");
+        p.both("same.txt", b"same");
+        p.write(&p.src(), "gone.txt", b"only in the source");
+        p.write(&p.src(), "sub/gone-too.txt", b"x");
+        p.write(&p.src(), "size.txt", b"12345");
+        p.write(&p.copy(), "size.txt", b"1234");
+        p.write(&p.src(), "content.txt", b"abcde");
+        p.write(&p.copy(), "content.txt", b"abcdX");
+        p.write(&p.src(), "was-a-file", b"file");
+        fs::create_dir_all(p.copy().join("was-a-file")).unwrap();
+        let c = p.run(Options::default());
+        assert!(!c.is_complete(false));
+        assert_eq!(
+            kinds(&c),
+            [
+                ("content.txt".into(), "content"),
+                ("gone.txt".into(), "missing"),
+                ("size.txt".into(), "size"),
+                ("sub/gone-too.txt".into(), "missing"),
+                ("was-a-file".into(), "not a file"),
+            ]
+        );
+        assert_eq!(c.files_matched, 1);
+    }
+
+    #[test]
+    fn a_same_size_difference_is_only_found_by_reading() {
+        let p = Pair::new("quick");
+        p.write(&p.src(), "f", b"aaaa");
+        p.write(&p.copy(), "f", b"aaab");
+        assert!(p.run(Options { quick: true, strict: false }).is_complete(false), "quick compares sizes only");
+        let full = p.run(Options::default());
+        assert_eq!(kinds(&full), [("f".into(), "content")]);
+        assert_eq!(full.bytes_read, 8);
+    }
+
+    #[test]
+    fn extras_are_reported_and_only_fail_when_strict() {
+        let p = Pair::new("extra");
+        p.both("a", b"1");
+        p.write(&p.copy(), "new.txt", b"only in the copy");
+        p.write(&p.copy(), "newdir/inside/x", b"1");
+        fs::create_dir_all(p.copy().join("emptyextra")).unwrap();
+        let c = p.run(Options::default());
+        let extra: Vec<String> = c.extra.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        assert_eq!(extra, ["emptyextra", "new.txt", "newdir"], "a folder is listed once, not its contents");
+        assert!(c.is_complete(false));
+        assert!(!c.is_complete(true));
+    }
+
+    #[test]
+    fn empty_source_folders_are_reported_not_failed() {
+        let p = Pair::new("empty");
+        p.both("a", b"1");
+        fs::create_dir_all(p.src().join("empty/nested-empty")).unwrap();
+        fs::create_dir_all(p.src().join("kept")).unwrap();
+        fs::create_dir_all(p.copy().join("kept")).unwrap();
+        let c = p.run(Options::default());
+        assert!(c.is_complete(false), "{c:?}");
+        assert!(!c.is_complete(true), "identical means the empty folder too");
+        assert_eq!(c.empty_folders_missing, [PathBuf::from("empty").join("nested-empty")]);
+    }
+
+    #[test]
+    fn times_further_apart_than_the_tolerance_are_reported() {
+        let p = Pair::new("times");
+        p.both("close", b"1");
+        p.both("far", b"1");
+        let set = |rel: &str, secs: u64| {
+            let f = File::options().write(true).open(p.copy().join(rel)).unwrap();
+            f.set_modified(fs::metadata(p.src().join(rel)).unwrap().modified().unwrap() + Duration::from_secs(secs)).unwrap();
+        };
+        set("close", 1);
+        set("far", 60);
+        let c = p.run(Options::default());
+        assert!(c.is_complete(true));
+        assert_eq!(c.times_differ, [PathBuf::from("far")]);
+    }
+
+    #[test]
+    fn stopping_part_way_never_counts_as_complete() {
+        let p = Pair::new("stop");
+        for i in 0..5 {
+            p.both(&format!("f{i}"), b"data");
+        }
+        let mut calls = 0;
+        let c = compare(&p.src(), &p.copy(), Options::default(), |_| {
+            calls += 1;
+            calls < 2
+        })
+        .unwrap();
+        assert!(c.stopped);
+        assert!(!c.is_complete(false));
+        assert_eq!(c.files_matched, 2);
+    }
+
+    #[test]
+    fn folders_that_are_not_there_are_errors() {
+        let p = Pair::new("roots");
+        let e = compare(&p.root.join("nope"), &p.copy(), Options::default(), |_| true).unwrap_err();
+        assert!(e.to_string().starts_with("the source ") && e.to_string().contains("nope"), "{e}");
+        p.write(&p.root, "afile", b"x");
+        let e = compare(&p.src(), &p.root.join("afile"), Options::default(), |_| true).unwrap_err();
+        assert!(e.to_string().contains("is not a folder"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_source_matches_anything_but_strict() {
+        let p = Pair::new("emptysrc");
+        p.write(&p.copy(), "x", b"1");
+        let c = p.run(Options::default());
+        assert!(c.is_complete(false));
+        assert!(!c.is_complete(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_skipped_and_listed_not_followed() {
+        let p = Pair::new("links");
+        p.both("real", b"1");
+        std::os::unix::fs::symlink("/nonexistent/target", p.src().join("link")).unwrap();
+        let c = p.run(Options::default());
+        assert!(c.is_complete(false));
+        assert_eq!(c.links_skipped, [PathBuf::from("link")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_source_file_fails_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Pair::new("unreadable");
+        p.both("secret", b"1");
+        fs::set_permissions(p.src().join("secret"), fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(p.src().join("secret")).is_ok() {
+            return; // running as root: can't make a file unreadable
+        }
+        let c = p.run(Options::default());
+        assert_eq!(kinds(&c), [("secret".into(), "unreadable")]);
+        fs::set_permissions(p.src().join("secret"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}

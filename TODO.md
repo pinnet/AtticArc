@@ -196,6 +196,11 @@ layer after the refactor, one implementation per system:
 
 ## 2. Features still open
 
+- [x] **Compare two folders** (Nov 2026): `atticarc_core::compare` and `atticarc-cli compare
+      <source> <copy> [--strict] [--quick]`, to prove an rclone copy (or any copy) finished.
+  - [ ] A Compare page in the GUI, with the same lists.
+  - [ ] Use it to check a restore (below) and in the end-to-end test (section 0.5).
+
 ### Colour labels and file tags
 
 Agreed Nov 2026: the same on every system (Windows, macOS, Linux), so a label set on one machine
