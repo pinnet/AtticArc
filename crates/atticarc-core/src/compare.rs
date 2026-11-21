@@ -12,7 +12,10 @@
 //! - modified times more than [`TIME_TOLERANCE`] apart;
 //! - empty source folders the copy lacks (`rclone` skips them unless
 //!   `--create-empty-src-dirs`);
-//! - links in the source, which aren't followed or compared.
+//! - links in the source, which aren't followed or compared;
+//! - the system's own folders and files on a drive ([`SYSTEM_NAMES`]: Spotlight's index, the
+//!   recycle bin, the page file...), skipped on both sides unless
+//!   [`Options::include_system`]. Nothing can copy them properly, and nothing needs to.
 //!
 //! [`Options::strict`] asks for the two folders to be identical: then files only in the
 //! copy and missing empty folders fail it too.
@@ -31,6 +34,36 @@ pub const TIME_TOLERANCE: Duration = Duration::from_secs(2);
 
 const BUFFER: usize = 1 << 20;
 
+/// Names the system keeps for itself on a drive, matched in any letter case at any depth.
+/// macOS: Spotlight's index, file-event log, bins, versions, Finder view settings.
+/// Windows: restore points and the volume's index, the recycle bins, page and hibernation
+/// files. Linux: fsck's lost+found.
+pub const SYSTEM_NAMES: &[&str] = &[
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".Trashes",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    ".PKInstallSandboxManager",
+    ".PKInstallSandboxManager-SystemSoftware",
+    ".MobileBackups",
+    ".DS_Store",
+    "System Volume Information",
+    "$RECYCLE.BIN",
+    "RECYCLER",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "DumpStack.log.tmp",
+    "lost+found",
+];
+
+/// Whether `name` is one of [`SYSTEM_NAMES`].
+pub fn is_system_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    SYSTEM_NAMES.iter().any(|s| s.eq_ignore_ascii_case(&name))
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
     /// Compare sizes only, without reading the files: fast, but doesn't prove the contents.
@@ -38,6 +71,8 @@ pub struct Options {
     /// The folders must be identical: also fail on anything only in the copy, and on
     /// empty source folders the copy lacks.
     pub strict: bool,
+    /// Compare the system's own folders and files ([`SYSTEM_NAMES`]) too, instead of skipping them.
+    pub include_system: bool,
 }
 
 /// Which side of the comparison something is on.
@@ -88,6 +123,8 @@ pub struct Comparison {
     pub empty_folders_missing: Vec<PathBuf>,
     /// Links in the source, not followed or compared.
     pub links_skipped: Vec<PathBuf>,
+    /// System folders and files skipped ([`SYSTEM_NAMES`]), on either side.
+    pub system_skipped: Vec<PathBuf>,
     /// The progress callback asked to stop; the result covers only what was done.
     pub stopped: bool,
 }
@@ -131,7 +168,9 @@ pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl 
         for (name, meta) in entries {
             let path = rel.join(&name);
             let ft = meta.file_type();
-            if ft.is_symlink() {
+            if !options.include_system && is_system_name(&name) {
+                result.system_skipped.push(path);
+            } else if ft.is_symlink() {
                 result.links_skipped.push(path);
             } else if ft.is_dir() {
                 subfolders.push(path);
@@ -154,6 +193,12 @@ pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl 
             let mut subfolders = Vec::new();
             for (name, meta) in entries {
                 let path = rel.join(&name);
+                if !options.include_system && is_system_name(&name) {
+                    if !result.system_skipped.contains(&path) {
+                        result.system_skipped.push(path);
+                    }
+                    continue;
+                }
                 // Asked of the system, so a name differing only in capitals matches where the system says it does.
                 match fs::symlink_metadata(source.join(&path)) {
                     Err(_) => result.extra.push(path),
@@ -166,7 +211,13 @@ pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl 
     }
 
     result.problems.sort_by(|a, b| a.path.cmp(&b.path));
-    for list in [&mut result.extra, &mut result.times_differ, &mut result.empty_folders_missing, &mut result.links_skipped] {
+    for list in [
+        &mut result.extra,
+        &mut result.times_differ,
+        &mut result.empty_folders_missing,
+        &mut result.links_skipped,
+        &mut result.system_skipped,
+    ] {
         list.sort();
     }
     Ok(result)
@@ -376,7 +427,7 @@ mod tests {
         let p = Pair::new("quick");
         p.write(&p.src(), "f", b"aaaa");
         p.write(&p.copy(), "f", b"aaab");
-        assert!(p.run(Options { quick: true, strict: false }).is_complete(false), "quick compares sizes only");
+        assert!(p.run(Options { quick: true, ..Options::default() }).is_complete(false), "quick compares sizes only");
         let full = p.run(Options::default());
         assert_eq!(kinds(&full), [("f".into(), "content")]);
         assert_eq!(full.bytes_read, 8);
@@ -459,6 +510,38 @@ mod tests {
         let c = p.run(Options::default());
         assert!(c.is_complete(false));
         assert!(!c.is_complete(true));
+    }
+
+    #[test]
+    fn system_folders_are_skipped_on_both_sides() {
+        let p = Pair::new("system");
+        p.both("song.wav", b"music");
+        // In the source: Spotlight's index, unreadable, and Finder files that differ.
+        p.write(&p.src(), ".Spotlight-V100/Store-V2/index", b"index");
+        p.write(&p.src(), "sub/.DS_Store", b"view settings A");
+        p.write(&p.copy(), "sub/.DS_Store", b"view settings B, longer");
+        p.write(&p.src(), "$Recycle.Bin/S-1-5/x", b"bin");
+        // In the copy only: its own system folders are not extras.
+        p.write(&p.copy(), "System Volume Information/tracking.log", b"x");
+        p.write(&p.copy(), ".fseventsd/0001", b"x");
+        let c = p.run(Options { strict: true, ..Options::default() });
+        assert!(c.is_complete(true), "{c:?}");
+        let skipped: Vec<String> = c.system_skipped.iter().map(|x| x.to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(skipped, ["$Recycle.Bin", ".Spotlight-V100", ".fseventsd", "System Volume Information", "sub/.DS_Store"]);
+
+        let all = p.run(Options { include_system: true, ..Options::default() });
+        assert!(!all.is_complete(false), "with include_system they're compared like anything else");
+        assert!(all.system_skipped.is_empty());
+    }
+
+    #[test]
+    fn system_names_match_in_any_case() {
+        for n in [".spotlight-v100", "$recycle.bin", "SYSTEM VOLUME INFORMATION", ".ds_store", "Lost+Found"] {
+            assert!(is_system_name(std::ffi::OsStr::new(n)), "{n}");
+        }
+        for n in ["Spotlight-V100", "recycle", "my .DS_Store notes", "system volume"] {
+            assert!(!is_system_name(std::ffi::OsStr::new(n)), "{n}");
+        }
     }
 
     #[cfg(unix)]

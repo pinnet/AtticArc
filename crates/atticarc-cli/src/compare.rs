@@ -25,6 +25,7 @@ pub fn parse(args: &[String]) -> Result<CompareArgs, String> {
             "--quick" => options.quick = true,
             "--strict" => options.strict = true,
             "--all" => all = true,
+            "--include-system" => options.include_system = true,
             s if s.starts_with("--") => return Err(format!("compare doesn't know '{s}'")),
             _ => folders.push(PathBuf::from(a)),
         }
@@ -106,6 +107,7 @@ fn report(c: &Comparison, a: &CompareArgs) {
     show("Modified times differ (contents match)", c.times_differ.iter().map(|x| p(x)).collect());
     show(empty_title, c.empty_folders_missing.iter().map(|x| p(x)).collect());
     show("Links in the source, not compared", c.links_skipped.iter().map(|x| p(x)).collect());
+    show("System folders and files, skipped (--include-system compares them)", c.system_skipped.iter().map(|x| p(x)).collect());
 }
 
 fn verdict(c: &Comparison, a: &CompareArgs, took: Duration) -> String {

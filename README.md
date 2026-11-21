@@ -231,6 +231,10 @@ with the same contents; both sides are hashed (BLAKE3), each file's two sides re
 - **Listed, doesn't fail it:** files only in the copy (`rclone copy` never deletes from the
   destination), modified times more than 2 seconds apart, empty folders the copy lacks (rclone
   skips them unless `--create-empty-src-dirs`), and links in the source (not followed).
+- **Skipped on both sides:** the system's own folders and files on a drive (`.Spotlight-V100`,
+  `.fseventsd`, `.Trashes`, `.DS_Store`, `System Volume Information`, `$RECYCLE.BIN`, the page
+  file, `lost+found`...). Nothing can copy them properly and nothing needs to; `--include-system`
+  compares them anyway.
 - `--strict`: the folders must be identical, so extras and missing empty folders fail it too.
 - `--quick`: sizes only, reading nothing. Fast, but not proof.
 - Exit code 0 means complete, 1 not complete, 2 the folders couldn't be compared, so it can
