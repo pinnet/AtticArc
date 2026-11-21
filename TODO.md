@@ -233,10 +233,16 @@ means the same on another.
 - [ ] Macrium `.mrimg` reader: catalogue the image collection on the NAS to find repeated data.
 - [ ] Tree view of an archive's contents in the Catalogue browser (Clean up has the tree; the
       Catalogue browser was left as it is).
-- [ ] AI review over MCP: an `atticarc-mcp` server with read-only catalogue tools (list, summarise,
-      search, file info) and one `suggest` tool that records keep/rescue/drop suggestions for a new
-      **Review** page; you approve, and anything deleted still goes through the usual check.
-      Metadata only by default. Rust with `rmcp`; Claude Desktop or a local LLM on Proxmox as client.
+- [ ] **Review page and advisor plugins** (revised 21 Nov 2026). An `Advisor` plugin contract:
+      an advisor reads the catalogue (metadata only) and returns keep / rescue / drop suggestions,
+      each with a reason and a confidence, shown on a new **Review** page.
+  - **Suggestions only, always**: no advisor deletes or changes anything. You approve on the
+    Review page, and anything deleted still goes through the usual check.
+  - **Built-in rules advisor** (in the open build): patterns for known throwaway Windows / macOS /
+    Linux folders (`$Recycle.Bin`, temp, browser and installer caches, an old `Windows`), with no
+    AI and no network.
+  - Other advisors plug in through the same contract and registry; the open build makes no
+    network connections for reviews.
 
 - [ ] **Versions of a folder (considered Nov 2026, parked).** Kept for now: a new folder with a
       taken name gets `Name (2).7z`, `Name (3).7z`… beside the first, which is logical and copies
@@ -295,6 +301,19 @@ Agreed Nov 2026; design in `docs/disk-sets.md`. After the refactor, as plugins.
       disk, SnapRAID. GPL tools run as separate programs only.
 - [ ] Planner and parity independent: any strategy with any engine, each with its own Settings
       section; a set records which made it.
+
+### Disk capture: a whole disk as a set of files
+
+Agreed Nov 2026; design in `docs/disk-capture.md`. After the refactor, as a plugin; open formats
+only, no other backup product.
+
+- [ ] **Capture**: read a whole disk via the privileged helper (from a VSS / APFS snapshot if live),
+      used blocks only where the file system is understood (NTFS first), content-defined chunks
+      (FastCDC), each stored once as a zstd file named by its BLAKE3 hash; a small `.atticimg`
+      index per capture. Repeat captures share chunks.
+- [ ] **Restore and export**: restore to a disk; export to VHDX, QCOW2 or raw `.img`.
+- [ ] **Store upkeep**: reference-counted chunk removal, scrub, catalogue shows new vs shared data;
+      the store rolls out to disk sets like any files.
 
 ## Found during the refactor
 
