@@ -147,7 +147,7 @@ GUI. Do this alongside 1.3–1.5 (it absorbs the `Loader<T>` and "busy, repaint 
 - **Seams only where change is likely** (don't make constants or core models pluggable):
   - [ ] Progress / feedback (first, as the pattern for the rest).
   - [ ] Archive backend: 7-Zip now; a Rust compression routine later.
-  - [ ] Metadata extractors: EXE version info, Macrium `.mrimg` reader (section 2).
+  - [ ] Metadata extractors: EXE version info (section 2).
   - [ ] **File streams** (agreed Nov 2026): extra data kept *with each file inside the archive*,
         whichever archive backend is plugged in, rather than only in the catalogue.
         - Contract `FileStreams { read(file) -> Vec<Stream { name, bytes }>, restore(file,
@@ -230,7 +230,6 @@ means the same on another.
 - [ ] MD5 as an optional hash, for compatibility with the old tool.
 - [ ] EXE version info (publisher, product, version, signature) in the catalogue.
 - [ ] Archive breakdown screen (pie or treemap of what an archive holds).
-- [ ] Macrium `.mrimg` reader: catalogue the image collection on the NAS to find repeated data.
 - [ ] Tree view of an archive's contents in the Catalogue browser (Clean up has the tree; the
       Catalogue browser was left as it is).
 - [ ] AI review over MCP: an `atticarc-mcp` server with read-only catalogue tools (list, summarise,

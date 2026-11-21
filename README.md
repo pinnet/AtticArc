@@ -80,7 +80,6 @@ MIT: see [LICENSE](LICENSE).
 - [ ] Skip locked files instead of failing the folder.
 - [x] Hash the size-collision candidates from `atticarc-cli scan` before archiving (`scan --hash`).
 - [ ] EXE version info in the catalogue.
-- [ ] Macrium Reflect image reader: mount `.mrimg` files read-only and catalogue their contents to prune the NAS image collection.
 
 ## Layout
 
