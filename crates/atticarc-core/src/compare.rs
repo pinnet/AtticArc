@@ -26,6 +26,7 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Modified times closer than this count as the same: FAT keeps times to 2 seconds,
@@ -33,6 +34,20 @@ use std::time::{Duration, SystemTime};
 pub const TIME_TOLERANCE: Duration = Duration::from_secs(2);
 
 const BUFFER: usize = 1 << 20;
+
+/// How often progress is reported while a big file is being read.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// Where a comparison has got to, for the progress callback.
+#[derive(Debug, Clone, Copy)]
+pub struct Progress<'a> {
+    /// Bytes read from both sides so far, counting the file being read now.
+    pub bytes_read: u64,
+    /// Source files looked at so far, whatever was found.
+    pub files_checked: u64,
+    /// The file being compared (or, at the end, the copy's folder being listed for extras).
+    pub current: &'a Path,
+}
 
 /// Names the system keeps for itself on a drive, matched in any letter case at any depth.
 /// macOS: Spotlight's index, file-event log, bins, versions, Finder view settings.
@@ -113,6 +128,8 @@ pub struct Comparison {
     pub bytes_matched: u64,
     /// Bytes read from both sides while hashing.
     pub bytes_read: u64,
+    /// Source files looked at, whatever was found.
+    pub files_checked: u64,
     /// Everything that makes the copy incomplete, in path order.
     pub problems: Vec<Finding>,
     /// Files and folders only in the copy (a folder is listed, not everything in it).
@@ -139,8 +156,9 @@ impl Comparison {
 /// Compares `copy` against `source`. Errors only if either folder can't be opened at
 /// all; anything unreadable inside them is a [`Problem`] in the result.
 ///
-/// `progress` hears the bytes read so far and returns `false` to stop.
-pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl FnMut(u64) -> bool) -> io::Result<Comparison> {
+/// `progress` hears where it has got to: before each file, several times a second while a big
+/// file is read, and while the copy is listed. It returns `false` to stop, even mid-file.
+pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl FnMut(&Progress) -> bool) -> io::Result<Comparison> {
     for (root, side) in [(source, "source"), (copy, "copy")] {
         let meta = fs::metadata(root).map_err(|e| io::Error::new(e.kind(), format!("the {side} {}: {e}", root.display())))?;
         if !meta.is_dir() {
@@ -189,6 +207,10 @@ pub fn compare(source: &Path, copy: &Path, options: Options, mut progress: impl 
     if !result.stopped {
         let mut stack = vec![PathBuf::new()];
         while let Some(rel) = stack.pop() {
+            if !progress(&Progress { bytes_read: result.bytes_read, files_checked: result.files_checked, current: &rel }) {
+                result.stopped = true;
+                break;
+            }
             let Ok(entries) = read_dir_sorted(&copy.join(&rel)) else { continue };
             let mut subfolders = Vec::new();
             for (name, meta) in entries {
@@ -233,8 +255,12 @@ fn compare_file(
     options: Options,
     buffers: &mut (Vec<u8>, Vec<u8>),
     result: &mut Comparison,
-    progress: &mut impl FnMut(u64) -> bool,
+    progress: &mut impl FnMut(&Progress) -> bool,
 ) -> bool {
+    result.files_checked += 1;
+    if !progress(&Progress { bytes_read: result.bytes_read, files_checked: result.files_checked, current: &path }) {
+        return false;
+    }
     let problem = |problem| Finding { path: path.clone(), problem };
     let copy_meta = match fs::metadata(copy.join(&path)) {
         Ok(m) => m,
@@ -258,18 +284,51 @@ fn compare_file(
     }
     if !options.quick {
         // Both sides at once: a source and its copy are usually on different drives.
+        // Both read on their own threads while this one reports progress, so a big file on a
+        // slow network share still shows movement and can be stopped part way.
         let (a, b) = (source.join(&path), copy.join(&path));
         let (buf_a, buf_b) = (&mut buffers.0, &mut buffers.1);
+        let (live, stop) = (AtomicU64::new(0), AtomicBool::new(false));
+        let mut asked_to_stop = false;
+        let me = std::thread::current();
+        let done = AtomicUsize::new(0);
+        // Each reader counts itself done and wakes this thread, so a small file costs no waiting.
+        // (Not `is_finished`: a thread that has woken us may not count as finished yet.)
+        let finish = || {
+            done.fetch_add(1, Ordering::Release);
+            me.unpark();
+        };
         let (ha, hb) = std::thread::scope(|s| {
-            let t = s.spawn(|| hash(&b, buf_b));
-            (hash(&a, buf_a), t.join().unwrap_or_else(|_| Err(io::Error::other("hashing thread failed"))))
+            let ta = s.spawn(|| {
+                let h = hash(&a, buf_a, &live, &stop);
+                finish();
+                h
+            });
+            let tb = s.spawn(|| {
+                let h = hash(&b, buf_b, &live, &stop);
+                finish();
+                h
+            });
+            while done.load(Ordering::Acquire) < 2 {
+                std::thread::park_timeout(PROGRESS_EVERY);
+                let read = result.bytes_read + live.load(Ordering::Relaxed);
+                if !asked_to_stop && !progress(&Progress { bytes_read: read, files_checked: result.files_checked, current: &path }) {
+                    asked_to_stop = true;
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            let failed = || Err(io::Error::other("hashing thread failed"));
+            (ta.join().unwrap_or_else(|_| failed()), tb.join().unwrap_or_else(|_| failed()))
         });
+        result.bytes_read += live.load(Ordering::Relaxed);
+        if asked_to_stop {
+            return false;
+        }
         match (ha, hb) {
-            (Ok((ha, na)), Ok((hb, nb))) => {
-                result.bytes_read += na + nb;
+            (Ok(ha), Ok(hb)) => {
                 if ha != hb {
                     result.problems.push(problem(Problem::ContentDiffers));
-                    return progress(result.bytes_read);
+                    return true;
                 }
             }
             (Err(error), _) => {
@@ -289,25 +348,27 @@ fn compare_file(
     {
         result.times_differ.push(path);
     }
-    progress(result.bytes_read)
+    true
 }
 
 fn apart(a: SystemTime, b: SystemTime) -> Duration {
     a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap_or_default()
 }
 
-/// BLAKE3 of the whole file, and how many bytes that took.
-fn hash(path: &Path, buf: &mut [u8]) -> io::Result<(blake3::Hash, u64)> {
+/// BLAKE3 of the whole file, adding what it reads to `read`; gives up when `stop` is set.
+fn hash(path: &Path, buf: &mut [u8], read: &AtomicU64, stop: &AtomicBool) -> io::Result<blake3::Hash> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut n = 0u64;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+        }
         let k = file.read(buf)?;
         if k == 0 {
-            return Ok((hasher.finalize(), n));
+            return Ok(hasher.finalize());
         }
         hasher.update(&buf[..k]);
-        n += k as u64;
+        read.fetch_add(k as u64, Ordering::Relaxed);
     }
 }
 
@@ -356,7 +417,7 @@ mod tests {
             fs::write(p, data).unwrap();
         }
         fn run(&self, options: Options) -> Comparison {
-            compare(&self.src(), &self.copy(), options, |_| true).unwrap()
+            compare(&self.src(), &self.copy(), options, |_: &Progress| true).unwrap()
         }
     }
 
@@ -482,24 +543,56 @@ mod tests {
         for i in 0..5 {
             p.both(&format!("f{i}"), b"data");
         }
-        let mut calls = 0;
-        let c = compare(&p.src(), &p.copy(), Options::default(), |_| {
-            calls += 1;
-            calls < 2
-        })
-        .unwrap();
+        // Stops when told, before the third file.
+        let c = compare(&p.src(), &p.copy(), Options::default(), |p: &Progress| p.files_checked < 3).unwrap();
         assert!(c.stopped);
         assert!(!c.is_complete(false));
         assert_eq!(c.files_matched, 2);
     }
 
     #[test]
+    fn progress_never_goes_backwards_and_stopping_is_not_a_problem() {
+        let p = Pair::new("bigfile");
+        let big = vec![3u8; 64 * BUFFER]; // 64 MiB each side
+        p.both("big.bin", &big);
+        // A slow reader: each report waits, so several land while the file is read.
+        let mut seen = Vec::new();
+        let c = compare(&p.src(), &p.copy(), Options::default(), |pr: &Progress| {
+            seen.push(pr.bytes_read);
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        })
+        .unwrap();
+        assert!(c.is_complete(true));
+        assert_eq!(c.bytes_read, 2 * big.len() as u64);
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never goes backwards");
+
+        // Asked to stop at the first report: not counted as matched, and not a problem.
+        let c = compare(&p.src(), &p.copy(), Options::default(), |_: &Progress| false).unwrap();
+        assert!(c.stopped);
+        assert_eq!(c.files_matched, 0);
+        assert!(c.problems.is_empty(), "stopping isn't a problem with the file");
+    }
+
+    #[test]
+    fn thousands_of_small_files_are_not_slowed_by_progress() {
+        let p = Pair::new("many");
+        for i in 0..2000 {
+            p.both(&format!("d{}/f{i}", i % 20), b"tiny");
+        }
+        let t = std::time::Instant::now();
+        let c = p.run(Options::default());
+        assert_eq!(c.files_matched, 2000);
+        assert!(t.elapsed() < Duration::from_secs(20), "took {:?}", t.elapsed());
+    }
+
+    #[test]
     fn folders_that_are_not_there_are_errors() {
         let p = Pair::new("roots");
-        let e = compare(&p.root.join("nope"), &p.copy(), Options::default(), |_| true).unwrap_err();
+        let e = compare(&p.root.join("nope"), &p.copy(), Options::default(), |_: &Progress| true).unwrap_err();
         assert!(e.to_string().starts_with("the source ") && e.to_string().contains("nope"), "{e}");
         p.write(&p.root, "afile", b"x");
-        let e = compare(&p.src(), &p.root.join("afile"), Options::default(), |_| true).unwrap_err();
+        let e = compare(&p.src(), &p.root.join("afile"), Options::default(), |_: &Progress| true).unwrap_err();
         assert!(e.to_string().contains("is not a folder"), "{e}");
     }
 

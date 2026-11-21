@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use atticarc_core::compare::{self, Comparison, Options, Problem, Side};
+use atticarc_core::compare::{self, Comparison, Options, Problem, Progress, Side};
 
 /// Lines shown per list unless `--all`.
 const SHOWN: usize = 20;
@@ -39,18 +39,20 @@ pub fn run(a: CompareArgs) -> ExitCode {
     let how = if a.options.quick { "sizes only (--quick)" } else { "every file hashed on both sides" };
     println!("Comparing {}\n     with {}\n  {how}\n", a.source.display(), a.copy.display());
     let started = Instant::now();
-    let mut last = Instant::now();
-    let mut shown = false;
-    let result = compare::compare(&a.source, &a.copy, a.options, |read| {
-        if last.elapsed() >= Duration::from_secs(1) {
-            last = Instant::now();
-            shown = true;
-            eprint!("\r  {} read…   ", super::human(read));
+    let mut last: Option<Instant> = None;
+    let mut width = 0;
+    let result = compare::compare(&a.source, &a.copy, a.options, |p: &Progress| {
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+            last = Some(Instant::now());
+            let line = progress_line(p);
+            // Pad to the last line's length, so a shorter one leaves no tail behind.
+            eprint!("\r{line:width$}", width = width);
+            width = line.chars().count();
         }
         true
     });
-    if shown {
-        eprint!("\r{:30}\r", "");
+    if width > 0 {
+        eprint!("\r{:width$}\r", "", width = width);
     }
     match result {
         Ok(c) => {
@@ -133,4 +135,14 @@ fn verdict(c: &Comparison, a: &CompareArgs, took: Duration) -> String {
 
 fn count(n: u64, what: &str) -> String {
     if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
+}
+
+/// e.g. "  1,204 files, 38.2 GB read · Songs/2026/mix.wav", kept to one line.
+fn progress_line(p: &Progress) -> String {
+    let head = format!("  {}, {} read · ", count(p.files_checked, "file"), super::human(p.bytes_read));
+    let path = p.current.display().to_string();
+    let room = 100usize.saturating_sub(head.chars().count());
+    let n = path.chars().count();
+    let path = if n > room { format!("…{}", path.chars().skip(n - room + 1).collect::<String>()) } else { path };
+    head + &path
 }
