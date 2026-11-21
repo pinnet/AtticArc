@@ -3,3 +3,6 @@
 *.db-journal
 # The fixture destination the tests read (crates/atticarc-core/tests/fixtures.rs).
 !crates/atticarc-core/tests/fixtures/**/*.db
+
+# Personal Windows launcher (local only)
+AtticARC.cmd
