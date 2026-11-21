@@ -235,7 +235,8 @@ means the same on another.
       Catalogue browser was left as it is).
 - [ ] **Review page and advisor plugins** (revised 21 Nov 2026). An `Advisor` plugin contract:
       an advisor reads the catalogue (metadata only) and returns keep / rescue / drop suggestions,
-      each with a reason and a confidence, shown on a new **Review** page.
+      each with a reason and a confidence, shown on a new **Review** page: a plain list,
+      sortable and filterable, worked through by hand.
   - **Suggestions only, always**: no advisor deletes or changes anything. You approve on the
     Review page, and anything deleted still goes through the usual check.
   - **Built-in rules advisor** (in the open build): patterns for known throwaway Windows / macOS /
